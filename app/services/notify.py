@@ -6,13 +6,13 @@ import logging
 from typing import Any
 
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
-from aiogram.types import Message
-from sqlalchemy import update
+from aiogram.types import LinkPreviewOptions, Message
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext
-from app.db.models import Notification, User
+from app.db.models import ModerationCard, Notification, User
 from app.services.settings import Chats, get_settings
 
 log = logging.getLogger(__name__)
@@ -62,6 +62,43 @@ async def notify_staff(
         except TelegramAPIError:
             log.warning("cannot notify staff chat %s", chat_id, exc_info=True)
     return sent
+
+
+def remember_alert(session: AsyncSession, ref_type: str, ref_id: int, messages: list[Message]) -> None:
+    """Keep every copy of a staff alert with buttons, so all of them show the decision later."""
+    for message in messages:
+        session.add(
+            ModerationCard(
+                ref_type=ref_type, ref_id=ref_id, chat_id=message.chat.id, message_id=message.message_id
+            )
+        )
+
+
+async def close_alert(ctx: AppContext, ref_type: str, ref_id: int, text: str) -> int:
+    """Every copy of a staff alert gets its final text (what was decided and by whom), without buttons."""
+    bot = ctx.bot
+    if bot is None:
+        return 0
+    async with ctx.db.session() as session:
+        where = (ModerationCard.ref_type == ref_type, ModerationCard.ref_id == ref_id)
+        cards = [
+            (c.chat_id, c.message_id)
+            for c in (await session.execute(select(ModerationCard).where(*where))).scalars()
+        ]
+        await session.execute(delete(ModerationCard).where(*where))
+        await session.commit()
+    for chat_id, message_id in cards:
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except TelegramAPIError:
+            continue
+    return len(cards)
 
 
 async def notify_user(

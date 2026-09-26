@@ -26,6 +26,7 @@ from aiogram.types import LinkPreviewOptions, Message
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot.i18n import h
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Channel, ChannelPost, MediaFile
@@ -35,6 +36,7 @@ from app.services import render_db
 from app.services.media import send_stored
 from app.services.notify import claim_notification, notify_staff
 from app.services.settings import Chats, Runtime, get_settings, update_settings
+from app.services.sync import manual as kept_edits
 
 log = logging.getLogger(__name__)
 
@@ -459,7 +461,8 @@ class SyncEngine:
                 return
             row.message_id = message.message_id
             row.state = "ok"
-            row.sent_hash = block.content_hash() if fragment is block.fragment else None
+            content_hash = block.content_hash()
+            row.sent_hash = content_hash if fragment is block.fragment else kept_edits.PLAIN + content_hash
             row.snapshot = fragment.to_json()
             row.dirty = False
             await session.commit()
@@ -509,11 +512,21 @@ class SyncEngine:
             block = await self._render(session, channel_id, kind, block_id)
             if block is None:
                 return
-            content_hash = block.content_hash()
-            if content_hash == row.sent_hash and row.state == "ok":
+            channel = await session.get(Channel, channel_id)
+            assert channel is not None
+            bases = kept_edits.post_bases(channel.chat_id, channel.username)
+            target = kept_edits.target_for(row.manual, block.fragment, block.content_hash(), bases)
+            content_hash = target.sent_hash
+            emoji_ok = True
+            if row.sent_hash == kept_edits.PLAIN + content_hash:
+                emoji_ok = emoji_allowed(await get_settings(session, Runtime))
+            if row.state == "ok" and kept_edits.up_to_date(row.sent_hash, content_hash, emoji_ok):
+                if target.manual != row.manual:  # a just kept edit got its data fingerprint
+                    row.manual = target.manual
+                    await session.commit()
                 result.unchanged += 1
                 return
-            fragment = await self._gate(session, block.fragment, result, f"{kind}:{block_id}")
+            fragment = await self._gate(session, target.fragment, result, f"{kind}:{block_id}")
             if fragment is None:
                 return
             if fragment is block.fragment:
@@ -526,9 +539,9 @@ class SyncEngine:
                         "Правка не отправлена — уберите часть сервисов или опций.",
                     )
                     return
-            channel = await session.get(Channel, channel_id)
-            assert channel is not None
             chat_id, message_id = channel.chat_id, row.message_id
+            post_url = bases[0] + str(message_id)
+            channel_title = channel.title or str(channel.chat_id)
             is_caption = block.media is not None
             preview = WITH_PREVIEW if block.link_preview else NO_PREVIEW
         message: Message | None = None
@@ -577,8 +590,12 @@ class SyncEngine:
             if row is None:
                 return
             if status in ("ok", "unchanged"):
-                row.sent_hash = content_hash if fragment is block.fragment else None
+                row.sent_hash = (
+                    content_hash if fragment is target.fragment else kept_edits.PLAIN + content_hash
+                )
                 row.snapshot = fragment.to_json()
+                # the channel shows the bot's version again: a manual edit nobody kept is gone
+                row.manual = target.manual if kept_edits.is_kept(target.manual) else None
                 row.state = "ok"
                 row.dirty = False
                 row.last_error = None
@@ -593,6 +610,12 @@ class SyncEngine:
             else:
                 row.last_error = status[6:]
             await session.commit()
+        if status in ("ok", "unchanged") and target.dropped:
+            await self._alert_once(
+                f"manual_dropped:{channel_id}:{kind}:{block_id}:{content_hash[:16]}",
+                f"🔄 Пост {message_id} в канале «{h(channel_title)}» обновлён: изменились его данные, "
+                f"поэтому оставленная ручная правка заменена версией бота.\n{post_url}",
+            )
         if status == "ok":
             result.edited += 1
             if message is not None:

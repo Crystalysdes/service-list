@@ -25,6 +25,7 @@ from app.services import render_db
 from app.services.media import send_album
 from app.services.notify import notify_staff
 from app.services.settings import Templates, get_settings
+from app.services.sync import manual as kept_edits
 from app.services.timefmt import fmt_date
 
 log = logging.getLogger(__name__)
@@ -156,6 +157,50 @@ async def _edit_text(bot: Any, chat_id: int, message_id: int, fragment: Fragment
     return "ok"
 
 
+async def _update_post(
+    engine: Any,
+    channel_id: int,
+    chat_id: int,
+    row: ChannelPost,
+    fragment: Fragment,
+    bases: tuple[str, ...],
+    limiter: Any,
+    result: Any,
+) -> None:
+    """Edit an existing post when the channel does not show what it should (a kept manual edit counts)."""
+    target = kept_edits.target_for(row.manual, fragment, fragment.content_hash(), bases)
+    if row.sent_hash == target.sent_hash:
+        if target.manual != row.manual:  # a just kept edit got its data fingerprint
+            async with engine.ctx.db.session() as session:
+                fresh = await session.get(ChannelPost, row.id)
+                if fresh is not None:
+                    fresh.manual = target.manual
+                    await session.commit()
+        result.unchanged += 1
+        return
+    await limiter.acquire()
+    status = await _edit_text(engine.ctx.bot, chat_id, row.message_id, target.fragment)
+    async with engine.ctx.db.session() as session:
+        fresh = await session.get(ChannelPost, row.id)
+        if fresh is not None:
+            if status == "missing":  # deleted by hand: re-post on the next pass
+                fresh.message_id = None
+                engine.wake(channel_id)
+            elif status == "ok":
+                fresh.sent_hash = target.sent_hash
+                fresh.snapshot = target.fragment.to_json()
+                fresh.manual = target.manual if kept_edits.is_kept(target.manual) else None
+            await session.commit()
+    if status == "ok":
+        result.edited += 1
+        if target.dropped:
+            await engine._alert_once(
+                f"manual_dropped:{channel_id}:{row.kind}:{row.block_id}:{target.sent_hash[:16]}",
+                f"🔄 Пост {row.message_id} в канале Scam list обновлён: изменились его данные, поэтому "
+                f"оставленная ручная правка заменена версией бота.\n{bases[0]}{row.message_id}",
+            )
+
+
 async def _delete_or_blank(
     engine: Any, chat_id: int, message_ids: list[int], blank: str, limiter: Any
 ) -> list[int]:
@@ -207,6 +252,7 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
         channel = await session.get(Channel, channel_id)
         assert channel is not None
         chat_id, username = channel.chat_id, channel.username
+        bases = kept_edits.post_bases(chat_id, username)
         tpl = await get_settings(session, Templates)
         channel_urls = await render_db.channel_urls(session)
         entries = list(
@@ -276,23 +322,8 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
                 target.dirty = False
                 await session.commit()
             result.sent += 1
-        elif row.sent_hash != content_hash:
-            await limiter.acquire()
-            status = await _edit_text(bot, chat_id, row.message_id, fragment)
-            async with ctx.db.session() as session:
-                fresh = await session.get(ChannelPost, row.id)
-                if fresh is not None:
-                    if status == "missing":  # deleted by hand: re-post on the next pass
-                        fresh.message_id = None
-                        engine.wake(channel_id)
-                    elif status == "ok":
-                        fresh.sent_hash = content_hash
-                        fresh.snapshot = fragment.to_json()
-                    await session.commit()
-            if status == "ok":
-                result.edited += 1
         else:
-            result.unchanged += 1
+            await _update_post(engine, channel_id, chat_id, row, fragment, bases, limiter, result)
 
     # 3. paged index (newest first), every page pinned, page 1 pinned last so it shows on top
     async with ctx.db.session() as session:
@@ -335,23 +366,8 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
                 target.dirty = False
                 await session.commit()
             result.sent += 1
-        elif row.sent_hash != content_hash:
-            await limiter.acquire()
-            status = await _edit_text(bot, chat_id, row.message_id, fragment)
-            async with ctx.db.session() as session:
-                fresh = await session.get(ChannelPost, row.id)
-                if fresh is not None:
-                    if status == "missing":
-                        fresh.message_id = None
-                        engine.wake(channel_id)
-                    elif status == "ok":
-                        fresh.sent_hash = content_hash
-                        fresh.snapshot = fragment.to_json()
-                    await session.commit()
-            if status == "ok":
-                result.edited += 1
         else:
-            result.unchanged += 1
+            await _update_post(engine, channel_id, chat_id, row, fragment, bases, limiter, result)
     if created and len(pages) > 1 and first_page_id:  # the first page (with the intro) stays on top
         with contextlib.suppress(TelegramAPIError):
             await bot.pin_chat_message(chat_id, first_page_id, disable_notification=True)

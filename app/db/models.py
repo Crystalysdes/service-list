@@ -382,8 +382,13 @@ class ChannelPost(Base):
     message_id: Mapped[int | None] = mapped_column(Integer)
     extra_message_ids: Mapped[list[int]] = mapped_column(JSONB, default=list)
     dirty: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
-    sent_hash: Mapped[str | None] = mapped_column(String(64))
+    # hash of what is in the channel: the bot's version, "plain:<hash>" without premium emoji or
+    # "manual:<hash>" for a kept manual edit
+    sent_hash: Mapped[str | None] = mapped_column(String(80))
     snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # a manual edit made in the channel: {"fragment", "edit_date"} and, once "✅ Оставить" is pressed,
+    # "base" (fingerprint of the post's data at that moment) and "links" (links to posts of the channel)
+    manual: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     state: Mapped[str] = mapped_column(String(16), default="ok")  # ok / sending / missing / foreign_edit
     last_error: Mapped[str | None] = mapped_column(Text)
