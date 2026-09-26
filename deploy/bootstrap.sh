@@ -35,9 +35,29 @@ ubuntu | debian) ;;
 esac
 
 step "Устанавливаю системные пакеты"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git curl ca-certificates openssl ufw openssh-client openssh-server iproute2 >/dev/null
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+# wait for the automatic updates a fresh VPS runs after boot; keep existing config files without asking
+APT=(apt-get -qq -o DPkg::Lock::Timeout=900 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+repair_dpkg() {  # finish an interrupted package installation (waits while another one is running)
+    local attempt out
+    for attempt in $(seq 1 90); do
+        if out=$(dpkg --force-confdef --force-confold --configure -a 2>&1); then
+            return 0
+        fi
+        if [[ "$out" != *lock* ]]; then
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        ((attempt == 1)) && echo "Система ещё ставит автоматические обновления — жду (до 15 минут)…"
+        sleep 10
+    done
+    return 1
+}
+
+repair_dpkg || die "Не удалось завершить прерванную установку пакетов. Выполните «dpkg --configure -a» и запустите скрипт снова."
+"${APT[@]}" update
+"${APT[@]}" install -y git curl ca-certificates openssl ufw openssh-client openssh-server iproute2 >/dev/null
 systemctl enable --now ssh >/dev/null 2>&1 || true
 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
@@ -71,7 +91,7 @@ ufw --force enable >/dev/null
 ufw status | head -n 6
 
 step "Защита SSH от перебора паролей (fail2ban)"
-apt-get install -y -qq fail2ban python3-systemd >/dev/null
+"${APT[@]}" install -y fail2ban python3-systemd >/dev/null
 cat >/etc/fail2ban/jail.d/servicelist-sshd.conf <<JAIL
 [sshd]
 enabled = true
