@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 from sqlalchemy import select
 
+from app.bot.routers.admin import diagnostics as diagnostics_screen
 from app.db.base import utcnow
 from app.db.models import Category, ChannelPost, Service
 from app.services import catalog
@@ -56,14 +58,30 @@ async def test_admin_creates_category_and_manages_service(h, tg, db, ctx):
         assert service.status == "hidden"
 
 
-async def test_diagnostics_and_live_toggle(h, tg, db, ctx):
+async def test_diagnostics_and_live_toggle(h, tg, db, ctx, monkeypatch):
     await imported_channel(tg, db, ctx, live=False)
     engine_for(ctx)
+    gate = asyncio.Event()
+    real = diagnostics_screen.diagnostics
+
+    async def held(*args, **kwargs):  # keeps the checks running until the test lets them go
+        await gate.wait()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(diagnostics_screen, "diagnostics", held)
     await h.say(OWNER_ID, "/admin")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Диагностика")
-    await h.press(OWNER_ID, h.last(OWNER_ID), "Запустить диагностику")
     screen = h.last(OWNER_ID)
-    assert "Премиум-эмодзи в канале — работают" in screen["text"]
+    await h.press(OWNER_ID, screen, "Запустить диагностику")
+    assert "Диагностика идёт" in screen["text"]  # shown at once, the checks run in the background
+    await h.click(OWNER_ID, screen, "a:diag:run")
+    assert "уже идёт" in tg.called("answerCallbackQuery")[-1]["text"]
+    gate.set()
+    await asyncio.gather(*list(ctx.services["diagnostics_tasks"]))
+    assert "Готово за" in screen["text"] and "Премиум-эмодзи в канале — работают" in screen["text"]
+    steps = [c["text"] for c in tg.called("editMessageText") if "⏳ Сейчас:" in c.get("text", "")]
+    assert any("права бота в каналах" in text for text in steps)
+    assert any("✅ Премиум-эмодзи в канале" in text for text in steps)  # finished checks are shown
     await h.press(OWNER_ID, screen, "В эфир")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Да, включить")
     async with db.session() as s:
@@ -195,3 +213,19 @@ async def test_keep_after_the_bot_already_rewrote_the_post(h, tg, db, ctx):
     assert "Tripmafia" in tg.messages[MAIN][ids["travel"]]["text"]
     await h.press(OWNER_ID, alert, "Оставить")
     assert "Уже решено: бот вернул свою версию" in tg.called("answerCallbackQuery")[-1]["text"]
+
+
+async def test_diagnostics_failure_is_reported(h, tg, db, ctx, monkeypatch):
+    await imported_channel(tg, db, ctx, live=False)
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("Telegram не отвечает")
+
+    monkeypatch.setattr(diagnostics_screen, "diagnostics", broken)
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Диагностика")
+    screen = h.last(OWNER_ID)
+    await h.press(OWNER_ID, screen, "Запустить диагностику")
+    await asyncio.gather(*list(ctx.services["diagnostics_tasks"]))
+    assert "❌ Диагностика прервалась: Telegram не отвечает" in screen["text"]
+    assert h.button(screen, "Запустить диагностику")  # can be started again

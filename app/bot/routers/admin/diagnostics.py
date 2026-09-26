@@ -2,23 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+import time
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import RoleFilter
+from app.bot.i18n import h
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.db.models import Channel, ChannelPost
 from app.services.audit import audit
 from app.services.channels import INACTIVE_STATUSES
-from app.services.selftest import Check, Diagnostics, diagnostics, format_report
+from app.services.selftest import Check, Diagnostics, check_lines, diagnostics, format_report
 from app.services.settings import Runtime, get_settings, update_settings
 from app.services.sync.engine import emoji_allowed
+
+log = logging.getLogger(__name__)
 
 router = Router(name="admin_diagnostics")
 router.message.filter(RoleFilter("admin"))
@@ -68,14 +76,64 @@ async def on_diag(call: CallbackQuery, session: AsyncSession, **data: Any) -> No
     await call.message.edit_text(text, reply_markup=markup)
 
 
+RUNNING = (
+    "🩺 <b>Диагностика идёт…</b>\n\n"
+    "Обычно это до минуты, результат появится в этом сообщении. Бот проверяет:\n"
+    "• премиум-эмодзи в канале;\n"
+    "• лимиты Telegram (пробные сообщения в служебном канале, бот их сразу удаляет);\n"
+    "• права бота в каналах;\n"
+    "• эталонные ссылки проверки ссылок."
+)
+
+
 @router.callback_query(F.data == "a:diag:run")
-async def on_diag_run(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    await call.answer("Проверяю…")
-    await diagnostics(data["ctx"])
-    session.expire_all()
-    text, markup = await _screen(session)
+async def on_diag_run(call: CallbackQuery, **data: Any) -> None:
+    ctx: AppContext = data["ctx"]
+    tasks: set[asyncio.Task[None]] = ctx.services.setdefault("diagnostics_tasks", set())
+    if any(not task.done() for task in tasks):
+        await call.answer("Диагностика уже идёт — результат появится в этом сообщении.", show_alert=True)
+        return
+    await call.answer("Диагностика запущена")
     assert call.message is not None
-    await call.message.edit_text(text, reply_markup=markup)
+    chat_id, message_id = call.message.chat.id, call.message.message_id
+    with contextlib.suppress(TelegramAPIError):
+        await ctx.bot.edit_message_text(  # type: ignore[union-attr]
+            text=RUNNING, chat_id=chat_id, message_id=message_id, reply_markup=back_home()
+        )
+    task = asyncio.create_task(_run(ctx, chat_id, message_id))  # the checks can take a minute
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _run(ctx: AppContext, chat_id: int, message_id: int) -> None:
+    """Runs the checks, showing each finished one and the current step in the same message."""
+    bot = ctx.bot
+    assert bot is not None
+    started = time.monotonic()
+
+    async def show(text: str, markup: Any) -> None:
+        try:
+            await bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id, reply_markup=markup
+            )
+        except TelegramBadRequest as exc:
+            if "not modified" not in exc.message.lower():
+                raise
+
+    async def progress(report: Diagnostics, step: str) -> None:
+        lines = ["🩺 <b>Диагностика идёт…</b>", "", *check_lines(report)]
+        await show("\n".join([*lines, "", f"⏳ Сейчас: {step}…"]), back_home())
+
+    try:
+        await diagnostics(ctx, progress)
+        note = f"✅ Готово за {max(1, round(time.monotonic() - started))} с."
+    except Exception as exc:  # the admin must see that it stopped, the log has the details
+        log.exception("diagnostics failed")
+        note = f"❌ Диагностика прервалась: {h(str(exc)[:200])}. Попробуйте ещё раз."
+    async with ctx.db.session() as session:
+        text, markup = await _screen(session)
+    with contextlib.suppress(TelegramAPIError):
+        await show(f"{note}\n\n{text}", markup)
 
 
 @router.callback_query(F.data == "a:diag:plain")

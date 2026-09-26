@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -106,10 +107,23 @@ async def selftest(ctx: AppContext) -> Check:
     )
 
 
-async def diagnostics(ctx: AppContext) -> Diagnostics:
+Progress = Callable[["Diagnostics", str], Awaitable[None]]
+
+
+async def diagnostics(ctx: AppContext, progress: Progress | None = None) -> Diagnostics:
+    """All live checks; ``progress(report so far, next step)`` is called before each step."""
     report = Diagnostics()
     bot = ctx.bot
     assert bot is not None
+
+    async def step(title: str) -> None:
+        if progress is not None:
+            try:
+                await progress(report, title)
+            except Exception:  # showing progress must never break the checks
+                log.warning("diagnostics progress failed", exc_info=True)
+
+    await step("премиум-эмодзи в канале")
     report.checks.append(await selftest(ctx))
     async with ctx.db.session() as session:
         chats = await get_settings(session, Chats)
@@ -118,6 +132,7 @@ async def diagnostics(ctx: AppContext) -> Diagnostics:
     emoji = await _test_emoji(ctx)
     runtime_changes: dict[str, Any] = {}
     if storage:
+        await step("лимиты Telegram (пробные сообщения в служебном канале)")
         rt = RichText()
         for index in range(105):
             rt.link("x", f"https://example.com/{index}")
@@ -138,6 +153,8 @@ async def diagnostics(ctx: AppContext) -> Diagnostics:
                 report.checks.append(Check("Лимит премиум-эмодзи в посте", True, f"{count} из 150"))
     else:
         report.checks.append(Check("Служебный канал", False, "не подключён"))
+    if channels:
+        await step("права бота в каналах")
     for channel in channels:
         check = await inspect_chat(bot, channel.chat_id, channel.role)
         title = channel.title or str(channel.chat_id)
@@ -164,6 +181,7 @@ async def diagnostics(ctx: AppContext) -> Diagnostics:
                 )
             ).scalar_one_or_none()
     if main is not None and nav is not None and nav.message_id:
+        await step("редактирование постов канала")
         try:
             await bot.edit_message_reply_markup(
                 chat_id=main.chat_id, message_id=nav.message_id, reply_markup=None
@@ -178,6 +196,7 @@ async def diagnostics(ctx: AppContext) -> Diagnostics:
         runtime_changes["edit_rights_ok"] = edit_ok
     checker = ctx.services.get("linkcheck")
     if checker is not None:
+        await step("эталонные ссылки проверки ссылок")
         report.checks.append(await checker.canary_check())
     async with ctx.db.session() as session:
         await update_settings(session, Runtime, last_diagnostics=report.to_json(), **runtime_changes)
@@ -185,11 +204,16 @@ async def diagnostics(ctx: AppContext) -> Diagnostics:
     return report
 
 
-def format_report(report: Diagnostics) -> str:
-    lines = ["🩺 <b>Диагностика</b>", ""]
+def check_lines(report: Diagnostics) -> list[str]:
+    lines = []
     for check in report.checks:
         icon = "✅" if check.ok else ("▫️" if check.ok is None else "❌")
         lines.append(f"{icon} {check.name}" + (f" — {check.detail}" if check.detail else ""))
+    return lines
+
+
+def format_report(report: Diagnostics) -> str:
+    lines = ["🩺 <b>Диагностика</b>", "", *check_lines(report)]
     lines.append("")
     lines.append(
         "Всё в порядке." if report.ok else "Есть проблемы — исправьте их и запустите диагностику снова."

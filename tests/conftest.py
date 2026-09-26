@@ -84,7 +84,7 @@ async def ctx(db, bot, config, tg):
     engine = context.services.get("sync")
     if engine is not None:
         await engine.stop()
-    for key in ("linkcheck_tasks", "migration_tasks"):
+    for key in ("linkcheck_tasks", "migration_tasks", "diagnostics_tasks"):
         for task in list(context.services.get(key, ())):
             task.cancel()
 
