@@ -64,6 +64,12 @@ def report_keyboard(run: ImportRun) -> Any:
     if run.status == "applied":
         builder.button(text="⏳ Сроки импортированных опций", callback_data="a:imp:terms")
         builder.button(text="⭐ Топ из эмодзи-сервисов", callback_data="a:imp:top")
+        builder.button(text="🔗 Проверить ссылки", callback_data="a:imp:links")
+        links = (run.report or {}).get("links") or {}
+        if links.get("dead") and not links.get("hidden"):
+            builder.button(
+                text=f"🙈 Скрыть неоткрывающиеся ({len(links['dead'])})", callback_data="a:imp:links:hide"
+            )
     if run.status != "applied":
         builder.button(text="🔁 Сканировать заново", callback_data="a:imp:scan")
     builder.adjust(1)
@@ -285,3 +291,108 @@ async def on_top(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
         f"Назначено топ-позиций: {count}. Первые сервисы с эмодзи в каждой ветке получили топ-1…3.",
         show_alert=True,
     )
+
+
+# ------------------------------------------------------------------------------------------ dead links
+async def _links_message(ctx: AppContext, report: Any) -> tuple[str, Any]:
+    """Store the verdicts in the run report and describe them."""
+    from app.db.models import Service
+    from app.domain.linkcheck import DEAD, UNKNOWN
+
+    async with ctx.db.session() as session:
+        run = await latest_run(session)
+        if run is None or report is None:
+            return "❌ Проверка ссылок не удалась, подробности в логе бота.", None
+        dead = sorted(sid for sid, v in report.verdicts.items() if v.state == DEAD)
+        unknown = sorted(sid for sid, v in report.verdicts.items() if v.usable == UNKNOWN)
+        run.report = {
+            **(run.report or {}),
+            "links": {
+                "at": report.started_at.isoformat(),
+                "dead": dead,
+                "unknown": unknown,
+                "trust": report.trust,
+                "hidden": False,
+            },
+        }
+        await session.commit()
+        lines = [
+            "🔗 <b>Ссылки импортированных сервисов</b>",
+            "",
+            f"Проверено: {report.checked} — живых {report.alive}, не открываются {len(dead)}, "
+            f"не удалось проверить {len(unknown)}.",
+        ]
+        failed = [name for group, name in (("tg", "t.me"), ("ext", "сайты")) if not report.trust.get(group)]
+        if failed:
+            lines.append(
+                "⚠️ Эталонные ссылки не сошлись (" + ", ".join(failed) + "): такие ссылки попали в "
+                "«не удалось проверить», а не в «не открываются»."
+            )
+        if dead:
+            lines += ["", "<b>Не открываются:</b>"]
+            for service_id in dead[:40]:
+                service = await session.get(Service, service_id)
+                if service is not None:
+                    detail = report.verdicts[service_id].detail
+                    lines.append(f"• {h(service.name)} — {h(service.url)} ({h(detail)})")
+            if len(dead) > 40:
+                lines.append(f"…и ещё {len(dead) - 40}")
+            lines += [
+                "",
+                "Скрытые сервисы не попадут в канал. Если ссылка заработает в течение 30 дней, "
+                "сервис вернётся сам; вернуть вручную — /admin → 🔗 Ссылки → Скрытые.",
+            ]
+    return "\n".join(lines), report_keyboard(run)
+
+
+@router.callback_query(F.data == "a:imp:links")
+async def on_links(call: CallbackQuery, **data: Any) -> None:
+    from app.services.linkcheck import start_background_pass
+
+    ctx: AppContext = data["ctx"]
+    assert call.message is not None
+    chat_id = call.message.chat.id
+
+    async def done(report: Any) -> None:
+        text, markup = await _links_message(ctx, report)
+        await ctx.bot.send_message(  # type: ignore[union-attr]
+            chat_id, text, reply_markup=markup, link_preview_options=NO_PREVIEW
+        )
+
+    if start_background_pass(ctx, "import", done):
+        await call.answer("Проверяю ссылки — итог пришлю сюда. Это займёт несколько минут.", show_alert=True)
+    else:
+        await call.answer("Проверка ссылок уже идёт или недоступна.", show_alert=True)
+
+
+@router.callback_query(F.data == "a:imp:links:hide")
+async def on_links_hide(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    from app.db.base import utcnow
+    from app.db.models import Service
+    from app.services.audit import audit
+    from app.services.catalog import request_sync
+    from app.services.linkcheck import hide_for_dead_link
+    from app.services.settings import LinkCheckSettings, get_settings
+
+    run = await latest_run(session)
+    links = ((run.report or {}) if run else {}).get("links") or {}
+    if run is None or not links.get("dead") or links.get("hidden"):
+        await call.answer("Нечего скрывать", show_alert=True)
+        return
+    settings = await get_settings(session, LinkCheckSettings)
+    now = utcnow()
+    hidden = 0
+    for service_id in links["dead"]:
+        service = await session.get(Service, service_id)
+        if service is not None and service.status == "active":
+            hide_for_dead_link(service, settings, now)
+            await audit(
+                session, data["user"].id, "service.hide_dead", "service", service.id, {"from": "import"}
+            )
+            hidden += 1
+    run.report = {**(run.report or {}), "links": {**links, "hidden": True}}
+    await session.commit()
+    request_sync(data["ctx"])
+    await call.answer(f"Скрыто сервисов: {hidden}", show_alert=True)
+    assert call.message is not None
+    await call.message.edit_reply_markup(reply_markup=report_keyboard(run))

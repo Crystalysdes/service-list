@@ -135,8 +135,29 @@ class LinkCheckSettings(SettingsGroup):
     breaker_ratio: float = 0.15
     paid_grace_hours: int = 72
     auto_restore_days: int = 30
-    canary_alive: list[str] = Field(default_factory=lambda: ["https://t.me/telegram", "https://t.me/durov"])
-    canary_dead: list[str] = Field(default_factory=lambda: ["https://t.me/zq9x_no_such_user_1a2b3c"])
+    request_delay_sec: float = 1.5  # pause between requests, so a pass is spread over time
+    # reference links: a pass trusts "dead" verdicts of a group (t.me / sites) only when these come out right
+    # (a bot like @BotFather is invisible to getChat, so it exercises the t.me page parsing)
+    canary_alive: list[str] = Field(
+        default_factory=lambda: [
+            "https://t.me/telegram",
+            "https://t.me/BotFather",
+            "https://telegram.org",
+        ]
+    )
+    canary_dead: list[str] = Field(
+        default_factory=lambda: [
+            "https://t.me/zq9x_no_such_user_1a2b3c",
+            "https://zq9x-no-such-host.invalid/",
+        ]
+    )
+
+
+class LinkCheckState(SettingsGroup):
+    KEY: ClassVar[str] = "linkcheck_state"
+
+    last_pass_at: datetime | None = None
+    last_report: dict[str, Any] = Field(default_factory=dict)
 
 
 class Runtime(SettingsGroup):

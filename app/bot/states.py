@@ -40,4 +40,4 @@ class OwnerReply(StatesGroup):
 
 
 class ClaimFlow(StatesGroup):
-    waiting_code = State()
+    search = State()

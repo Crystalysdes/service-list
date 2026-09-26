@@ -57,6 +57,7 @@ async def show_list(call_or_message: CallbackQuery | Message, data: dict[str, An
         )
     if not rows:
         builder.button(text=t("menu.add_service"), callback_data="add:start", style="success")
+    builder.button(text=t("claim.btn"), callback_data="claim:start")
     builder.button(text=t("common.menu"), callback_data="m:menu")
     builder.adjust(1)
     text = t("my.title") + "\n\n" + (t("my.empty") if not rows else "")

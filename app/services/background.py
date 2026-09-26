@@ -20,6 +20,9 @@ async def start_background(ctx: AppContext) -> None:
     else:
         log.warning("CRYPTOPAY_TOKEN is not set: payments are disabled")
 
+    from app.services.linkcheck import LinkChecker
+
+    ctx.services["linkcheck"] = LinkChecker(ctx)
     engine = SyncEngine(ctx)
     ctx.services["sync"] = engine
     await engine.start()
@@ -40,3 +43,6 @@ async def stop_background(ctx: AppContext) -> None:
     provider = ctx.services.get("cryptopay")
     if provider is not None and hasattr(provider, "close"):
         await provider.close()
+    checker = ctx.services.get("linkcheck")
+    if checker is not None:
+        await checker.close()

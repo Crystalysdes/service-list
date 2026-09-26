@@ -72,6 +72,12 @@ async def job_expire(ctx: AppContext) -> None:
     await expire(ctx)
 
 
+async def job_linkcheck(ctx: AppContext) -> None:
+    from app.services.linkcheck import job_pass
+
+    await job_pass(ctx)
+
+
 def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
     """(job, trigger) pairs."""
     return [
@@ -80,6 +86,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_expire_unpaid, IntervalTrigger(hours=1, jitter=60)),
         (job_reminders, IntervalTrigger(minutes=10)),
         (job_expire, IntervalTrigger(minutes=2)),
+        (job_linkcheck, IntervalTrigger(minutes=15, jitter=60)),
     ]
 
 
