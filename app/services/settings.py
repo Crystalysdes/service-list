@@ -35,6 +35,17 @@ def _scam_index_header_default() -> dict[str, Any]:
     return RichText().text("Scam list:", "bold").build().to_json()
 
 
+def _scam_intro_default() -> dict[str, Any]:
+    """Pinned on top of the Scam list channel: what it is, in Russian and then in English."""
+    rt = RichText().text("🇷🇺 Сервисы, которые ")
+    rt.link("Service List", "channel:main")
+    rt.text(" заблокировал за мошенничество. Не пользуйтесь ими — подробности в карточке каждого сервиса.")
+    rt.text("\n\n🇬🇧 Services banned by ")
+    rt.link("Service List", "channel:main")
+    rt.text(" for fraud. Do not use them — details are in each service's card.")
+    return rt.build().to_json()
+
+
 class SettingsGroup(BaseModel):
     KEY: ClassVar[str] = ""
 
@@ -100,6 +111,9 @@ class Templates(SettingsGroup):
     nav_footer: dict[str, Any] = Field(default_factory=dict)
     nav_footer_sep: str = "\n\n"
     scam_index_header: dict[str, Any] = Field(default_factory=_scam_index_header_default)
+    # a separate field, so the default reaches installations whose templates were saved before it existed
+    scam_intro: dict[str, Any] = Field(default_factory=_scam_intro_default)
+    scam_empty: str = "Пока пусто · Nothing here yet"
     scam_index_prefix: str = "↳ "
     scam_card_title: str = "🚫 SCAM • {name}"
     scam_label_link: str = "Ссылка: "

@@ -8,7 +8,7 @@ import asyncio
 from sqlalchemy import select
 
 from app.db.models import BotChat, Channel
-from app.services.settings import Chats, get_settings
+from app.services.settings import Chats, Runtime, get_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.helpers import engine_for, imported_channel
 
@@ -91,6 +91,7 @@ async def test_telegram_picker_adds_the_bot_with_the_rights_and_connects(h, tg, 
     await h.pick_chat(OWNER_ID, SCAM)
     note, _ = tg.bot_messages(OWNER_ID)[-2:]
     assert "Канал подключён: Scam — Scam list" in note["text"]
+    assert "при запуске в эфир" in note["text"]  # not live yet
     assert tg.keyboard(OWNER_ID) is None
     async with db.session() as s:
         channel = (await s.execute(select(Channel))).scalar_one()
@@ -145,3 +146,17 @@ async def test_move_to_a_channel_chosen_with_the_picker(h, tg, db, ctx):
     async with db.session() as s:
         new = (await s.execute(select(Channel).where(Channel.chat_id == NEW_MAIN))).scalar_one()
         assert (new.role, new.status) == ("main", "migrating")
+
+
+async def test_scam_channel_connected_while_live_is_filled_right_away(h, tg, db):
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    async with db.session() as s:
+        await update_settings(s, Runtime, live=True)
+        await s.commit()
+    tg.add_chat(SCAM, "channel", "Scam", bot_status="left")
+    await _connect_screen(h, "Scam list")
+    await h.pick_chat(OWNER_ID, SCAM)
+    note, _ = tg.bot_messages(OWNER_ID)[-2:]
+    assert "Бот сейчас заполнит канал" in note["text"]
+    async with db.session() as s:
+        assert (await s.execute(select(Channel))).scalar_one().status == "live"

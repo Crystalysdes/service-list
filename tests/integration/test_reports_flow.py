@@ -14,6 +14,7 @@ from tests.conftest import OWNER_ID
 from tests.helpers import MAIN, channel_row, engine_for, imported_channel
 
 SCAM = -1009990000001
+SCAM2 = -1009990000002
 REPORTER = 8001
 REPORTER_EN = 8002
 SELLER = 8003
@@ -172,7 +173,11 @@ async def test_report_ban_scam_channel_and_amnesty(h, tg, db, ctx):
     link = u16len(card_post["text"][: card_post["text"].index("https://t.me/tripmafia")])
     assert {"type": "code", "offset": link, "length": len("https://t.me/tripmafia")} in card_post["entities"]
     assert shot.get("photo") and shot["_reply_to"] == card_post["message_id"]
-    assert index["text"].startswith("Scam list:")
+    # the pinned first index page starts with what the channel is, in Russian and then in English
+    assert index["text"].startswith("🇷🇺 Сервисы, которые Service List заблокировал за мошенничество")
+    assert "\n\n🇬🇧 Services banned by Service List for fraud" in index["text"]
+    assert "Scam list:\n\n↳ Tripmafia — #travel" in index["text"]
+    assert any(e.get("url") == "https://t.me/servicelist" for e in index["entities"])
     assert any(e.get("url") == f"https://t.me/scamlist/{card_post['message_id']}" for e in index["entities"])
     assert tg.pins[SCAM] == [index["message_id"]]
     again = await engine.run_once(ids["scam_channel_id"])
@@ -200,7 +205,9 @@ async def test_report_ban_scam_channel_and_amnesty(h, tg, db, ctx):
         assert (await s.get(Service, ids["trip"])).status == "active"
         assert not list((await s.execute(select(BlacklistEntry))).scalars())
     await engine.run_once(ids["scam_channel_id"])
-    assert tg.messages[SCAM] == {} and tg.pins[SCAM] == []
+    [left] = tg.messages[SCAM].values()  # the card and screenshot are gone, the pinned intro stays
+    assert left["message_id"] == index["message_id"] and "Пока пусто · Nothing here yet" in left["text"]
+    assert tg.pins[SCAM] == [index["message_id"]]
     await engine.run_once(ids["channel_id"])
     assert "Tripmafia" in tg.messages[MAIN][ids["travel"]]["text"]
 
@@ -303,6 +310,29 @@ async def test_manual_scam_entry_and_blacklist_screen(h, tg, db, ctx):
     assert "записей — 1" in h.last(OWNER_ID)["text"]
 
 
+async def test_empty_scam_channel_gets_the_pinned_intro_and_page_one_stays_on_top(h, tg, db, ctx):
+    ids, engine = await _setup(tg, db, ctx)
+    await engine.run_once(ids["scam_channel_id"])
+    [intro] = tg.messages[SCAM].values()
+    assert intro["text"].startswith("🇷🇺 Сервисы, которые Service List") and "Пока пусто" in intro["text"]
+    assert tg.pins[SCAM] == [intro["message_id"]]
+
+    # a big list filled at once: several pages, the first one (with the intro) is the top pin
+    tg.add_chat(SCAM2, "channel", "Scam list 2", username="scamlist2")
+    async with db.session() as s:
+        scam2 = await save_channel(s, await ctx.bot.get_chat(SCAM2), "mirror", None)
+        scam2.role, scam2.status = "scam", "live"
+        for number in range(1, 181):
+            s.add(ScamEntry(name=f"Scam service {number}", url=f"https://t.me/scam{number}", summary="."))
+        await s.commit()
+        scam2_id = scam2.id
+    await engine.run_once(scam2_id)
+    indexes = [m for m in tg.messages[SCAM2].values() if "Scam list:" in m["text"]]
+    assert len(indexes) == 3
+    first = next(m for m in indexes if m["text"].startswith("🇷🇺"))
+    assert tg.pins[SCAM2][-1] == first["message_id"]
+
+
 def test_scam_index_pages_fit_telegram_limits():
     tpl = Templates()
     entries = [
@@ -326,6 +356,7 @@ def test_scam_index_pages_fit_telegram_limits():
         assert fragment.u16len <= 4096
         assert fragment.user_entity_count() <= 100
         assert f"({number}/{len(pages)})" in fragment.text
+        assert fragment.text.startswith("🇷🇺") == (number == 1)  # the intro is on the first page only
 
 
 async def test_scam_channel_lost_rights_marks_it_broken(h, tg, db, ctx):

@@ -21,6 +21,7 @@ from app.db.base import utcnow
 from app.db.models import Channel, ChannelPost, ScamEntry
 from app.domain.richtext import Fragment, RichText, u16_trim, u16len
 from app.domain.symbols import LinkContext, channel_post_base
+from app.services import render_db
 from app.services.media import send_album
 from app.services.notify import notify_staff
 from app.services.settings import Templates, get_settings
@@ -55,20 +56,24 @@ def _index_line(entry: ScamEntry, tpl: Templates) -> str:
 
 
 def paginate(entries: list[ScamEntry], tpl: Templates) -> list[list[ScamEntry]]:
-    """Split the (newest first) entries into index pages that fit Telegram's limits."""
+    """Split the (newest first) entries into index pages that fit Telegram's limits.
+
+    There is always a first page: it carries the intro, so the channel explains itself even when empty.
+    """
     header = u16len(Fragment.from_json(tpl.scam_index_header).text) + 16
+    intro = Fragment.from_json(tpl.scam_intro)
     pages: list[list[ScamEntry]] = []
     current: list[ScamEntry] = []
-    size = header
+    size = header + u16len(intro.text) + 2
+    lines = INDEX_PAGE - len([e for e in intro.entities if e.type != "custom_emoji"])  # 100 entities max
     for entry in entries:
         line = u16len(_index_line(entry, tpl)) + 1
-        if current and (len(current) >= INDEX_PAGE or size + line > INDEX_CHARS):
+        if current and (len(current) >= lines or size + line > INDEX_CHARS):
             pages.append(current)
-            current, size = [], header
+            current, size, lines = [], header, INDEX_PAGE
         current.append(entry)
         size += line
-    if current:
-        pages.append(current)
+    pages.append(current)
     return pages
 
 
@@ -76,11 +81,17 @@ def render_index(
     entries: list[ScamEntry], page: int, pages: int, tpl: Templates, ctx: LinkContext
 ) -> Fragment:
     rt = RichText()
+    intro = Fragment.from_json(tpl.scam_intro)
+    if page == 1 and intro.text:
+        rt.fragment(intro)
+        rt.text("\n\n")
     with rt.wrap("blockquote"):
         rt.fragment(Fragment.from_json(tpl.scam_index_header))
         if pages > 1:
             rt.text(f" ({page}/{pages})")
         rt.text("\n\n")
+        if not entries:
+            rt.text(tpl.scam_empty)
         for index, entry in enumerate(entries):
             if index:
                 rt.text("\n")
@@ -197,6 +208,7 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
         assert channel is not None
         chat_id, username = channel.chat_id, channel.username
         tpl = await get_settings(session, Templates)
+        channel_urls = await render_db.channel_urls(session)
         entries = list(
             (
                 await session.execute(
@@ -289,9 +301,15 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
         )
         card_messages = {r.block_id: r.message_id for r in rows if r.kind == "scam_card" and r.message_id}
         indexes = {r.block_id: r for r in rows if r.kind == "scam_index"}
-    link_ctx = LinkContext(scam_post_base=channel_post_base(chat_id, username), scam_cards=card_messages)
+    link_ctx = LinkContext(
+        bot_username=ctx.bot_username,
+        channels=channel_urls,
+        scam_post_base=channel_post_base(chat_id, username),
+        scam_cards=card_messages,
+    )
     pages = paginate(list(reversed(entries)), tpl)
     created = False
+    first_page_id = indexes[1].message_id if indexes.get(1) is not None else None
     for page, chunk in enumerate(pages, start=1):
         fragment = render_index(chunk, page, len(pages), tpl, link_ctx)
         content_hash = fragment.content_hash()
@@ -302,6 +320,8 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
             with contextlib.suppress(TelegramAPIError):
                 await bot.pin_chat_message(chat_id, message.message_id, disable_notification=True)
             created = True
+            if page == 1:
+                first_page_id = message.message_id
             async with ctx.db.session() as session:
                 target = await session.get(ChannelPost, row.id) if row is not None else None
                 if target is None:
@@ -332,9 +352,9 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
                 result.edited += 1
         else:
             result.unchanged += 1
-    if created and len(pages) > 1 and indexes.get(1) is not None and indexes[1].message_id:
+    if created and len(pages) > 1 and first_page_id:  # the first page (with the intro) stays on top
         with contextlib.suppress(TelegramAPIError):
-            await bot.pin_chat_message(chat_id, indexes[1].message_id, disable_notification=True)
+            await bot.pin_chat_message(chat_id, first_page_id, disable_notification=True)
 
     # pages that are no longer needed (entries removed)
     for page, row in sorted(indexes.items()):

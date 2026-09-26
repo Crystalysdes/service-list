@@ -29,7 +29,7 @@ from app.services.channels import (
     request_chat_keyboard,
     save_channel,
 )
-from app.services.settings import Chats, get_settings, save_settings
+from app.services.settings import Chats, Runtime, get_settings, save_settings
 
 router = Router(name="admin_channels")
 router.message.filter(RoleFilter("admin"))
@@ -213,11 +213,15 @@ async def connect(
             return
         channel = await save_channel(session, chat, role, await ensure_invite_link(bot, chat))
         await audit(session, user_id, "channel.connect", "channel", channel.id, {"role": role})
-        note = f"✅ Канал подключён: {h(chat.title or chat.id)} — {ROLE_TITLES[role]}.\n" + (
-            "Дальше: «📦 Импорт», чтобы перенести текущие посты в базу."
-            if role == "main"
-            else "Посты будут опубликованы при запуске в эфир."
-        )
+        live = (await get_settings(session, Runtime)).live
+        if role == "main":
+            after = "Дальше: «📦 Импорт», чтобы перенести текущие посты в базу."
+        elif live:  # already on air: the channel is filled right away
+            channel.status = "live"
+            after = "Бот сейчас заполнит канал."
+        else:
+            after = "Посты будут опубликованы при запуске в эфир."
+        note = f"✅ Канал подключён: {h(chat.title or chat.id)} — {ROLE_TITLES[role]}.\n{after}"
     await state.clear()
     await session.commit()
     engine = data["ctx"].get("sync")

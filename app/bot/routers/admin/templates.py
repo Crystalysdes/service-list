@@ -35,9 +35,12 @@ TEXTS = {
     "scam_label_category": "Подпись «Ветка» в карточке скама",
     "scam_label_date": "Подпись «Дата» в карточке скама",
     "scam_removed": "Текст снятой карточки скама",
+    "scam_empty": "Строка пустого скам-листа",
 }
-# fragment templates: (title, symbolic link target of the linked part or None)
+KEEP_LINKS = "*"  # links stay as the admin made them
+# fragment templates: (title, symbolic link target of the linked part, None = no links, or KEEP_LINKS)
 FRAGMENTS: dict[str, tuple[str, str | None]] = {
+    "scam_intro": ("Описание Scam list (RU + EN, закреплено)", KEEP_LINKS),
     "cta": ("Строка «[занять место]» (ведёт в бота)", "bot:start:add_{slug}"),
     "footer": ("Футер категорий «#навигация»", "post:nav"),
     "emoji_name_marker": ("Метка у эмодзи-названия «[тык.]»", "service:url"),
@@ -45,6 +48,7 @@ FRAGMENTS: dict[str, tuple[str, str | None]] = {
     "scam_index_header": ("Заголовок индекса скам-листа", None),
 }
 LINK_TYPES = {"text_link", "url"}
+MAX_LEN = {"scam_intro": 1500}
 
 
 def _preview_links(url: str, bot_username: str | None) -> str | None:
@@ -59,6 +63,8 @@ def fragment_from_input(message: Message, target: str | None) -> Fragment:
     """The admin's message becomes the template; the part made a link points to ``target``."""
     fragment = Fragment.from_message(message).without_auto()
     fragment = Fragment(fragment.text, tuple(e for e in fragment.entities if e.type != "url"))
+    if target == KEEP_LINKS:
+        return fragment
     if target is None:
         return Fragment(fragment.text, tuple(e for e in fragment.entities if e.type != "text_link"))
     links = [e for e in fragment.entities if e.type == "text_link"]
@@ -130,7 +136,9 @@ async def on_field(call: CallbackQuery, state: FSMContext, session: AsyncSession
             f"<b>{title}</b> — сейчас так (сообщение выше).\n\n"
             "Пришлите новый вариант сообщением: можно жирный, курсив и премиум-эмодзи."
         )
-        if target is not None:
+        if target == KEEP_LINKS:
+            prompt += f" Ссылки сохранятся как есть. До {MAX_LEN.get(key, 300)} символов."
+        elif target is not None:
             prompt += (
                 " Сделайте ссылкой ту часть, которая должна вести куда нужно (адрес любой — бот подставит "
                 "свой); если ссылки нет, ссылкой станет весь текст."
@@ -169,9 +177,11 @@ async def input_template(message: Message, data: dict[str, Any], fsm: dict[str, 
             )
             return False
         problems = validate(fragment)
-        if not fragment.text.strip() or fragment.u16len > 300 or problems:
+        limit = MAX_LEN.get(key, 300)
+        if not fragment.text.strip() or fragment.u16len > limit or problems:
             await message.answer(
-                "Не подходит: " + (h("; ".join(problems)) if problems else "нужен текст до 300 символов.")
+                "Не подходит: "
+                + (h("; ".join(problems)) if problems else f"нужен текст до {limit} символов.")
             )
             return False
         stored = fragment.to_json()
