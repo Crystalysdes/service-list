@@ -1,6 +1,6 @@
 # Tests on every push; when they pass, the server is updated over SSH.
-# Deploy needs three repository secrets printed by deploy/bootstrap.sh on the server:
-#   DEPLOY_HOST, DEPLOY_KNOWN_HOSTS, DEPLOY_SSH_KEY
+# Deploy needs the repository secrets printed by deploy/bootstrap.sh on the server:
+#   DEPLOY_HOST, DEPLOY_KNOWN_HOSTS, DEPLOY_SSH_KEY (+ DEPLOY_PORT when SSH is not on port 22)
 # The key is restricted on the server: it can only run "deploy <commit sha>" of this branch.
 name: test-and-deploy
 
@@ -63,6 +63,7 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
         run: |
           if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_KNOWN_HOSTS" ] || [ -z "$DEPLOY_SSH_KEY" ]; then
             echo "::warning::Deploy secrets are not set yet (DEPLOY_HOST, DEPLOY_KNOWN_HOSTS, DEPLOY_SSH_KEY) - skipping deploy."
@@ -73,6 +74,7 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           ssh -i ~/.ssh/deploy_key \
+            -p "${DEPLOY_PORT:-22}" \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o BatchMode=yes \

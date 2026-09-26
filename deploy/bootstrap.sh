@@ -37,7 +37,8 @@ esac
 step "Устанавливаю системные пакеты"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq git curl ca-certificates openssl ufw openssh-client iproute2 >/dev/null
+apt-get install -y -qq git curl ca-certificates openssl ufw openssh-client openssh-server iproute2 >/dev/null
+systemctl enable --now ssh >/dev/null 2>&1 || true
 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     step "Устанавливаю Docker"
@@ -59,10 +60,15 @@ install -m 755 "$DIR/deploy/servicelist" /usr/local/bin/servicelist
 step "Настройки бота"
 SL_DIR="$DIR" SL_NO_RESTART=1 servicelist config
 
-step "Файрвол: открыт только SSH (боту входящие порты не нужны)"
-ufw allow OpenSSH >/dev/null
+# the port(s) sshd really listens on — never lock out a session on a non-standard port
+ssh_ports=$(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -u)
+[[ -n "$ssh_ports" ]] || ssh_ports=22
+step "Файрвол: открыт только SSH (порт $(echo "$ssh_ports" | paste -sd, -)); боту входящие порты не нужны"
+for port in $ssh_ports; do
+    ufw allow "$port/tcp" >/dev/null
+done
 ufw --force enable >/dev/null
-ufw status | head -n 5
+ufw status | head -n 6
 
 step "Собираю и запускаю бота (первый раз это займёт 2–4 минуты)"
 if SL_DIR="$DIR" servicelist deploy; then

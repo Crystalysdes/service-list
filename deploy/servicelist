@@ -386,6 +386,12 @@ cmd_ssh_deploy() {
     cmd_deploy "$sha"
 }
 
+ssh_port() {
+    local port=${SL_SSH_PORT:-}
+    [[ -n "$port" ]] || port=$(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
+    printf '%s' "${port:-22}"
+}
+
 detect_ip() {
     local ip=""
     if command -v ip >/dev/null 2>&1; then
@@ -398,7 +404,7 @@ detect_ip() {
 cmd_deploy_key() {
     command -v ssh-keygen >/dev/null || die "Нет ssh-keygen (apt-get install openssh-client)"
     [[ -f "$SL_HOST_KEY" ]] || die "Нет ключа сервера $SL_HOST_KEY"
-    local host keys_dir tmp
+    local host keys_dir tmp port known_host
     make_tmp
     tmp=$SL_TMP
     ssh-keygen -q -t ed25519 -N '' -C "$KEY_COMMENT" -f "$tmp/key"
@@ -415,15 +421,21 @@ cmd_deploy_key() {
     host=$(detect_ip)
     ask host "Внешний IP этого сервера" "$host"
     [[ "$host" =~ ^[0-9a-fA-F.:]+$ ]] || die "Некорректный IP: $host"
+    port=$(ssh_port)
+    known_host=$host
+    [[ "$port" == 22 ]] || known_host="[$host]:$port"
 
     printf '\n%s════ СЕКРЕТЫ ДЛЯ GITHUB ════%s\n' "$B" "$N"
     printf 'GitHub → репозиторий service-list → Settings → Secrets and variables → Actions → New repository secret.\n'
-    printf 'Создайте три секрета (имя — ровно как здесь, значение — всё между линиями):\n\n'
+    printf 'Создайте секреты ниже (имя — ровно как здесь, значение — всё между линиями):\n\n'
     printf '%s1) DEPLOY_HOST%s\n────────\n%s\n────────\n\n' "$B" "$N" "$host"
-    printf '%s2) DEPLOY_KNOWN_HOSTS%s\n────────\n%s %s\n────────\n\n' "$B" "$N" "$host" "$(awk '{print $1" "$2}' "$SL_HOST_KEY")"
+    printf '%s2) DEPLOY_KNOWN_HOSTS%s\n────────\n%s %s\n────────\n\n' "$B" "$N" "$known_host" "$(awk '{print $1" "$2}' "$SL_HOST_KEY")"
     printf '%s3) DEPLOY_SSH_KEY%s (весь блок, включая строки BEGIN и END)\n────────\n' "$B" "$N"
     cat "$tmp/key"
     printf '────────\n\n'
+    if [[ "$port" != 22 ]]; then
+        printf '%s4) DEPLOY_PORT%s (SSH здесь не на стандартном порту)\n────────\n%s\n────────\n\n' "$B" "$N" "$port"
+    fi
     printf 'Приватный ключ хранится только в GitHub: с сервера он удалён. Этим ключом можно лишь обновить бота —\n'
     printf 'ни консоли, ни других команд. Новый ключ: «servicelist deploy-key» (старый перестанет работать).\n'
 }
