@@ -70,6 +70,20 @@ done
 ufw --force enable >/dev/null
 ufw status | head -n 6
 
+step "Защита SSH от перебора паролей (fail2ban)"
+apt-get install -y -qq fail2ban python3-systemd >/dev/null
+cat >/etc/fail2ban/jail.d/servicelist-sshd.conf <<JAIL
+[sshd]
+enabled = true
+backend = systemd
+port = $(echo "$ssh_ports" | paste -sd, -)
+maxretry = 10
+findtime = 10m
+bantime = 1h
+JAIL
+systemctl enable fail2ban >/dev/null 2>&1 || true
+systemctl restart fail2ban || warn "fail2ban не запустился — боту это не мешает."
+
 step "Собираю и запускаю бота (первый раз это займёт 2–4 минуты)"
 if SL_DIR="$DIR" servicelist deploy; then
     (cd "$DIR" && docker compose logs --tail 15 bot) || true
