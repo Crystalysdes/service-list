@@ -30,6 +30,8 @@ REQUIRED_RIGHTS: dict[str, tuple[str, ...]] = {
     "storage": ("can_post_messages", "can_edit_messages", "can_delete_messages"),
 }
 ROLE_TITLES = {"main": "основной", "mirror": "зеркало", "scam": "Scam list", "storage": "служебный"}
+# channels that are not "the" main / scam channel: retired ones and new ones still being filled (a move)
+INACTIVE_STATUSES = ("retired", "migrating")
 
 _REF_RE = re.compile(r"^(?:https?://)?(?:t\.me/|telegram\.me/)?@?([A-Za-z][A-Za-z0-9_]{3,31})/?$")
 
@@ -118,7 +120,9 @@ async def active_channels(
     session: AsyncSession, roles: tuple[str, ...] = ("main", "mirror")
 ) -> list[Channel]:
     rows = await session.execute(
-        select(Channel).where(Channel.role.in_(roles), Channel.status != "retired").order_by(Channel.id)
+        select(Channel)
+        .where(Channel.role.in_(roles), Channel.status.not_in(INACTIVE_STATUSES))
+        .order_by(Channel.id)
     )
     return list(rows.scalars())
 

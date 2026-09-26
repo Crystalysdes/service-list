@@ -78,6 +78,23 @@ async def job_linkcheck(ctx: AppContext) -> None:
     await job_pass(ctx)
 
 
+async def job_health(ctx: AppContext) -> None:
+    from app.services.migration import check_health
+
+    await check_health(ctx)
+
+
+async def job_backup(ctx: AppContext) -> None:
+    from app.services.backup import make_backup
+    from app.services.notify import notify_staff
+
+    try:
+        await make_backup(ctx, "daily")
+    except Exception:
+        log.exception("daily backup failed")
+        await notify_staff(ctx, "🚨 Ежедневная резервная копия не создана — подробности в логе бота.")
+
+
 def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
     """(job, trigger) pairs."""
     return [
@@ -87,6 +104,8 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_reminders, IntervalTrigger(minutes=10)),
         (job_expire, IntervalTrigger(minutes=2)),
         (job_linkcheck, IntervalTrigger(minutes=15, jitter=60)),
+        (job_health, IntervalTrigger(minutes=15, jitter=60)),
+        (job_backup, CronTrigger(hour=4, minute=0, timezone=ctx.config.timezone)),
     ]
 
 

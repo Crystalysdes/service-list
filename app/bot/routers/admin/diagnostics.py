@@ -15,6 +15,7 @@ from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.db.models import Channel, ChannelPost
 from app.services.audit import audit
+from app.services.channels import INACTIVE_STATUSES
 from app.services.selftest import Check, Diagnostics, diagnostics, format_report
 from app.services.settings import Runtime, get_settings, update_settings
 from app.services.sync.engine import emoji_allowed
@@ -94,7 +95,9 @@ async def on_plain(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
 async def on_live_on(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     runtime = await get_settings(session, Runtime)
     main = (
-        await session.execute(select(Channel).where(Channel.role == "main", Channel.status != "retired"))
+        await session.execute(
+            select(Channel).where(Channel.role == "main", Channel.status.not_in(INACTIVE_STATUSES))
+        )
     ).scalar_one_or_none()
     if main is None:
         await call.answer("Сначала подключите основной канал.", show_alert=True)

@@ -11,13 +11,16 @@ from app.db.models import Category, Channel, ChannelPost, Order, Service, User
 from app.domain.symbols import channel_post_base
 from app.services.billing import PaidResult, feature_row, money
 from app.services.catalog import request_sync
+from app.services.channels import INACTIVE_STATUSES
 from app.services.notify import notify_staff, notify_user
 from app.services.timefmt import fmt_date
 
 
 async def category_post_url(session: AsyncSession, category_id: int) -> str | None:
     main = (
-        await session.execute(select(Channel).where(Channel.role == "main", Channel.status != "retired"))
+        await session.execute(
+            select(Channel).where(Channel.role == "main", Channel.status.not_in(INACTIVE_STATUSES))
+        )
     ).scalar_one_or_none()
     if main is None:
         return None

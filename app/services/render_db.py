@@ -22,6 +22,7 @@ from app.domain.render import (
 )
 from app.domain.richtext import Fragment
 from app.domain.symbols import LinkContext, channel_post_base, channel_url
+from app.services.channels import INACTIVE_STATUSES
 from app.services.settings import Limits as LimitSettings
 from app.services.settings import Runtime, Templates, get_settings
 
@@ -102,7 +103,9 @@ async def limits(session: AsyncSession) -> Limits:
 async def channel_urls(session: AsyncSession) -> dict[str, str]:
     urls: dict[str, str] = {}
     rows = await session.execute(
-        select(Channel).where(Channel.role.in_(("main", "scam")), Channel.status != "retired")
+        select(Channel)
+        .where(Channel.role.in_(("main", "scam")), Channel.status.not_in(INACTIVE_STATUSES))
+        .order_by(Channel.id)
     )
     for channel in rows.scalars():
         url = channel_url(channel.chat_id, channel.username, channel.invite_link)

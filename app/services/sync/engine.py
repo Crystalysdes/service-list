@@ -178,12 +178,13 @@ class SyncEngine:
         await self.ensure_workers()
         self.wake()
 
-    async def run_once(self, channel_id: int) -> PassResult:
+    async def run_once(self, channel_id: int, *, force: bool = False) -> PassResult:
         """Run a pass right now (admin "sync now", tests)."""
-        return await self.reconcile(channel_id, RateLimiter(10_000))
+        return await self.reconcile(channel_id, RateLimiter(10_000), force=force)
 
     # ------------------------------------------------------------------ reconcile
-    async def reconcile(self, channel_id: int, limiter: RateLimiter) -> PassResult:
+    async def reconcile(self, channel_id: int, limiter: RateLimiter, *, force: bool = False) -> PassResult:
+        """One pass over a channel. ``force`` publishes even before "live" (filling a new channel)."""
         result = PassResult()
         async with self._lock:
             async with self.ctx.db.session() as session:
@@ -192,7 +193,7 @@ class SyncEngine:
                 if channel is None or channel.status in ("broken", "retired", "paused"):
                     result.skipped.append("channel")
                     return result
-                if not runtime.live:
+                if not runtime.live and not force:
                     result.skipped.append("not_live")
                     return result
                 planner = self.planners.get(channel.role)

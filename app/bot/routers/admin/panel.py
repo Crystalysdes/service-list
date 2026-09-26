@@ -48,8 +48,12 @@ async def wizard_steps(session: AsyncSession) -> list[tuple[str, bool]]:
     ]
 
 
-def home_keyboard(role: str | None, pending: int, reports: int) -> InlineKeyboardMarkup:
+def home_keyboard(
+    role: str | None, pending: int, reports: int, can_restore: bool = False
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    if can_restore:
+        builder.button(text="♻️ Восстановить из резервной копии", callback_data="a:bak:restore")
     builder.button(text=f"📥 Заявки ({pending})", callback_data="a:mod")
     builder.button(text=f"⚠️ Жалобы ({reports})", callback_data="a:rep")
     builder.button(text="🗂 Категории", callback_data="a:cat")
@@ -90,8 +94,15 @@ async def show_home(chat_id: int, data: dict[str, Any], *, edit: Message | None 
         lines.append("")
     else:
         lines.append("✅ Всё настроено, бот в эфире.")
+    can_restore = False
+    if data.get("role") == "owner" and not steps[2][1]:
+        from app.services.backup import database_is_empty
+
+        can_restore = await database_is_empty(data["ctx"].db)
+        if can_restore:
+            lines.append("Переезжаете на новый сервер? Восстановите всё из резервной копии.")
     text = "\n".join(lines)
-    markup = home_keyboard(data.get("role"), pending or 0, reports or 0)
+    markup = home_keyboard(data.get("role"), pending or 0, reports or 0, can_restore)
     if edit is not None:
         try:
             await edit.edit_text(text, reply_markup=markup)

@@ -79,7 +79,14 @@ async def ctx(db, bot, config, tg):
         bot_username=tg.bot_user["username"],
     )
     context.services["throttle"] = (100_000, 1.0)
-    return context
+    yield context
+    # background work started by handlers (sync workers, link checks, moves) must not outlive the test
+    engine = context.services.get("sync")
+    if engine is not None:
+        await engine.stop()
+    for key in ("linkcheck_tasks", "migration_tasks"):
+        for task in list(context.services.get(key, ())):
+            task.cancel()
 
 
 @pytest.fixture

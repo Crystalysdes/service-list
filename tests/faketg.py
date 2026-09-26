@@ -754,7 +754,8 @@ class Harness:
         return msg
 
     async def send(self, user_id: int, **fields: Any) -> dict[str, Any]:
-        msg = self.tg.user_message(user_id, None, **fields)
+        text = fields.pop("text", None)
+        msg = self.tg.user_message(user_id, text, **fields)
         await self.feed({"message": self.tg._export(msg)})
         return msg
 

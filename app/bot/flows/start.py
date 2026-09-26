@@ -17,6 +17,7 @@ from app.db.base import utcnow
 from app.db.models import Channel
 from app.domain.captcha import is_blocked, new_challenge
 from app.domain.symbols import channel_url
+from app.services.channels import INACTIVE_STATUSES
 from app.services.settings import Captcha, get_settings
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
@@ -92,7 +93,9 @@ async def send_language_choice(chat_id: int, data: dict[str, Any], *, edit: Mess
 async def channel_links(session: AsyncSession) -> tuple[str | None, str | None]:
     rows = (
         await session.execute(
-            select(Channel).where(Channel.role.in_(("main", "scam")), Channel.status != "retired")
+            select(Channel)
+            .where(Channel.role.in_(("main", "scam")), Channel.status.not_in(INACTIVE_STATUSES))
+            .order_by(Channel.id)
         )
     ).scalars()
     main_url = scam_url = None

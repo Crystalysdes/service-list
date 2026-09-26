@@ -155,7 +155,7 @@ async def diagnostics(ctx: AppContext) -> Diagnostics:
             report.checks.append(Check(f"Права: {title}", True, "ок"))
     # edit rights on posts not sent by the bot: a no-op markup edit must answer "not modified"
     async with ctx.db.session() as session:
-        main = next((c for c in channels if c.role == "main"), None)
+        main = next((c for c in channels if c.role == "main" and c.status != "migrating"), None)
         nav = None
         if main is not None:
             nav = (
