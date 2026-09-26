@@ -16,6 +16,7 @@ from app.db.models import Channel, ChannelPost
 from app.domain.render import compare
 from app.domain.richtext import Fragment
 from app.services.catalog import request_sync
+from app.services.channels import remember_chat
 from app.services.notify import claim_notification, notify_staff
 from app.services.settings import Runtime, get_settings
 
@@ -86,6 +87,8 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
 
 @router.my_chat_member()
 async def on_my_member(update: ChatMemberUpdated, session: AsyncSession, **data: Any) -> None:
+    # remembered for the "choose a channel" lists: Telegram gives bots no way to list their chats
+    await remember_chat(session, update.chat, update.new_chat_member)
     channel = await _channel(session, update.chat.id)
     if channel is None:
         return

@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,12 +17,16 @@ from app.bot.routers.admin.panel import back_home
 from app.bot.states import ChannelConnect
 from app.services.audit import audit
 from app.services.channels import (
+    REQUEST_IDS,
     RIGHT_NAMES,
     ROLE_TITLES,
     active_channels,
     chat_ref_from_message,
     ensure_invite_link,
     inspect_chat,
+    known_chats,
+    missing_rights,
+    request_chat_keyboard,
     save_channel,
 )
 from app.services.settings import Chats, get_settings, save_settings
@@ -31,11 +35,19 @@ router = Router(name="admin_channels")
 router.message.filter(RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
+CONNECT_ROLES = (*ROLE_TITLES, "moderation")
 CONNECT_HELP = (
-    "Добавьте бота в канал администратором с правами: публикация, редактирование и удаление сообщений, "
-    "приглашение пользователей.\n\nЗатем перешлите сюда любой пост из этого канала "
-    "или пришлите его @username / ID."
+    "Бот должен быть администратором канала с правами: публикация, редактирование и удаление сообщений, "
+    "приглашение пользователей."
 )
+BIND_HINT = (
+    "Если в группе включены темы, отправьте в нужных темах <code>/bind applications</code>, "
+    "<code>/bind reports</code> и <code>/bind log</code> — тогда заявки, жалобы и лог пойдут по своим темам."
+)
+
+
+def _what(role: str) -> str:
+    return "группа модерации" if role == "moderation" else f"{ROLE_TITLES[role]} канал"
 
 
 async def channels_text(session: AsyncSession) -> str:
@@ -63,11 +75,7 @@ async def channels_text(session: AsyncSession) -> str:
             f"<b>Группа модерации:</b> {chats.moderation_chat_id}" + (f" ({extra})" if extra else "")
         )
     else:
-        lines.append(
-            "<b>Группа модерации:</b> не привязана — добавьте бота в группу и отправьте там "
-            "<code>/bind</code> (в группе с темами: <code>/bind applications</code>, "
-            "<code>/bind reports</code>, <code>/bind log</code> в нужных темах)."
-        )
+        lines.append("<b>Группа модерации:</b> не подключена — кнопка «👥 Группа модерации» ниже.")
     return "\n".join(lines)
 
 
@@ -79,37 +87,145 @@ def channels_keyboard(has_main: bool, has_scam: bool) -> Any:
         builder.button(text="➕ Канал Scam list", callback_data="a:ch:add:scam")
     builder.button(text="➕ Зеркало", callback_data="a:ch:add:mirror")
     builder.button(text="🗄 Служебный канал", callback_data="a:ch:add:storage")
+    builder.button(text="👥 Группа модерации", callback_data="a:ch:add:moderation")
     builder.button(text="🚚 Переезд / пересборка", callback_data="a:mig")
     builder.adjust(1)
     return back_home(builder)
+
+
+async def _channels_screen(session: AsyncSession) -> tuple[str, Any]:
+    roles = {c.role for c in await active_channels(session, ("main", "scam"))}
+    return await channels_text(session), channels_keyboard("main" in roles, "scam" in roles)
 
 
 @router.callback_query(F.data == "a:ch")
 async def on_channels(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     await state.clear()
     await call.answer()
-    channels = await active_channels(session, ("main", "scam"))
-    roles = {c.role for c in channels}
+    text, markup = await _channels_screen(session)
     assert call.message is not None
-    await call.message.edit_text(
-        await channels_text(session), reply_markup=channels_keyboard("main" in roles, "scam" in roles)
-    )
+    await call.message.edit_text(text, reply_markup=markup)
+
+
+async def connect_screen(session: AsyncSession, role: str) -> tuple[str, Any]:
+    """Known chats as buttons + how to use Telegram's own picker (sent separately, it is a reply keyboard)."""
+    kind = "group" if role == "moderation" else "channel"
+    chats = await known_chats(session, kind)
+    builder = InlineKeyboardBuilder()
+    for chat in chats:
+        icon = "👥" if kind == "group" else "📢"
+        warn = " ⚠️ мало прав" if missing_rights(chat, role) else ""
+        builder.button(
+            text=f"{icon} {(chat.title or str(chat.chat_id))[:40]}{warn}",
+            callback_data=f"a:ch:pick:{role}:{chat.chat_id}",
+        )
+    builder.adjust(1)
+    lines = [f"Подключение: <b>{_what(role)}</b>.", ""]
+    if chats:
+        lines.append(
+            "Группы, где есть бот, — нажмите нужную:"
+            if kind == "group"
+            else "Каналы, где бот уже администратор, — нажмите нужный:"
+        )
+    else:
+        lines.append(
+            "Бот пока не видит групп, куда его добавили."
+            if kind == "group"
+            else "Бот пока не видит каналов, где он администратор."
+        )
+    if kind == "group":
+        lines += [
+            "",
+            "Или нажмите «👥 Выбрать группу» внизу экрана: Telegram покажет ваши группы и сам добавит бота.",
+            "Ещё можно прислать сюда @username или ID группы либо отправить <code>/bind</code> "
+            "в самой группе.",
+        ]
+    else:
+        lines += [
+            "",
+            "Или нажмите «📋 Выбрать канал» внизу экрана: Telegram покажет ваши каналы и сам добавит туда "
+            "бота администратором с нужными правами.",
+            "Ещё можно переслать сюда любой пост из канала или прислать его @username / ID.",
+            "",
+            CONNECT_HELP,
+        ]
+    return "\n".join(lines), back_home(builder, target="a:ch")
 
 
 @router.callback_query(F.data.startswith("a:ch:add:"))
-async def on_add_channel(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+async def on_add_channel(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     role = (call.data or "").rsplit(":", 1)[1]
-    if role not in ROLE_TITLES:
+    if role not in CONNECT_ROLES:
         await call.answer()
         return
     await state.set_state(ChannelConnect.waiting)
     await state.update_data(role=role)
     await call.answer()
     assert call.message is not None
-    title = ROLE_TITLES[role]
-    await call.message.edit_text(
-        f"Подключение: <b>{title}</b> канал.\n\n{CONNECT_HELP}", reply_markup=back_home(target="a:ch")
+    text, markup = await connect_screen(session, role)
+    await call.message.edit_text(text, reply_markup=markup)
+    await call.message.answer(
+        "👇 Кнопка выбора — внизу экрана.", reply_markup=request_chat_keyboard(role, REQUEST_IDS[role])
     )
+
+
+async def connect(
+    target: Message,
+    role: str,
+    ref: int | str,
+    *,
+    session: AsyncSession,
+    bot: Bot,
+    state: FSMContext,
+    data: dict[str, Any],
+) -> None:
+    """Connect a channel / the storage channel / the moderation group chosen in any way."""
+    check = await inspect_chat(bot, ref, role)
+    if check.error:
+        await target.answer(f"⚠️ {h(check.error)}\n\n{CONNECT_HELP if role != 'moderation' else ''}".strip())
+        return
+    if check.missing:
+        missing = ", ".join(RIGHT_NAMES.get(r, r) for r in check.missing)
+        await target.answer(f"⚠️ Не хватает прав: {missing}. Выдайте их и выберите канал ещё раз.")
+        return
+    chat = check.chat
+    user_id = data["user"].id
+    if role in ("storage", "moderation"):
+        chats = await get_settings(session, Chats)
+        if role == "storage":
+            chats.storage_chat_id = chat.id
+            note = f"✅ Служебный канал подключён: {h(chat.title or chat.id)}"
+        else:
+            if chats.moderation_chat_id != chat.id:
+                chats.topic_applications = chats.topic_reports = chats.topic_log = None
+            chats.moderation_chat_id = chat.id
+            note = f"✅ Группа модерации подключена: {h(chat.title or chat.id)}\n\n{BIND_HINT}"
+        await save_settings(session, chats)
+        await audit(session, user_id, f"{role}.connect", "chat", chat.id)
+    else:
+        existing = [c for c in await active_channels(session, (role,)) if c.chat_id != chat.id]
+        if role in ("main", "scam") and existing:
+            await state.clear()
+            await target.answer(
+                "⚠️ Такой канал уже подключён. Для замены используйте «🚚 Переезд / пересборка».",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        channel = await save_channel(session, chat, role, await ensure_invite_link(bot, chat))
+        await audit(session, user_id, "channel.connect", "channel", channel.id, {"role": role})
+        note = f"✅ Канал подключён: {h(chat.title or chat.id)} — {ROLE_TITLES[role]}.\n" + (
+            "Дальше: «📦 Импорт», чтобы перенести текущие посты в базу."
+            if role == "main"
+            else "Посты будут опубликованы при запуске в эфир."
+        )
+    await state.clear()
+    await session.commit()
+    engine = data["ctx"].get("sync")
+    if engine is not None and role not in ("storage", "moderation"):
+        await engine.wake_all()
+    await target.answer(note, reply_markup=ReplyKeyboardRemove())
+    text, markup = await _channels_screen(session)
+    await target.answer(text, reply_markup=markup)
 
 
 @router.message(ChannelConnect.waiting, F.chat.type == "private")
@@ -120,52 +236,34 @@ async def on_channel_ref(
     ref = chat_ref_from_message(message)
     if ref is None:
         await message.answer(
-            "Не понял, какой это канал. Перешлите пост из канала или пришлите @username / ID."
+            "Не понял, какая это группа. Выберите её в списке или кнопкой внизу экрана либо пришлите "
+            "@username / ID группы."
+            if role == "moderation"
+            else "Не понял, какой это канал. Выберите его в списке или кнопкой внизу экрана, перешлите "
+            "из него пост или пришлите @username / ID."
         )
         return
-    check = await inspect_chat(bot, ref, role)
-    if check.error:
-        await message.answer(f"⚠️ {h(check.error)}\n\n{CONNECT_HELP}")
+    await connect(message, role, ref, session=session, bot=bot, state=state, data=data)
+
+
+@router.callback_query(F.data.regexp(r"^a:ch:pick:[a-z]+:-?\d+$"))
+async def on_pick(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot, **data: Any
+) -> None:
+    _, _, _, role, chat_id = (call.data or "").split(":")
+    if role not in CONNECT_ROLES:
+        await call.answer()
         return
-    if check.missing:
-        missing = ", ".join(RIGHT_NAMES.get(r, r) for r in check.missing)
-        await message.answer(f"⚠️ Не хватает прав: {missing}. Выдайте их и пришлите канал ещё раз.")
-        return
-    chat = check.chat
-    if role == "storage":
-        chats = await get_settings(session, Chats)
-        chats.storage_chat_id = chat.id
-        await save_settings(session, chats)
-        await audit(session, data["user"].id, "storage.connect", "chat", chat.id)
-        await state.clear()
-        await message.answer(
-            f"✅ Служебный канал подключён: {h(chat.title or chat.id)}", reply_markup=back_home(target="a:ch")
-        )
-        return
-    existing = [c for c in await active_channels(session, (role,)) if c.chat_id != chat.id]
-    if role in ("main", "scam") and existing:
-        await message.answer(
-            "⚠️ Такой канал уже подключён. Для замены используйте «🚚 Переезд / пересборка».",
-            reply_markup=back_home(target="a:ch"),
-        )
-        await state.clear()
-        return
-    invite = await ensure_invite_link(bot, chat)
-    channel = await save_channel(session, chat, role, invite)
-    await audit(session, data["user"].id, "channel.connect", "channel", channel.id, {"role": role})
-    await state.clear()
-    await session.commit()
-    engine = data["ctx"].get("sync")
-    if engine is not None:
-        await engine.wake_all()
+    await call.answer()
+    assert call.message is not None
+    await connect(call.message, role, int(chat_id), session=session, bot=bot, state=state, data=data)
+
+
+@router.message(StateFilter(None), F.chat_shared, F.chat.type == "private")
+async def on_stale_pick(message: Message, **data: Any) -> None:
     await message.answer(
-        f"✅ Канал подключён: {h(chat.title or chat.id)} — {ROLE_TITLES[role]}.\n"
-        + (
-            "Дальше: «📦 Импорт», чтобы перенести текущие посты в базу."
-            if role == "main"
-            else "Посты будут опубликованы при запуске в эфир."
-        ),
-        reply_markup=back_home(target="a:ch"),
+        "Этот выбор устарел. Откройте /admin → 📡 Каналы и выберите, что подключаете.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 

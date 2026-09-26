@@ -10,7 +10,7 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,9 @@ from app.services.channels import (
     chat_ref_from_message,
     ensure_invite_link,
     inspect_chat,
+    known_chats,
+    missing_rights,
+    request_chat_keyboard,
     save_channel,
 )
 
@@ -34,10 +37,13 @@ router.message.filter(F.chat.type == "private", RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
 HELP = (
-    "1. Создайте новый канал и добавьте бота администратором с правами: публикация, редактирование и "
-    "удаление сообщений, приглашение пользователей.\n"
-    "2. Перешлите сюда любой пост из нового канала или пришлите его @username / ID."
+    "1. Создайте новый канал.\n"
+    "2. Нажмите «📋 Выбрать канал» внизу экрана и выберите его — Telegram сам добавит туда бота "
+    "администратором с нужными правами. Или добавьте бота сами (публикация, редактирование и удаление "
+    "сообщений, приглашение пользователей) и выберите канал в списке выше, перешлите оттуда пост "
+    "или пришлите @username / ID."
 )
+MOVE_REQUEST_IDS = {"main": 201, "scam": 202}
 
 
 class MoveConnect(StatesGroup):
@@ -109,16 +115,28 @@ async def on_screen(call: CallbackQuery, state: FSMContext, session: AsyncSessio
 
 
 @router.callback_query(F.data.regexp(r"^a:mig:new:(main|scam)$"))
-async def on_new(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+async def on_new(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     role = (call.data or "").rsplit(":", 1)[1]
     await state.set_state(MoveConnect.waiting)
     await state.set_data({"role": role})
     await call.answer()
     assert call.message is not None
     builder = InlineKeyboardBuilder()
+    chats = await known_chats(session, "channel")
+    for chat in chats:
+        warn = " ⚠️ мало прав" if missing_rights(chat, role) else ""
+        builder.button(
+            text=f"📢 {(chat.title or str(chat.chat_id))[:40]}{warn}",
+            callback_data=f"a:mig:pick:{role}:{chat.chat_id}",
+        )
     builder.button(text="✖️ Отмена", callback_data="a:mig")
+    builder.adjust(1)
+    listed = "Каналы, где бот уже администратор, — нажмите нужный.\n\n" if chats else ""
     await call.message.edit_text(
-        f"🚚 Новый {ROLE_TITLES[role]} канал.\n\n{HELP}", reply_markup=builder.as_markup()
+        f"🚚 Новый {ROLE_TITLES[role]} канал.\n\n{listed}{HELP}", reply_markup=builder.as_markup()
+    )
+    await call.message.answer(
+        "👇 Кнопка выбора — внизу экрана.", reply_markup=request_chat_keyboard(role, MOVE_REQUEST_IDS[role])
     )
 
 
@@ -154,29 +172,28 @@ def _start_publish(ctx: AppContext, channel_id: int, chat_id: int) -> None:
     task.add_done_callback(tasks.discard)
 
 
-@router.message(MoveConnect.waiting)
-async def on_channel(
-    message: Message, state: FSMContext, session: AsyncSession, bot: Bot, **data: Any
+async def start_move(
+    target: Message,
+    role: str,
+    ref: int | str,
+    *,
+    session: AsyncSession,
+    bot: Bot,
+    state: FSMContext,
+    data: dict[str, Any],
 ) -> None:
-    role = (await state.get_data()).get("role", "main")
-    ref = chat_ref_from_message(message)
-    if ref is None:
-        await message.answer(
-            "Не понял, какой это канал. Перешлите пост из канала или пришлите @username / ID."
-        )
-        return
     check = await inspect_chat(bot, ref, role)
     if check.error:
-        await message.answer(f"⚠️ {h(check.error)}\n\n{HELP}")
+        await target.answer(f"⚠️ {h(check.error)}\n\n{HELP}")
         return
     if check.missing:
         missing = ", ".join(RIGHT_NAMES.get(r, r) for r in check.missing)
-        await message.answer(f"⚠️ Не хватает прав: {missing}. Выдайте их и пришлите канал ещё раз.")
+        await target.answer(f"⚠️ Не хватает прав: {missing}. Выдайте их и выберите канал ещё раз.")
         return
     chat = check.chat
     known = (await session.execute(select(Channel).where(Channel.chat_id == chat.id))).scalar_one_or_none()
     if known is not None and known.status not in ("retired",):
-        await message.answer("⚠️ Этот канал уже подключён. Нужен новый, пустой канал.")
+        await target.answer("⚠️ Этот канал уже подключён. Нужен новый, пустой канал.")
         return
     channel = await save_channel(session, chat, role, await ensure_invite_link(bot, chat))
     channel.status = "migrating"
@@ -189,11 +206,37 @@ async def on_channel(
     engine = ctx.get("sync")
     if engine is not None:
         await engine.ensure_workers()
-    await message.answer(
+    await target.answer(
         f"⏳ Канал {h(chat.title or chat.id)} подключён. Публикую всё — это займёт несколько минут "
-        "(Telegram разрешает около 20 постов в минуту). Итог пришлю сюда."
+        "(Telegram разрешает около 20 постов в минуту). Итог пришлю сюда.",
+        reply_markup=ReplyKeyboardRemove(),
     )
-    _start_publish(ctx, channel.id, message.chat.id)
+    _start_publish(ctx, channel.id, target.chat.id)
+
+
+@router.message(MoveConnect.waiting)
+async def on_channel(
+    message: Message, state: FSMContext, session: AsyncSession, bot: Bot, **data: Any
+) -> None:
+    role = (await state.get_data()).get("role", "main")
+    ref = chat_ref_from_message(message)
+    if ref is None:
+        await message.answer(
+            "Не понял, какой это канал. Выберите его кнопкой внизу, перешлите из него пост "
+            "или пришлите @username / ID."
+        )
+        return
+    await start_move(message, role, ref, session=session, bot=bot, state=state, data=data)
+
+
+@router.callback_query(F.data.regexp(r"^a:mig:pick:(main|scam):-?\d+$"))
+async def on_pick(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot, **data: Any
+) -> None:
+    _, _, _, role, chat_id = (call.data or "").split(":")
+    await call.answer()
+    assert call.message is not None
+    await start_move(call.message, role, int(chat_id), session=session, bot=bot, state=state, data=data)
 
 
 @router.callback_query(F.data.regexp(r"^a:mig:pub:\d+$"))

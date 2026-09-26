@@ -103,11 +103,15 @@ async def test_owner_admin_panel_connect_channel_and_bind(h, tg, db):
     assert "Мастер настройки" in home["text"]
     await h.press(OWNER_ID, home, "Каналы")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Основной канал")
+    assert "request_chat" in tg.keyboard(OWNER_ID)["keyboard"][0][0]  # Telegram's picker is offered too
     channel_id = -1001234567890
     tg.add_chat(channel_id, "channel", "Service List", username="servicelist")
     post = tg.post(channel_id, "hello")
     await h.forward_from_channel(OWNER_ID, channel_id, post["message_id"])
-    assert "Канал подключён" in h.last(OWNER_ID)["text"]
+    note, screen = tg.bot_messages(OWNER_ID)[-2:]
+    assert "Канал подключён" in note["text"]
+    assert "Основной: Service List (@servicelist)" in screen["text"]
+    assert tg.keyboard(OWNER_ID) is None  # the picker keyboard is removed
     async with db.session() as s:
         channel = (await s.execute(select(Channel))).scalar_one()
         assert channel.role == "main" and channel.username == "servicelist"

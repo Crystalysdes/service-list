@@ -33,6 +33,13 @@ USER_COUNTED = {
     "text_mention",
     "date_time",
 }
+DEFAULT_ADMIN_RIGHTS = {
+    "can_post_messages": True,
+    "can_edit_messages": True,
+    "can_delete_messages": True,
+    "can_invite_users": True,
+    "can_pin_messages": True,
+}
 NOT_MODIFIED = (
     "Bad Request: message is not modified: specified new message content and reply markup are exactly "
     "the same as a current content and reply markup of the message"
@@ -106,15 +113,9 @@ class FakeTelegram:
             chat["username"] = username
         if is_forum:
             chat["is_forum"] = True
-        default_rights = {
-            "can_post_messages": True,
-            "can_edit_messages": True,
-            "can_delete_messages": True,
-            "can_invite_users": True,
-            "can_pin_messages": True,
+        chat["_members"] = {
+            self.bot_user["id"]: {"status": bot_status, **DEFAULT_ADMIN_RIGHTS, **(rights or {})}
         }
-        default_rights.update(rights or {})
-        chat["_members"] = {self.bot_user["id"]: {"status": bot_status, **default_rights}}
         self.chats[chat_id] = chat
         self.messages.setdefault(chat_id, {})
         return chat
@@ -209,6 +210,10 @@ class FakeTelegram:
             msg["is_topic_message"] = True
         self.messages[chat_id][mid] = msg
         return msg
+
+    def keyboard(self, chat_id: int) -> dict[str, Any] | None:
+        """The reply keyboard shown under the input field of a private chat (not part of any message)."""
+        return self.chats[chat_id].get("_keyboard")
 
     def bot_messages(self, chat_id: int) -> list[dict[str, Any]]:
         return [
@@ -318,6 +323,19 @@ class FakeTelegram:
             msg["from"] = dict(self.bot_user)
         return msg
 
+    @staticmethod
+    def _reply_markup(chat: dict[str, Any], msg: dict[str, Any], markup: dict[str, Any] | None) -> None:
+        """Only an inline keyboard belongs to the message; a reply keyboard replaces the one under the
+        input field of the chat until it is removed."""
+        if not markup:
+            return
+        if "inline_keyboard" in markup:
+            msg["reply_markup"] = markup
+        elif markup.get("remove_keyboard"):
+            chat.pop("_keyboard", None)
+        elif "keyboard" in markup:
+            chat["_keyboard"] = markup
+
     def _export(self, msg: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in msg.items() if not k.startswith("_")}
 
@@ -347,8 +365,7 @@ class FakeTelegram:
         msg["text"] = text
         if entities:
             msg["entities"] = entities
-        if params.get("reply_markup"):
-            msg["reply_markup"] = params["reply_markup"]
+        self._reply_markup(chat, msg, params.get("reply_markup"))
         if params.get("message_thread_id"):
             msg["message_thread_id"] = params["message_thread_id"]
         if params.get("reply_parameters"):
@@ -625,8 +642,7 @@ class FakeTelegram:
             msg["caption"] = text
             if entities:
                 msg["caption_entities"] = entities
-        if params.get("reply_markup"):
-            msg["reply_markup"] = params["reply_markup"]
+        self._reply_markup(chat, msg, params.get("reply_markup"))
         self._common(msg, params)
         self._store(chat, msg)
         return self._export(msg)
@@ -786,6 +802,64 @@ class Harness:
             "message": self.tg._export(stored),
         }
         await self.feed({"callback_query": cq})
+
+    async def bot_membership(
+        self, chat_id: int, status: str, by: int, rights: dict[str, bool] | None = None
+    ) -> None:
+        """Someone added, promoted or removed the bot: the fake chat changes and my_chat_member arrives."""
+        bot_id = self.tg.bot_user["id"]
+        query = {"chat_id": chat_id, "user_id": bot_id}
+        old = self.tg.m_getChatMember(query, {})
+        members = self.tg.chats[chat_id].setdefault("_members", {})
+        if status in ("left", "kicked"):
+            members.pop(bot_id, None)
+        else:
+            if rights is None:
+                rights = DEFAULT_ADMIN_RIGHTS if status == "administrator" else {}
+            members[bot_id] = {"status": status, **rights}
+        new = self.tg.m_getChatMember(query, {})
+        if status == "kicked":
+            new = {"status": "kicked", "user": dict(self.tg.bot_user), "until_date": 0}
+        update = {
+            "chat": self.tg.public_chat(chat_id),
+            "from": self.tg.users[by],
+            "date": self.tg.clock,
+            "old_chat_member": old,
+            "new_chat_member": new,
+        }
+        await self.feed({"my_chat_member": update})
+
+    async def pick_chat(self, user_id: int, chat_id: int) -> dict[str, Any]:
+        """The user taps the keyboard's "request_chat" button and picks a chat: Telegram gives the bot the
+        requested admin rights there (my_chat_member) and sends the choice as a chat_shared message."""
+        keyboard = self.tg.keyboard(user_id)
+        assert keyboard, "no reply keyboard is shown"
+        buttons = [b for row in keyboard["keyboard"] for b in row if "request_chat" in b]
+        assert buttons, f"no request_chat button in {keyboard}"
+        request = buttons[0]["request_chat"]
+        chat = self.tg.chats[chat_id]
+        assert (chat["type"] == "channel") == request["chat_is_channel"], "Telegram would not offer this chat"
+        wanted = {
+            k for k, v in (request.get("bot_administrator_rights") or {}).items() if v and k != "is_anonymous"
+        }
+        if wanted:
+            member = self.tg._bot_member(chat) or {"status": "left"}
+            if member["status"] != "creator":
+                have = (
+                    {k for k, v in member.items() if k != "status" and v}
+                    if member["status"] == "administrator"
+                    else set()
+                )
+                if member["status"] != "administrator" or not wanted <= have:
+                    await self.bot_membership(
+                        chat_id, "administrator", user_id, dict.fromkeys(have | wanted, True)
+                    )
+        shared: dict[str, Any] = {"request_id": request["request_id"], "chat_id": chat_id}
+        if request.get("request_title") and chat.get("title"):
+            shared["title"] = chat["title"]
+        if request.get("request_username") and chat.get("username"):
+            shared["username"] = chat["username"]
+        return await self.send(user_id, chat_shared=shared)
 
     async def group_say(self, chat_id: int, user_id: int, text: str, thread_id: int | None = None) -> None:
         msg = self.tg.group_message(chat_id, user_id, text, thread_id)

@@ -64,6 +64,22 @@ class Channel(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class BotChat(Base):
+    """A channel or group the bot was added to (Telegram cannot list them: kept from my_chat_member)."""
+
+    __tablename__ = "bot_chats"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    type: Mapped[str] = mapped_column(String(16))  # channel / group / supergroup
+    title: Mapped[str | None] = mapped_column(String(256))
+    username: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16))  # administrator / creator / member / left / kicked ...
+    rights: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, server_default=text("now()")
+    )
+
+
 class MediaFile(CreatedMixin, Base):
     """A file we keep locally (intro banner, report screenshots) so it survives a bot change."""
 

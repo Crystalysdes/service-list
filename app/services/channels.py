@@ -9,11 +9,20 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import Message
+from aiogram.types import (
+    ChatAdministratorRights,
+    KeyboardButton,
+    KeyboardButtonRequestChat,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Channel
+from app.db.base import utcnow
+from app.db.models import BotChat, Channel
+from app.services.settings import Chats, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +39,19 @@ REQUIRED_RIGHTS: dict[str, tuple[str, ...]] = {
     "storage": ("can_post_messages", "can_edit_messages", "can_delete_messages"),
 }
 ROLE_TITLES = {"main": "основной", "mirror": "зеркало", "scam": "Scam list", "storage": "служебный"}
+# request_id of the "choose a chat" keyboard button per purpose (any int32; tells the answers apart)
+REQUEST_IDS = {"main": 101, "scam": 102, "mirror": 103, "storage": 104, "moderation": 105}
+RIGHT_FLAGS = (
+    "can_manage_chat",
+    "can_post_messages",
+    "can_edit_messages",
+    "can_delete_messages",
+    "can_invite_users",
+    "can_pin_messages",
+    "can_restrict_members",
+    "can_promote_members",
+    "can_change_info",
+)
 # channels that are not "the" main / scam channel: retired ones and new ones still being filled (a move)
 INACTIVE_STATUSES = ("retired", "migrating")
 
@@ -49,7 +71,9 @@ class ChatCheck:
 
 
 def chat_ref_from_message(message: Message) -> int | str | None:
-    """Extract a chat reference from a forwarded post or from text (@username, t.me link, -100… id)."""
+    """A chat picked with the "choose a chat" button, a forwarded post or text (@username, t.me link, id)."""
+    if message.chat_shared is not None:
+        return message.chat_shared.chat_id
     origin = message.forward_origin
     if origin is not None and getattr(origin, "type", None) == "channel":
         return origin.chat.id  # type: ignore[union-attr]
@@ -71,7 +95,11 @@ async def inspect_chat(bot: Bot, ref: int | str, role: str) -> ChatCheck:
     except TelegramAPIError as exc:
         check.error = f"Не удалось открыть чат: {exc.message}"
         return check
-    if role != "moderation" and check.chat.type != "channel":
+    if role == "moderation":
+        if check.chat.type not in ("group", "supergroup"):
+            check.error = "Это не группа."
+            return check
+    elif check.chat.type != "channel":
         check.error = "Это не канал."
         return check
     me = await bot.me()
@@ -81,6 +109,10 @@ async def inspect_chat(bot: Bot, ref: int | str, role: str) -> ChatCheck:
         check.error = f"Не удалось проверить права бота: {exc.message}"
         return check
     check.is_admin = member.status in ("administrator", "creator")
+    if role == "moderation":  # writing cards into a group only needs membership
+        if member.status not in ("administrator", "creator", "member"):
+            check.error = "Бота нет в этой группе — добавьте его."
+        return check
     if not check.is_admin:
         check.error = "Бот не является администратором."
         return check
@@ -135,3 +167,95 @@ async def main_channel(session: AsyncSession) -> Channel | None:
 async def scam_channel(session: AsyncSession) -> Channel | None:
     rows = await active_channels(session, ("scam",))
     return rows[0] if rows else None
+
+
+# ------------------------------------------------------------------------------------------ known chats
+async def remember_chat(session: AsyncSession, chat: Any, member: Any) -> None:
+    """Keep every channel / group the bot is added to: Telegram has no method to list them later."""
+    if chat.type not in ("channel", "group", "supergroup"):
+        return
+    rights = {}
+    if member.status == "administrator":
+        rights = {flag: bool(getattr(member, flag, False)) for flag in RIGHT_FLAGS}
+    values = {
+        "chat_id": chat.id,
+        "type": chat.type,
+        "title": chat.title,
+        "username": getattr(chat, "username", None),
+        "status": member.status,
+        "rights": rights,
+        "updated_at": utcnow(),
+    }
+    stmt = insert(BotChat).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[BotChat.chat_id], set_={k: v for k, v in values.items() if k != "chat_id"}
+    )
+    await session.execute(stmt)
+
+
+async def known_chats(session: AsyncSession, kind: str) -> list[BotChat]:
+    """Channels where the bot is an admin (kind="channel") or groups it is in (kind="group"), not yet used."""
+    if kind == "channel":
+        types, statuses = ("channel",), ("administrator", "creator")
+    else:
+        types, statuses = ("group", "supergroup"), ("administrator", "creator", "member")
+    taken = set((await session.execute(select(Channel.chat_id).where(Channel.status != "retired"))).scalars())
+    chats = await get_settings(session, Chats)
+    taken |= {c for c in (chats.storage_chat_id, chats.moderation_chat_id) if c}
+    rows = (
+        await session.execute(
+            select(BotChat)
+            .where(BotChat.type.in_(types), BotChat.status.in_(statuses))
+            .order_by(BotChat.updated_at.desc())
+            .limit(60)
+        )
+    ).scalars()
+    return [row for row in rows if row.chat_id not in taken][:20]
+
+
+def missing_rights(chat: BotChat, role: str) -> list[str]:
+    if chat.status == "creator":
+        return []
+    return [right for right in REQUIRED_RIGHTS.get(role, ()) if not (chat.rights or {}).get(right)]
+
+
+def _admin_rights(flags: tuple[str, ...]) -> ChatAdministratorRights:
+    values = {
+        "is_anonymous": False,
+        "can_manage_chat": True,
+        "can_delete_messages": False,
+        "can_manage_video_chats": False,
+        "can_restrict_members": False,
+        "can_promote_members": False,
+        "can_change_info": False,
+        "can_invite_users": False,
+        "can_post_stories": False,
+        "can_edit_stories": False,
+        "can_delete_stories": False,
+        "can_send_welcome_messages": False,
+    }
+    values.update(dict.fromkeys(flags, True))
+    return ChatAdministratorRights(**values)
+
+
+def request_chat_keyboard(role: str, request_id: int) -> ReplyKeyboardMarkup:
+    """Telegram's own chat picker: lists the admin's channels / groups and adds the bot with the rights."""
+    is_channel = role != "moderation"
+    rights = _admin_rights(REQUIRED_RIGHTS.get(role, ()))
+    button = KeyboardButton(
+        text="📋 Выбрать канал" if is_channel else "👥 Выбрать группу",
+        request_chat=KeyboardButtonRequestChat(
+            request_id=request_id,
+            chat_is_channel=is_channel,
+            user_administrator_rights=rights,
+            bot_administrator_rights=rights,
+            request_title=True,
+            request_username=True,
+        ),
+    )
+    return ReplyKeyboardMarkup(
+        keyboard=[[button]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Выберите кнопкой внизу или перешлите пост",
+    )
