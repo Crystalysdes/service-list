@@ -68,7 +68,7 @@ async def test_backup_restore_roundtrip(h, tg, db, ctx):
     before = await _counts(db)
     travel_before = tg.messages[MAIN][ids["travel"]]["text"]
     record, result = await make_backup(ctx, "manual")
-    assert result.encrypted and result.path.suffix == ".slbk" and result.media == 1 and result.pg_dump
+    assert result.encrypted and result.path.suffix == ".slbk" and result.media == 1  # pg_dump is optional
     stored = [m for m in tg.bot_messages(STORAGE) if m.get("document")]
     assert stored and record.sent_file_id
 

@@ -8,3 +8,4 @@ data/
 *.egg-info/
 build/
 dist/
+.deploy-branch

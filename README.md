@@ -48,21 +48,52 @@
 5. **Telegram ID владельцев**: их можно узнать, например, у [@userinfobot](https://t.me/userinfobot).
 6. **Ссылки на эмодзи-паки** (`t.me/addemoji/...`): буквы для названий-из-эмодзи и эмодзи для каталога.
 
-## Запуск
+## Установка на сервер
 
+Нужен чистый сервер с **Ubuntu 22.04/24.04 или Debian 12**.
+
+1. **Подключитесь к серверу.** На Windows откройте PowerShell (на Mac/Linux — Терминал) и выполните `ssh root@IP_СЕРВЕРА`. Пароль root берётся из панели хостинга.
+2. **Вставьте команду установки:**
+   ```bash
+   bash <(curl -fsSL https://raw.githubusercontent.com/Crystalysdes/service-list/claude/amazing-pasteur-j0islp/deploy/bootstrap.sh)
+   ```
+   Скрипт ставит Docker, скачивает бота в `/opt/service-list` и задаёт вопросы. Токены при вводе не видны — просто вставьте и нажмите Enter.
+   - **Токен бота.** Скрипт проверит его и покажет @username бота.
+   - **Telegram ID владельцев.** Свой ID подскажет [@userinfobot](https://t.me/userinfobot).
+   - **Токен Crypto Pay.** Можно пропустить и добавить позже.
+   - **Часовой пояс.**
+   - **Пароль бэкапов.** По Enter скрипт создаст надёжный пароль и покажет его — **сохраните его** в менеджер паролей.
+
+   Затем скрипт включает файрвол (открыт только SSH), собирает и запускает бота и печатает три секрета для GitHub.
+3. **Добавьте секреты в GitHub.** Репозиторий → Settings → Secrets and variables → Actions → New repository secret. Создайте три секрета — `DEPLOY_HOST`, `DEPLOY_KNOWN_HOSTS`, `DEPLOY_SSH_KEY` — со значениями из вывода скрипта.
+
+После этого каждое изменение в ветке `claude/amazing-pasteur-j0islp` само проходит тесты в GitHub Actions и выкатывается на сервер.
+- Ключ деплоя на сервере ограничен: им можно только обновить бота до коммита этой ветки. Ни консоли, ни других команд.
+- Вручную обновить можно кнопкой «Run workflow» во вкладке Actions или командой `servicelist deploy` на сервере.
+
+**Команды на сервере:**
+
+| Команда | Что делает |
+|---|---|
+| `servicelist status` | Состояние контейнеров |
+| `servicelist logs` | Журнал бота (выход — Ctrl+C) |
+| `servicelist config` | Изменить токены, владельцев, пароль бэкапов; по Enter значения сохраняются |
+| `servicelist restart` / `stop` / `start` | Перезапуск, остановка, запуск |
+| `servicelist deploy` | Обновить до последней версии ветки |
+| `servicelist backup` | Резервная копия прямо сейчас |
+| `servicelist restore ФАЙЛ` | Восстановить копию в пустую базу |
+| `servicelist deploy-key` | Новый ключ для GitHub; старый перестанет работать, обновите `DEPLOY_SSH_KEY` |
+
+**После переустановки ОС или смены сервера** снова выполните команду установки и обновите в GitHub все три секрета: меняются и ключ сервера, и ключ деплоя.
+
+**Без скрипта, вручную** (Docker уже установлен):
 ```bash
-git clone <репозиторий> service-list && cd service-list
-cp .env.example .env
-nano .env        # BOT_TOKEN, OWNER_IDS, POSTGRES_PASSWORD, CRYPTOPAY_TOKEN, BACKUP_PASSPHRASE, TIMEZONE
+git clone https://github.com/Crystalysdes/service-list.git && cd service-list
+cp .env.example .env && nano .env   # BOT_TOKEN, OWNER_IDS, POSTGRES_PASSWORD, CRYPTOPAY_TOKEN, BACKUP_PASSPHRASE, TIMEZONE
 docker compose up -d --build
-docker compose logs -f bot
 ```
 
 Миграции базы применяются при старте автоматически. Данные хранятся в томах Docker: `pgdata` для базы, `botdata` (`/data`) для медиа и архивов.
-
-> **`BACKUP_PASSPHRASE` обязательно запишите отдельно**, например в менеджер паролей: без него зашифрованную копию не восстановить.
-
-**Обновление:** `git pull && docker compose up -d --build`.
 
 ## Первая настройка (в Telegram)
 
@@ -127,11 +158,7 @@ docker compose logs -f bot
   - **Где хранятся:** архив уходит в служебный канал, если он меньше 50 МБ, и лежит в `/data/backups`. Хранятся 14 ежедневных и 8 еженедельных копий.
 - **Восстановление на новом сервере.** Запустите бота с тем же `BACKUP_PASSPHRASE` и восстановите копию одним из способов:
   - файл до 20 МБ пришлите боту: `/admin` → «♻️ Восстановить из резервной копии»;
-  - любой размер:
-    ```bash
-    docker compose cp servicelist-XXXX.slbk bot:/data/backups/
-    docker compose run --rm bot python -m app restore /data/backups/servicelist-XXXX.slbk
-    ```
+  - любой размер: скопируйте файл на сервер (например, `scp servicelist-XXXX.slbk root@IP:/root/`) и выполните `servicelist restore /root/servicelist-XXXX.slbk`.
 
   Восстановление возможно только в пустую базу. После него запустите 🩺 Диагностику.
 - **Новый токен.** Если сменился бот, привяжите к новому боту тот же Fragment-юзернейм и добавьте его админом в каналы. Пользователи продолжат работу после `/start`.

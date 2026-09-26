@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+# Service List bot — server helper, installed as /usr/local/bin/servicelist by deploy/bootstrap.sh.
+#
+#   servicelist config        enter / change the bot settings (tokens, owners, passwords) -> .env
+#   servicelist deploy [SHA]  update the code (branch head or a commit of the branch) and restart
+#   servicelist deploy-key    create the SSH key GitHub Actions deploys with, print the GitHub secrets
+#   servicelist status | logs [N] | start | restart | stop
+#   servicelist backup        make a backup archive now (also sent to the storage channel)
+#   servicelist restore FILE  restore a backup archive into the (empty) database
+#
+# The deploy key may run only "servicelist ssh-deploy", which accepts nothing but "deploy <commit sha>".
+set -euo pipefail
+
+SL_DIR="${SL_DIR:-/opt/service-list}"
+SL_AUTH_KEYS="${SL_AUTH_KEYS:-/root/.ssh/authorized_keys}"
+SL_HOST_KEY="${SL_HOST_KEY:-/etc/ssh/ssh_host_ed25519_key.pub}"
+SL_SELF="${SL_SELF:-/usr/local/bin/servicelist}"
+SL_LOCK="${SL_LOCK:-/run/lock/servicelist-deploy.lock}"
+DEFAULT_BRANCH="claude/amazing-pasteur-j0islp"
+KEY_COMMENT="github-actions-deploy"
+ENV_FILE="$SL_DIR/.env"
+MANAGED_KEYS=(BOT_TOKEN OWNER_IDS POSTGRES_PASSWORD CRYPTOPAY_TOKEN CRYPTOPAY_TESTNET TIMEZONE BACKUP_PASSPHRASE LOG_LEVEL)
+
+if [[ -t 1 ]]; then
+    B=$'\033[1m' G=$'\033[32m' Y=$'\033[33m' R=$'\033[31m' C=$'\033[36m' N=$'\033[0m'
+else
+    B="" G="" Y="" R="" C="" N=""
+fi
+
+info() { printf '%s==>%s %s\n' "$C" "$N" "$*"; }
+ok() { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die() {
+    printf '%s✗ %s%s\n' "$R" "$*" "$N" >&2
+    exit 1
+}
+
+run() {
+    if [[ "${SL_DRY_RUN:-}" == 1 ]]; then
+        printf 'DRY:'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+branch() {
+    if [[ -n "${SL_BRANCH:-}" ]]; then
+        printf '%s\n' "$SL_BRANCH"
+    elif [[ -s "$SL_DIR/.deploy-branch" ]]; then
+        head -n1 "$SL_DIR/.deploy-branch"
+    else
+        printf '%s\n' "$DEFAULT_BRANCH"
+    fi
+}
+
+need_dir() {
+    [[ -d "$SL_DIR" ]] || die "Бот не установлен в $SL_DIR — сначала запустите deploy/bootstrap.sh"
+    cd "$SL_DIR"
+}
+
+compose() { run docker compose "$@"; }
+
+SL_TMP=""
+make_tmp() {  # one temporary directory per run, removed on exit
+    SL_TMP=$(mktemp -d)
+    trap 'rm -rf "$SL_TMP"' EXIT
+}
+
+# ------------------------------------------------------------------------------------------ .env
+env_get() {
+    [[ -f "$ENV_FILE" ]] || return 0
+    local value
+    value=$(sed -n "s/^$1=//p" "$ENV_FILE" | tail -n1)
+    value=${value%\"}
+    value=${value#\"}
+    value=${value%\'}
+    value=${value#\'}
+    printf '%s' "$value"
+}
+
+mask() {
+    local value=$1
+    if ((${#value} <= 10)); then
+        printf '%s' '••••'
+    else
+        printf '%s…%s' "${value:0:6}" "${value: -3}"
+    fi
+}
+
+# ask VAR "question" [default] [secret]   (locals are __-prefixed so they never shadow VAR)
+ask() {
+    local __var=$1 __question=$2 __default=${3-} __secret=${4-} __shown __reply=""
+    if [[ -n "$__default" ]]; then
+        __shown=$__default
+        [[ "$__secret" == secret ]] && __shown=$(mask "$__default")
+        __question="$__question [$__shown]"
+    fi
+    if [[ "$__secret" == secret ]]; then
+        IFS= read -r -s -p "$__question: " __reply || die "Ввод прерван"
+        printf '\n' >&2
+    else
+        IFS= read -r -p "$__question: " __reply || die "Ввод прерван"
+    fi
+    __reply=${__reply//[$'\r\n']/}
+    __reply="${__reply#"${__reply%%[![:space:]]*}"}"
+    __reply="${__reply%"${__reply##*[![:space:]]}"}"
+    printf -v "$__var" '%s' "${__reply:-$__default}"
+}
+
+yes_no() {  # yes_no "question" default(y|n)
+    local reply
+    ask reply "$1 (y/n)" "$2"
+    [[ "$reply" =~ ^([yYдД]|yes|да)$ ]]
+}
+
+# HTTP status of a GET (000 when the request failed), body in the file given as $1
+http_get() {
+    local out=$1
+    shift
+    curl -sS -o "$out" -w '%{http_code}' --max-time 15 "$@" 2>/dev/null || true
+}
+
+check_bot_token() {  # prints the bot username; exit status: 0 ok, 1 rejected, 2 could not check
+    [[ "${SL_SKIP_CHECKS:-}" == 1 ]] && return 0
+    local body code
+    body=$(mktemp)
+    code=$(http_get "$body" "https://api.telegram.org/bot$1/getMe")
+    if [[ "$code" == 200 ]]; then
+        sed -n 's/.*"username":"\([^"]*\)".*/\1/p' "$body"
+        rm -f "$body"
+        return 0
+    fi
+    rm -f "$body"
+    [[ "$code" == 401 || "$code" == 404 ]] && return 1
+    return 2
+}
+
+check_cryptopay() {  # $1 token, $2 true|false (testnet); prints the app name; exit status as above
+    [[ "${SL_SKIP_CHECKS:-}" == 1 ]] && return 0
+    local host=pay.crypt.bot body code
+    [[ "$2" == true ]] && host=testnet-pay.crypt.bot
+    body=$(mktemp)
+    code=$(http_get "$body" -H "Crypto-Pay-API-Token: $1" "https://$host/api/getMe")
+    if [[ "$code" == 200 ]] && grep -q '"ok":true' "$body"; then
+        sed -n 's/.*"name":"\([^"]*\)".*/\1/p' "$body"
+        rm -f "$body"
+        return 0
+    fi
+    rm -f "$body"
+    [[ "$code" == 401 || "$code" == 400 || "$code" == 200 ]] && return 1
+    return 2
+}
+
+valid_passphrase() {
+    [[ ${#1} -ge 12 && "$1" =~ ^[A-Za-z0-9._~+/=@#%^*!?:,-]+$ ]]
+}
+
+random_secret() {
+    openssl rand -base64 "${1:-24}" | tr -d '\n'
+}
+
+write_env() {  # KEY=VALUE pairs; other lines of the existing file are kept
+    local tmp pair key
+    tmp=$(mktemp "$SL_DIR/.env.XXXXXX")
+    chmod 600 "$tmp"
+    {
+        printf '# Service List bot settings — written by "servicelist config". Keep this file private.\n'
+        for pair in "$@"; do
+            printf '%s\n' "$pair"
+        done
+        if [[ -f "$ENV_FILE" ]]; then
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                key=${line%%=*}
+                [[ " ${MANAGED_KEYS[*]} " == *" $key "* ]] && continue
+                printf '%s\n' "$line"
+            done <"$ENV_FILE"
+        fi
+    } >"$tmp"
+    mv -f "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+}
+
+cmd_config() {
+    need_dir
+    local bot_token owner_ids pay_token pay_testnet timezone passphrase pg_password log_level
+    local username status reply new_passphrase=""
+    bot_token=$(env_get BOT_TOKEN)
+    owner_ids=$(env_get OWNER_IDS)
+    pay_token=$(env_get CRYPTOPAY_TOKEN)
+    pay_testnet=$(env_get CRYPTOPAY_TESTNET)
+    timezone=$(env_get TIMEZONE)
+    passphrase=$(env_get BACKUP_PASSPHRASE)
+    pg_password=$(env_get POSTGRES_PASSWORD)
+    log_level=$(env_get LOG_LEVEL)
+
+    printf '\n%sНастройка бота Service List%s\n' "$B" "$N"
+    printf 'Enter — оставить значение в скобках. Токены при вводе не видны — это нормально, просто вставьте и нажмите Enter.\n\n'
+
+    # --- bot token
+    while true; do
+        ask bot_token "Токен бота от @BotFather" "$bot_token" secret
+        if [[ ! "$bot_token" =~ ^[0-9]{5,}:[A-Za-z0-9_-]{30,}$ ]]; then
+            warn "Не похоже на токен (вид: 123456789:AAE…). Попробуйте ещё раз."
+            bot_token=""
+            continue
+        fi
+        status=0
+        username=$(check_bot_token "$bot_token") || status=$?
+        if ((status == 0)); then
+            [[ -n "$username" ]] && ok "Бот: @$username — к нему должен быть привязан коллекционный юзернейм с Fragment (для премиум-эмодзи в канале)"
+            break
+        elif ((status == 1)); then
+            warn "Telegram не принял этот токен. Скопируйте его из @BotFather ещё раз."
+            bot_token=""
+        else
+            warn "Не удалось проверить токен (нет связи с api.telegram.org)."
+            yes_no "Оставить этот токен без проверки?" n && break
+            bot_token=""
+        fi
+    done
+
+    # --- owners
+    while true; do
+        ask owner_ids "Telegram ID владельцев через запятую (свой ID подскажет @userinfobot)" "$owner_ids"
+        owner_ids=${owner_ids//[[:space:]]/}
+        [[ "$owner_ids" =~ ^[0-9]{3,15}(,[0-9]{3,15})*$ ]] && break
+        warn "Нужны числа через запятую, например 123456789,987654321."
+        owner_ids=""
+    done
+
+    # --- Crypto Pay
+    while true; do
+        ask pay_token "Токен Crypto Pay (@CryptoBot → Crypto Pay → Create App; Enter — пропустить, «-» — убрать)" "$pay_token" secret
+        if [[ -z "$pay_token" || "$pay_token" == "-" ]]; then
+            pay_token=""
+            warn "Без токена Crypto Pay оплата не работает: заявки можно одобрять, но счёт не выставится."
+            break
+        fi
+        if [[ ! "$pay_token" =~ ^[0-9]+:[A-Za-z0-9_-]{10,}$ ]]; then
+            warn "Не похоже на токен Crypto Pay (вид: 12345:AAz…)."
+            pay_token=""
+            continue
+        fi
+        if yes_no "Это токен тестовой сети (@CryptoTestnetBot)?" "$([[ "$pay_testnet" == true ]] && echo y || echo n)"; then
+            pay_testnet=true
+        else
+            pay_testnet=false
+        fi
+        status=0
+        reply=$(check_cryptopay "$pay_token" "$pay_testnet") || status=$?
+        if ((status == 0)); then
+            [[ -n "$reply" ]] && ok "Crypto Pay: приложение «$reply»"
+            break
+        elif ((status == 1)); then
+            warn "Crypto Pay не принял токен (проверьте и сеть: основная или тестовая)."
+            pay_token=""
+        else
+            warn "Не удалось проверить токен Crypto Pay."
+            yes_no "Оставить без проверки?" n && break
+            pay_token=""
+        fi
+    done
+    [[ -n "$pay_testnet" ]] || pay_testnet=false
+
+    # --- timezone
+    while true; do
+        ask timezone "Часовой пояс (для дат в сообщениях и времени ежедневного бэкапа)" "${timezone:-Europe/Moscow}"
+        if [[ "$timezone" =~ ^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$ ]] &&
+            [[ ! -d /usr/share/zoneinfo || -f "/usr/share/zoneinfo/$timezone" ]]; then
+            break
+        fi
+        warn "Не знаю такого пояса. Примеры: Europe/Moscow, Europe/Kyiv, Asia/Almaty, UTC."
+        timezone=""
+    done
+
+    # --- backup passphrase
+    while true; do
+        if [[ -n "$passphrase" ]]; then
+            ask reply "Пароль шифрования бэкапов уже задан. Enter — оставить, «new» — создать новый, или введите свой" "" secret
+            [[ -z "$reply" ]] && break
+        else
+            ask reply "Пароль шифрования бэкапов (Enter — создать надёжный автоматически)" "" secret
+            [[ -z "$reply" ]] && reply=new
+        fi
+        [[ "$reply" == new ]] && reply=$(random_secret 24)
+        if ! valid_passphrase "$reply"; then
+            warn "Нужно от 12 символов: латиница, цифры и . _ ~ + / = @ # % ^ * ! ? : , -"
+            continue
+        fi
+        [[ -n "$passphrase" ]] && warn "Старые бэкапы открываются только старым паролем — сохраните его тоже."
+        passphrase=$reply
+        new_passphrase=$reply
+        break
+    done
+
+    # --- database password: generated once, never changed (the database keeps the first one)
+    [[ -n "$pg_password" ]] || pg_password=$(random_secret 24 | tr '+/' '-_' | tr -d '=')
+    [[ -n "$log_level" ]] || log_level=INFO
+
+    write_env \
+        "BOT_TOKEN=$bot_token" \
+        "OWNER_IDS=$owner_ids" \
+        "POSTGRES_PASSWORD=$pg_password" \
+        "CRYPTOPAY_TOKEN=$pay_token" \
+        "CRYPTOPAY_TESTNET=$pay_testnet" \
+        "TIMEZONE=$timezone" \
+        "BACKUP_PASSPHRASE=$passphrase" \
+        "LOG_LEVEL=$log_level"
+    ok "Настройки сохранены в $ENV_FILE (доступ только у root)"
+
+    if [[ -n "$new_passphrase" ]]; then
+        printf '\n%s%s════ СОХРАНИТЕ ПАРОЛЬ БЭКАПОВ ════%s\n' "$B" "$Y" "$N"
+        printf '%s%s%s\n' "$B" "$new_passphrase" "$N"
+        printf 'Без него резервную копию не восстановить. Запишите в менеджер паролей, не только на этот сервер.\n\n'
+    fi
+
+    if [[ "${SL_NO_RESTART:-}" != 1 ]] && command -v docker >/dev/null 2>&1 && [[ -n "$(docker compose ps -q 2>/dev/null)" ]]; then
+        info "Перезапускаю бота с новыми настройками"
+        compose up -d
+    fi
+}
+
+# ------------------------------------------------------------------------------------------ deploy
+self_update() {
+    local source="$SL_DIR/deploy/servicelist"
+    [[ -f "$source" && "$SL_SELF" == /usr/local/bin/servicelist && -w "$(dirname "$SL_SELF")" ]] || return 0
+    cmp -s "$source" "$SL_SELF" && return 0
+    run install -m 755 "$source" "$SL_SELF.new"
+    run mv -f "$SL_SELF.new" "$SL_SELF"
+}
+
+wait_healthy() {
+    [[ "${SL_DRY_RUN:-}" == 1 ]] && return 0
+    local deadline=$((SECONDS + 90)) cid status started age
+    while ((SECONDS < deadline)); do
+        sleep 3
+        cid=$(docker compose ps -q bot 2>/dev/null || true)
+        [[ -n "$cid" ]] || continue
+        status=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo unknown)
+        started=$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || echo "")
+        [[ "$status" == running && -n "$started" ]] || continue
+        age=$(($(date +%s) - $(date -d "$started" +%s 2>/dev/null || date +%s)))
+        if ((age >= 20)); then
+            ok "Бот работает"
+            return 0
+        fi
+    done
+    die "Бот не запустился стабильно. Посмотрите «servicelist logs» и проверьте «servicelist config»."
+}
+
+cmd_deploy() {
+    need_dir
+    local sha=${1-} target current_branch
+    current_branch=$(branch)
+    info "Получаю код ($current_branch)"
+    run git fetch --quiet origin "$current_branch"
+    target="origin/$current_branch"
+    if [[ -n "$sha" ]]; then
+        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "Некорректный коммит: $sha"
+        git cat-file -e "$sha^{commit}" 2>/dev/null || die "Коммит $sha не найден"
+        git merge-base --is-ancestor "$sha" "origin/$current_branch" || die "Коммит $sha не из ветки $current_branch"
+        target=$sha
+    fi
+    run git checkout --quiet --force -B "$current_branch" "$target"
+    self_update
+    [[ -f "$ENV_FILE" ]] || die "Нет настроек: выполните «servicelist config»"
+    info "Собираю и перезапускаю ($(git rev-parse --short HEAD))"
+    compose up -d --build --remove-orphans
+    run docker image prune -f >/dev/null
+    wait_healthy
+}
+
+cmd_ssh_deploy() {
+    local request=${SSH_ORIGINAL_COMMAND:-}
+    if [[ ! "$request" =~ ^deploy\ ([0-9a-f]{40})$ ]]; then
+        echo "Этим ключом можно только: deploy <commit sha>" >&2
+        exit 2
+    fi
+    local sha=${BASH_REMATCH[1]}
+    mkdir -p "$(dirname "$SL_LOCK")"
+    exec 9>"$SL_LOCK"
+    flock -w 900 9 || die "Другой деплой идёт слишком долго"
+    cmd_deploy "$sha"
+}
+
+detect_ip() {
+    local ip=""
+    if command -v ip >/dev/null 2>&1; then
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+    fi
+    [[ -n "$ip" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    printf '%s' "$ip"
+}
+
+cmd_deploy_key() {
+    command -v ssh-keygen >/dev/null || die "Нет ssh-keygen (apt-get install openssh-client)"
+    [[ -f "$SL_HOST_KEY" ]] || die "Нет ключа сервера $SL_HOST_KEY"
+    local host keys_dir tmp
+    make_tmp
+    tmp=$SL_TMP
+    ssh-keygen -q -t ed25519 -N '' -C "$KEY_COMMENT" -f "$tmp/key"
+
+    keys_dir=$(dirname "$SL_AUTH_KEYS")
+    mkdir -p "$keys_dir"
+    chmod 700 "$keys_dir"
+    touch "$SL_AUTH_KEYS"
+    chmod 600 "$SL_AUTH_KEYS"
+    grep -v " $KEY_COMMENT\$" "$SL_AUTH_KEYS" >"$tmp/authorized_keys" || true
+    printf 'restrict,command="%s ssh-deploy" %s\n' "$SL_SELF" "$(cat "$tmp/key.pub")" >>"$tmp/authorized_keys"
+    cat "$tmp/authorized_keys" >"$SL_AUTH_KEYS"
+
+    host=$(detect_ip)
+    ask host "Внешний IP этого сервера" "$host"
+    [[ "$host" =~ ^[0-9a-fA-F.:]+$ ]] || die "Некорректный IP: $host"
+
+    printf '\n%s════ СЕКРЕТЫ ДЛЯ GITHUB ════%s\n' "$B" "$N"
+    printf 'GitHub → репозиторий service-list → Settings → Secrets and variables → Actions → New repository secret.\n'
+    printf 'Создайте три секрета (имя — ровно как здесь, значение — всё между линиями):\n\n'
+    printf '%s1) DEPLOY_HOST%s\n────────\n%s\n────────\n\n' "$B" "$N" "$host"
+    printf '%s2) DEPLOY_KNOWN_HOSTS%s\n────────\n%s %s\n────────\n\n' "$B" "$N" "$host" "$(awk '{print $1" "$2}' "$SL_HOST_KEY")"
+    printf '%s3) DEPLOY_SSH_KEY%s (весь блок, включая строки BEGIN и END)\n────────\n' "$B" "$N"
+    cat "$tmp/key"
+    printf '────────\n\n'
+    printf 'Приватный ключ хранится только в GitHub: с сервера он удалён. Этим ключом можно лишь обновить бота —\n'
+    printf 'ни консоли, ни других команд. Новый ключ: «servicelist deploy-key» (старый перестанет работать).\n'
+}
+
+# ------------------------------------------------------------------------------------------ maintenance
+cmd_restore() {
+    need_dir
+    local file=${1-} tmp name
+    [[ -n "$file" && -f "$file" ]] || die "Укажите файл архива: servicelist restore /путь/к/servicelist-….slbk"
+    name=$(basename "$file")
+    make_tmp
+    tmp=$SL_TMP
+    install -m 600 -o 1000 -g 1000 "$file" "$tmp/$name"
+    chmod 755 "$tmp"
+    info "Останавливаю бота"
+    compose stop bot
+    info "Восстанавливаю из $name"
+    compose run --rm -v "$tmp/$name:/restore/$name:ro" bot python -m app restore "/restore/$name" || {
+        compose up -d
+        die "Восстановление не удалось (см. сообщение выше)"
+    }
+    compose up -d
+    wait_healthy
+    ok "Готово. В Telegram: /admin → 🩺 Диагностика"
+}
+
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    local command=${1-}
+    shift || true
+    case "$command" in
+    config) cmd_config "$@" ;;
+    deploy | update) cmd_deploy "$@" ;;
+    ssh-deploy) cmd_ssh_deploy ;;
+    deploy-key) cmd_deploy_key ;;
+    status) need_dir && docker compose ps ;;
+    logs) need_dir && docker compose logs --tail "${1:-100}" -f bot ;;
+    start) need_dir && compose up -d ;;
+    restart) need_dir && compose restart bot ;;
+    stop) need_dir && compose stop ;;
+    backup) need_dir && compose exec bot python -m app backup ;;
+    restore) cmd_restore "$@" ;;
+    "" | -h | --help | help) usage ;;
+    *)
+        usage
+        exit 2
+        ;;
+    esac
+}
+
+main "$@"
