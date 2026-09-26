@@ -242,6 +242,8 @@ def card_keyboard(request: ModerationRequest) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     rid = request.id
     builder.button(text="✅ Одобрить", callback_data=f"mod:ok:{rid}", style="success")
+    if request.kind == "new":  # published at once, the author pays nothing (admins only)
+        builder.button(text="🎁 Одобрить бесплатно", callback_data=f"mod:free:{rid}")
     builder.button(text="❌ Отклонить", callback_data=f"mod:no:{rid}", style="danger")
     if request.kind in ("new", "edit"):
         builder.button(text="✏️ Исправить", callback_data=f"mod:ed:{rid}")
@@ -318,9 +320,17 @@ async def close_cards(ctx: AppContext, ref_type: str, ref_id: int, line: str) ->
 
 # ------------------------------------------------------------------------------------------ decisions
 async def approve(
-    ctx: AppContext, session: AsyncSession, request: ModerationRequest, moderator_id: int
+    ctx: AppContext,
+    session: AsyncSession,
+    request: ModerationRequest,
+    moderator_id: int,
+    *,
+    free: bool = False,
 ) -> dict[str, Any]:
-    """Apply the decision; returns follow-up info for notifications."""
+    """Apply the decision; returns follow-up info for notifications.
+
+    ``free`` publishes a new listing without payment: a $0 order goes through the usual fulfilment.
+    """
     now = utcnow()
     request.status = "approved"
     request.moderator_id = moderator_id
@@ -332,7 +342,16 @@ async def approve(
         service.status = "approved"
         service.approved_at = now
         service.approved_by = moderator_id
-        order = await billing.create_order(session, user_id=request.user_id, service=service, kind="listing")
+        order = await billing.create_order(
+            session,
+            user_id=request.user_id,
+            service=service,
+            kind="listing",
+            amount_cents=0 if free else None,
+        )
+        if free:
+            order.provider = "free"
+            order.note = "одобрено бесплатно"
         follow["order_id"] = order.id
         follow["amount"] = order.amount_cents
         if order.amount_cents == 0:
@@ -367,7 +386,9 @@ async def approve(
         from app.services.options import apply_custom_emoji
 
         follow.update(await apply_custom_emoji(session, service, request.payload))
-    await audit(session, moderator_id, "request.approve", "request", request.id)
+    await audit(
+        session, moderator_id, "request.approve", "request", request.id, {"free": True} if free else None
+    )
     await session.flush()
     return follow
 

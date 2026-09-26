@@ -21,7 +21,9 @@ from app.domain.links import LinkError, clean_text, normalize
 from app.services import billing, moderation
 from app.services.catalog import request_sync
 from app.services.notify import notify_user
+from app.services.purchases import category_post_url
 from app.services.settings import Limits, get_settings
+from app.services.users import has_role
 
 router = Router(name="admin_moderation")
 router.message.filter(RoleFilter("moderator"))
@@ -55,6 +57,7 @@ async def _notify_decision(
             return
         category = await session.get(Category, service.category_id)
         limits = await get_settings(session, Limits)
+        post_url = await category_post_url(session, service.category_id)
     t = Translator(user.lang if user else None)
     name = h(service.name)
     builder = InlineKeyboardBuilder()
@@ -62,6 +65,8 @@ async def _notify_decision(
         if request.kind == "new" and follow and follow.get("published"):
             text = t("add.approved_free", name=name, category=h(category.title if category else ""))
             builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
+            if post_url:
+                builder.button(text=t("pay.open_post"), url=post_url)
         elif request.kind == "new" and follow:
             text = t(
                 "add.approved",
@@ -113,6 +118,26 @@ async def on_approve(call: CallbackQuery, session: AsyncSession, **data: Any) ->
     await session.commit()
     await call.answer("Одобрено")
     await moderation.close_cards(ctx, "request", request.id, f"✅ Одобрено: {_who(data)}")
+    await _notify_decision(ctx, request, True, follow)
+    request_sync(ctx)
+
+
+@router.callback_query(F.data.startswith("mod:free:"))
+async def on_approve_free(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    if not has_role(data.get("role"), "admin"):
+        await call.answer("Бесплатно одобряет только администратор.", show_alert=True)
+        return
+    request = await _load(session, call)
+    if request is None:
+        return
+    if request.kind != "new":
+        await call.answer()
+        return
+    ctx: AppContext = data["ctx"]
+    follow = await moderation.approve(ctx, session, request, data["user"].id, free=True)
+    await session.commit()
+    await call.answer("Одобрено бесплатно")
+    await moderation.close_cards(ctx, "request", request.id, f"🎁 Одобрено бесплатно: {_who(data)}")
     await _notify_decision(ctx, request, True, follow)
     request_sync(ctx)
 

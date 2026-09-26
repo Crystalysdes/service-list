@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import BlacklistEntry, ModerationRequest, Order, Service, User
+from app.db.models import BlacklistEntry, ModerationRequest, Order, Service, Staff, User
 from app.jobs import job_poll_invoices
 from app.services import billing
 from app.services.settings import Chats, get_settings, save_settings
@@ -12,6 +12,7 @@ from tests.fakepay import FakeCryptoPay
 from tests.helpers import MAIN, engine_for, imported_channel
 
 USER = 7001
+MODERATOR = 7002
 GROUP = -100900
 
 
@@ -90,6 +91,41 @@ async def test_submit_approve_pay_publish(h, tg, db, ctx):
     async with db.session() as s:
         order = (await s.execute(select(Order))).scalar_one()
         assert order.status == "fulfilled"
+
+
+async def test_approve_for_free_publishes_without_payment(h, tg, db, ctx):
+    ids, pay, engine = await _setup(tg, db, ctx)
+    await _submit(h, tg)
+    card = h.last(GROUP)
+    assert [b["text"] for b in h.buttons(card)][:2] == ["✅ Одобрить", "🎁 Одобрить бесплатно"]
+
+    # a moderator may approve, but only an admin may approve for free
+    tg.add_user(MODERATOR, "Mod", "mod")
+    async with db.session() as s:
+        s.add(Staff(user_id=MODERATOR, role="moderator"))
+        await s.commit()
+    await h.press(MODERATOR, card, "бесплатно")
+    assert "только администратор" in tg.called("answerCallbackQuery")[-1]["text"]
+
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    await h.press(OWNER_ID, card, "бесплатно")
+    closed = tg.messages[GROUP][card["message_id"]]
+    assert "🎁 Одобрено бесплатно: @owner" in closed["text"] and "reply_markup" not in closed
+    note = h.last(USER)
+    assert "одобрена и опубликована" in note["text"]
+    assert [b["text"] for b in h.buttons(note)] == ["🗂 Управлять сервисом", "📋 Открыть пост"]
+    assert h.button(note, "Открыть пост")["url"] == f"https://t.me/servicelist/{ids['travel']}"
+    assert pay.created == []  # no invoice at all
+    async with db.session() as s:
+        service = (await s.execute(select(Service).where(Service.name == "Fly Cheap"))).scalar_one()
+        order = (await s.execute(select(Order).where(Order.service_id == service.id))).scalar_one()
+        assert service.status == "active" and service.published_at is not None
+        assert service.listing_expires_at is None  # the listing term is "forever" by default
+        assert (order.status, order.amount_cents, order.provider) == ("fulfilled", 0, "free")
+
+    await engine.run_once(ids["channel_id"])
+    travel = tg.messages[MAIN][ids["travel"]]["text"]
+    assert travel.index("Travel with Coco Jango") < travel.index("Fly Cheap") < travel.index("занять место")
 
 
 async def test_reject_with_reason_and_edit_flow(h, tg, db, ctx):
