@@ -48,6 +48,27 @@ async def fake_api(unused_tcp_port):
             return web.json_response(
                 {"ok": True, "result": {"items": [{"invoice_id": 77, "status": "paid", "amount": "10.00"}]}}
             )
+        if method == "transfer":
+            if payload["spend_id"] == "proxy-page":
+                return web.Response(text="<html>502 Bad Gateway</html>", status=502)
+            result = {"transfer_id": 9, "status": "completed", **payload}
+            return web.json_response({"ok": True, "result": result})
+        if method == "getTransfers":
+            items = [
+                {
+                    "transfer_id": 9,
+                    "spend_id": payload["spend_id"],
+                    "user_id": 5,
+                    "asset": "USDT",
+                    "amount": "95.00",
+                    "status": "completed",
+                }
+            ]
+            return web.json_response({"ok": True, "result": {"items": items}})
+        if method == "getBalance":
+            return web.json_response(
+                {"ok": True, "result": [{"currency_code": "USDT", "available": "120.5", "onhold": "0"}]}
+            )
         return web.json_response({"ok": True, "result": True})
 
     app = web.Application()
@@ -95,3 +116,33 @@ async def test_client_requests(fake_api):
     assert err.value.name == "UNAUTHORIZED"
     await client.close()
     await bad.close()
+
+
+async def test_escrow_requests(fake_api):
+    from app.services.cryptopay import outcome_unknown
+
+    base, seen = fake_api
+    client = CryptoPayClient("good")
+    client.base = base
+    invoice = await client.create_crypto_invoice(
+        asset="USDT",
+        amount="105.00",
+        description="Сделка #1",
+        payload="esc:abc:1",
+        expires_in=3600,
+        paid_btn_url=None,
+    )
+    assert invoice.invoice_id == 77
+    params = seen[-1]["params"]
+    assert params["currency_type"] == "crypto" and params["asset"] == "USDT" and params["amount"] == "105.00"
+    assert "fiat" not in params and "accepted_assets" not in params
+    transfer = await client.transfer(user_id=5, asset="USDT", amount="95.00", spend_id="esc-abc-seller")
+    assert transfer.transfer_id == 9 and seen[-1]["params"]["spend_id"] == "esc-abc-seller"
+    found = await client.get_transfers(spend_id="esc-abc-seller")
+    assert found[0].amount == "95.00" and found[0].user_id == 5
+    assert await client.get_balance() == {"USDT": ("120.5", "0")}
+    with pytest.raises(CryptoPayError) as err:  # a proxy's error page: maybe sent, check before retrying
+        await client.transfer(user_id=5, asset="USDT", amount="1.00", spend_id="proxy-page")
+    assert outcome_unknown(err.value)
+    assert outcome_unknown(TimeoutError()) and not outcome_unknown(CryptoPayError("USER_NOT_FOUND"))
+    await client.close()

@@ -1,4 +1,8 @@
-"""Minimal Crypto Pay API client (@CryptoBot): invoices priced in USD, paid in USDT/TON/BTC."""
+"""Minimal Crypto Pay API client (@CryptoBot).
+
+Invoices priced in USD and paid in USDT/TON/BTC (listings and options), invoices in a crypto asset
+(escrow deals), transfers from the app balance to a Telegram user and the balance itself.
+"""
 
 from __future__ import annotations
 
@@ -18,10 +22,23 @@ TESTNET = "https://testnet-pay.crypt.bot/api/"
 
 
 class CryptoPayError(Exception):
+    """The API answered with an error: the request was not carried out."""
+
     def __init__(self, name: str, code: int | None = None) -> None:
         super().__init__(name)
         self.name = name
         self.code = code
+
+
+# a reply that is not the API's JSON (a proxy's error page) or no reply at all: the request may have
+# been carried out, so a transfer must be checked by its spend_id before anything else
+UNKNOWN_OUTCOME = (aiohttp.ClientError, TimeoutError, OSError)
+
+
+def outcome_unknown(exc: BaseException) -> bool:
+    if isinstance(exc, CryptoPayError):
+        return exc.name == "BAD_RESPONSE"
+    return isinstance(exc, UNKNOWN_OUTCOME)
 
 
 @dataclass
@@ -45,6 +62,33 @@ class CryptoInvoice:
             payload=data.get("payload"),
             raw=data,
         )
+
+
+@dataclass
+class CryptoTransfer:
+    transfer_id: int
+    spend_id: str
+    user_id: int
+    asset: str
+    amount: str
+    status: str  # completed
+    raw: dict[str, Any]
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> CryptoTransfer:
+        return cls(
+            transfer_id=int(data["transfer_id"]),
+            spend_id=str(data.get("spend_id") or ""),
+            user_id=int(data.get("user_id") or 0),
+            asset=str(data.get("asset") or ""),
+            amount=str(data.get("amount") or ""),
+            status=str(data.get("status") or ""),
+            raw=data,
+        )
+
+
+def _items(result: Any) -> list[dict[str, Any]]:
+    return list(result.get("items", [])) if isinstance(result, dict) else list(result or [])
 
 
 class PaymentProvider(Protocol):
@@ -114,14 +158,65 @@ class CryptoPayClient:
             params["paid_btn_url"] = paid_btn_url
         return CryptoInvoice.from_api(await self._request("createInvoice", params))
 
+    async def create_crypto_invoice(
+        self,
+        *,
+        asset: str,
+        amount: str,
+        description: str,
+        payload: str,
+        expires_in: int,
+        paid_btn_url: str | None,
+    ) -> CryptoInvoice:
+        """An invoice in a crypto asset (escrow deals are in USDT): exactly that asset and amount."""
+        params: dict[str, Any] = {
+            "currency_type": "crypto",
+            "asset": asset,
+            "amount": amount,
+            "description": description[:1024],
+            "payload": payload,
+            "expires_in": expires_in,
+            "allow_comments": False,
+            "allow_anonymous": False,
+        }
+        if paid_btn_url:
+            params["paid_btn_name"] = "openBot"
+            params["paid_btn_url"] = paid_btn_url
+        return CryptoInvoice.from_api(await self._request("createInvoice", params))
+
     async def get_invoices(self, invoice_ids: list[int]) -> list[CryptoInvoice]:
         if not invoice_ids:
             return []
         result = await self._request(
             "getInvoices", {"invoice_ids": ",".join(str(i) for i in invoice_ids), "count": 1000}
         )
-        items = result.get("items", []) if isinstance(result, dict) else result
-        return [CryptoInvoice.from_api(item) for item in items]
+        return [CryptoInvoice.from_api(item) for item in _items(result)]
+
+    async def transfer(
+        self, *, user_id: int, asset: str, amount: str, spend_id: str, comment: str | None = None
+    ) -> CryptoTransfer:
+        """Send coins from the app balance to a Telegram user; ``spend_id`` makes it happen once."""
+        params = {
+            "user_id": user_id,
+            "asset": asset,
+            "amount": amount,
+            "spend_id": spend_id[:64],
+            "comment": comment[:1024] if comment else None,
+            "disable_send_notification": False,
+        }
+        return CryptoTransfer.from_api(await self._request("transfer", params))
+
+    async def get_transfers(self, *, spend_id: str) -> list[CryptoTransfer]:
+        result = await self._request("getTransfers", {"spend_id": spend_id[:64], "count": 1000})
+        return [CryptoTransfer.from_api(item) for item in _items(result)]
+
+    async def get_balance(self) -> dict[str, tuple[str, str]]:
+        """asset -> (available, on hold), amounts as the API gives them."""
+        result = await self._request("getBalance", {})
+        return {
+            str(item.get("currency_code")): (str(item.get("available", "0")), str(item.get("onhold", "0")))
+            for item in _items(result)
+        }
 
     async def delete_invoice(self, invoice_id: int) -> bool:
         try:
