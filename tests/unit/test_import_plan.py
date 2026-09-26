@@ -73,3 +73,29 @@ def test_known_font_resolves_names():
     design = plan["categories"][2]
     assert design["items"][1]["name"] == "CRYSTALYS"
     assert plan["unresolved"] == []
+
+
+def test_footer_without_a_link_or_with_an_old_one_leads_to_the_navigation():
+    from app.domain.richtext import Fragment
+
+    plain = Fragment.plain("\n\n#навигация")
+    old_link = RichText().text("\n\n").link("#навигация", BASE + "5").build()  # an older nav message
+    for footer in (plain, old_link):
+        posts = [
+            Snapshot(3, category_post("🗺️Travel [путешествия]", TRAVEL, None) + footer),
+            Snapshot(4, category_post("✏️VPN [Впн]", VPN, None) + footer),
+            Snapshot(7, nav_post([("#travel", BASE + "3"), ("#vpn", BASE + "4")])),
+        ]
+        plan = build_plan(
+            PlanInput(
+                snapshots=posts,
+                info=ChannelInfo(chat_id=-1001234567890, username="servicelist", pinned_id=7),
+                emoji_sets={},
+                reverse_letters={},
+            )
+        )
+        stored = Fragment.from_json(plan["templates"]["footer"])
+        assert stored.text == "#навигация"
+        assert [(e.type, e.offset, e.length, e.url) for e in stored.entities] == [
+            ("text_link", 0, 10, "post:nav")
+        ]

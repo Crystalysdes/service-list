@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app.domain.fonts import Glyph
-from app.domain.richtext import AUTO_DETECTED, Fragment, RichText
+from app.domain.richtext import AUTO_DETECTED, Entity, Fragment, RichText, u16len
 from app.domain.symbols import LinkContext
 
 MAX_TEXT = 4096
 MAX_CAPTION = 1024
+# a link to a message of a channel: t.me/<username>/<id> or t.me/c/<internal id>/<id>
+POST_URL_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me)/(?:c/\d+|[A-Za-z][A-Za-z0-9_]{3,31})/\d+/?(?:\?.*)?$"
+)
+HASHTAG_RE = re.compile(r"#\w+")
 
 
 class RenderOverflow(Exception):
@@ -155,6 +161,31 @@ def render_item(item: ItemView, tpl: RenderTemplates) -> Fragment:
     return rt.build()
 
 
+def nav_footer(footer: Fragment) -> Fragment:
+    """The category footer («#навигация») always leads to the navigation post.
+
+    A channel imported with a plain hashtag there, or with a link to an older navigation message, would
+    otherwise keep a footer that opens a hashtag search or a stale message.
+    """
+    if not footer.text:
+        return footer
+    links = [e for e in footer.entities if e.type == "text_link"]
+    if links:
+        entities = tuple(
+            replace(e, url="post:nav") if e.type == "text_link" and POST_URL_RE.match(e.url or "") else e
+            for e in footer.entities
+        )
+        return Fragment(footer.text, entities)
+    match = HASHTAG_RE.search(footer.text)
+    if match is not None:
+        start, length = u16len(footer.text[: match.start()]), u16len(match.group())
+    elif not footer.custom_emoji_count():  # premium emoji cannot sit inside a link
+        start, length = 0, footer.u16len
+    else:
+        return footer
+    return Fragment(footer.text, (Entity("text_link", start, length, url="post:nav"), *footer.entities))
+
+
 def render_category(view: CategoryView, tpl: RenderTemplates, ctx: LinkContext) -> Fragment:
     rt = RichText()
     rt.fragment(view.header)
@@ -171,7 +202,7 @@ def render_category(view: CategoryView, tpl: RenderTemplates, ctx: LinkContext) 
     rt.fragment(tpl.cta)
     if tpl.footer.text:
         rt.text(tpl.footer_sep)
-        rt.fragment(tpl.footer)
+        rt.fragment(nav_footer(tpl.footer))
     return rt.build().map_links(lambda url: ctx.resolve(url, slug=view.slug))
 
 

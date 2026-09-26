@@ -24,6 +24,7 @@ from app.domain.render import (
     NavItem,
     RenderTemplates,
     compare,
+    nav_footer,
     render_category,
     render_nav,
 )
@@ -104,8 +105,10 @@ def build_plan(data: PlanInput) -> dict[str, Any]:
     cta_fragment = _most_common_fragment(
         [c.content.map_links(lambda _url: "bot:start:add_{slug}") for c in ctas], Fragment()
     )
+    # any link to a message of this channel in the footer is the way to the navigation (maybe an older
+    # navigation message); a footer without a link gets one (nav_footer), not a plain hashtag
     footers = [
-        c.footer.map_links(lambda url: "post:nav" if post_target(url, info) == nav_id else url)
+        nav_footer(c.footer.map_links(lambda url: "post:nav" if post_target(url, info) is not None else url))
         for _, c in parsed
         if c.footer.text
     ]

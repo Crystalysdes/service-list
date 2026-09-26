@@ -161,3 +161,23 @@ def test_limits_report():
     frag = render_category(view, RenderTemplates(), LinkContext())
     report = measure(frag, Limits())
     assert not report.ok and report.user_entities == 120
+
+
+def test_nav_footer_always_links_to_the_navigation():
+    from app.domain.render import nav_footer
+    from app.domain.richtext import Fragment, RichText
+
+    def links(fragment):
+        return [(e.offset, e.length, e.url) for e in fragment.entities if e.type == "text_link"]
+
+    assert links(nav_footer(Fragment.plain("#навигация"))) == [(0, 10, "post:nav")]
+    assert links(nav_footer(Fragment.plain("⬆️ #навигация"))) == [(3, 10, "post:nav")]  # the hashtag only
+    assert links(nav_footer(Fragment.plain("Навигация"))) == [(0, 9, "post:nav")]  # no hashtag: all of it
+    old = RichText().link("#навигация", "https://t.me/servicelist/5").build()
+    assert links(nav_footer(old)) == [(0, 10, "post:nav")]
+    private = RichText().link("#навигация", "https://t.me/c/1234567890/5").build()
+    assert links(nav_footer(private)) == [(0, 10, "post:nav")]
+    site = RichText().link("наш сайт", "https://example.com/nav").build()
+    assert links(nav_footer(site)) == [(0, 8, "https://example.com/nav")]  # another site stays
+    emoji_only = RichText().emoji("5368324170671202286", "⭐").text(" Навигация").build()
+    assert links(nav_footer(emoji_only)) == []  # premium emoji cannot sit inside a link

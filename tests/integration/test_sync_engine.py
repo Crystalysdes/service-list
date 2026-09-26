@@ -9,7 +9,7 @@ from app.db.models import Category, ChannelPost, Service
 from app.domain.richtext import Fragment
 from app.services import catalog
 from app.services.selftest import diagnostics, selftest
-from app.services.settings import Runtime, get_settings, update_settings
+from app.services.settings import Runtime, Templates, get_settings, update_settings
 from tests.helpers import MAIN, engine_for, imported_channel
 
 
@@ -38,6 +38,23 @@ async def test_go_live_only_changes_cta_links(tg, db, ctx):
     assert _posts(tg)[ids["nav"]] == before[ids["nav"]]
     again = await engine.run_once(ids["channel_id"])
     assert again.edited == 0 and again.sent == 0
+
+
+async def test_plain_hashtag_footer_becomes_a_link_to_the_navigation(tg, db, ctx):
+    # the channel was imported with "#навигация" as a plain hashtag: it must still lead to the nav post
+    ids = await imported_channel(tg, db, ctx)
+    async with db.session() as s:
+        await update_settings(s, Templates, footer=Fragment.plain("#навигация").to_json())
+        await s.commit()
+    await engine_for(ctx).run_once(ids["channel_id"])
+    for key in ("travel", "vpn", "design"):
+        msg = _posts(tg)[ids[key]]
+        footer = [
+            e for e in msg["entities"] if e["type"] == "text_link" and e["url"].endswith(f"/{ids['nav']}")
+        ]
+        units = msg["text"].encode("utf-16-le")  # entity offsets count UTF-16 units
+        start, length = footer[0]["offset"], footer[0]["length"]
+        assert units[start * 2 : (start + length) * 2].decode("utf-16-le") == "#навигация"
 
 
 async def test_new_service_and_new_category_keep_nav_last(tg, db, ctx):
