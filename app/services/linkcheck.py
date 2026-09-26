@@ -476,9 +476,13 @@ class LinkChecker:
             service.link_first_dead_at = now
         if service.status != "active":
             return
-        if service.link_dead_streak < settings.dead_streak:
-            return
-        if now - service.link_first_dead_at < timedelta(hours=settings.dead_min_hours):
+        # the owner learns at once, while the service is still listed, and can replace the link in time
+        first_warning = service.link_dead_streak == 1 and service.owner_id is not None
+        if service.link_dead_streak < settings.dead_streak or now - service.link_first_dead_at < timedelta(
+            hours=settings.dead_min_hours
+        ):
+            if first_warning:
+                notices.append(("dead", service.id, {"detail": verdict.detail}))
             return
         if await is_paid(session, service):
             if service.link_grace_until is None:
@@ -531,7 +535,8 @@ class LinkChecker:
                 )
                 staff.button(text="✅ Всё в порядке", callback_data=f"lnk:fpok:{service.id}")
                 staff.button(text="🙈 Скрыть", callback_data=f"lnk:fphide:{service.id}")
-            await notify_staff(self.ctx, text, reply_markup=staff.as_markup() if has_buttons else None)
+            if kind != "dead":  # the staff hear about a dead link when the service is hidden
+                await notify_staff(self.ctx, text, reply_markup=staff.as_markup() if has_buttons else None)
             if owner is None or kind == "takeover":
                 continue
             t = Translator(owner.lang)
@@ -539,7 +544,11 @@ class LinkChecker:
             builder.button(text=t("lnk.change"), callback_data=f"my:{service.id}:ef:url")
             builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
             builder.adjust(1)
-            if kind == "hidden":
+            if kind == "dead":
+                await notify_user(
+                    self.ctx, owner.id, t("lnk.dead", name=name, url=url), reply_markup=builder.as_markup()
+                )
+            elif kind == "hidden":
                 await notify_user(
                     self.ctx, owner.id, t("lnk.hidden", name=name, url=url), reply_markup=builder.as_markup()
                 )

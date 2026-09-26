@@ -95,6 +95,22 @@ async def test_dead_link_hidden_after_streak_and_restored(h, tg, db, ctx):
     assert (await _service(db, "Hannibal Lecter")).link_dead_streak == 0
 
 
+async def test_owner_is_warned_as_soon_as_the_link_dies(h, tg, db, ctx):
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    hannibal = await _service(db, "Hannibal Lecter")
+    await _patch(db, hannibal.id, owner_id=SELLER)
+    staff_before = len(tg.bot_messages(OWNER_ID))
+    fetcher.tme("hannibal_lecter", None)
+    await checker.run_pass()
+    notice = h.last(SELLER)
+    assert "перестала открываться" in notice["text"] and "замените её на новую" in notice["text"]
+    assert h.button(notice, "Изменить ссылку")["callback_data"] == f"my:{hannibal.id}:ef:url"
+    assert len(tg.bot_messages(OWNER_ID)) == staff_before  # the staff are told only when it is hidden
+    assert (await _service(db, "Hannibal Lecter")).status == "active"  # still listed for now
+    await checker.run_pass()
+    assert h.last(SELLER)["message_id"] == notice["message_id"]  # one warning per dead spell
+
+
 async def test_breaker_and_canaries_protect_from_mass_hiding(h, tg, db, ctx):
     _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
     for username in ("lvtravel", "hoteltraffic", "tripmafia"):

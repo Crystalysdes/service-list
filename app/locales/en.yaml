@@ -243,6 +243,7 @@ rep:
   owner_late: "The time to reply has passed or a decision has already been made."
 lnk:
   change: "🔗 Change the link"
+  dead: "⚠️ The link of your service «{name}» stopped working: {url}\n\nIf it has changed, replace it with a new one — button below. If the link does not come back, the service will be temporarily hidden from the list."
   hidden: "🙈 Your service «{name}» is temporarily hidden from the list: the link {url} does not open.\n\nChange the link — the service returns after a moderator checks it. If the link starts working again, it returns automatically."
   grace: "⚠️ The link of your service «{name}» does not open: {url}\n\nPlease update it before {until}, otherwise the service will be temporarily hidden from the list."
   restored: "♻️ The link of «{name}» works again — the service is back in the list."
