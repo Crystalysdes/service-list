@@ -52,3 +52,7 @@ class DealWizard(StatesGroup):
 
 class DealDispute(StatesGroup):
     reason = State()
+
+
+class DealChatAdd(StatesGroup):
+    waiting = State()

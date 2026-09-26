@@ -23,7 +23,7 @@ def build_dispatcher(ctx: AppContext) -> Dispatcher:
         observer.middleware(throttling)
         observer.middleware(access)
 
-    from app.bot.routers import channel, fallback
+    from app.bot.routers import channel, escrow_chat, fallback
     from app.bot.routers.admin import (
         backup,
         catalog,
@@ -55,6 +55,7 @@ def build_dispatcher(ctx: AppContext) -> Dispatcher:
     dp.include_routers(user_start.router, admin_panel.router, admin_channels.router, admin_staff.router)
     dp.include_routers(
         inputs.router,
+        escrow_chat.router,
         channel.router,
         importer.router,
         catalog.router,

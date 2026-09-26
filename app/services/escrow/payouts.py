@@ -427,8 +427,10 @@ async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str
                 problems.append(
                     f"оплаченный счёт #{invoice.invoice_id} ({invoice.payload or 'без payload'}) бот не знает"
                 )
-            elif row.status != "paid":  # paid after being dropped: take the money in (it goes back)
-                await take_payment(ctx, row.id, invoice)
+            elif row.status != "paid":  # paid after being dropped: take the money in
+                from app.services.escrow.sweep import on_funding
+
+                await on_funding(ctx, await take_payment(ctx, row.id, invoice))
     try:
         transfers = await pay.get_transfers()
     except PROVIDER_ERRORS:

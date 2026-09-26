@@ -226,6 +226,11 @@ async def on_keep_old(call: CallbackQuery, **data: Any) -> None:
 async def on_my_member(update: ChatMemberUpdated, session: AsyncSession, **data: Any) -> None:
     # remembered for the "choose a channel" lists: Telegram gives bots no way to list their chats
     await remember_chat(session, update.chat, update.new_chat_member)
+    if update.chat.type == "supergroup":
+        from app.services.escrow.chats import on_bot_member
+
+        await session.commit()  # the pool update below runs in its own transactions
+        await on_bot_member(data["ctx"], update.chat.id, update.new_chat_member.status)
     channel = await _channel(session, update.chat.id)
     if channel is None:
         return

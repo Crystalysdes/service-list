@@ -33,6 +33,9 @@ async def on_funding(ctx: AppContext, result: Funding, *, seen_by: int | None = 
             await tell(ctx, deal.buyer_id, deal, "funded_buyer")
         if deal.seller_id != seen_by:
             await tell(ctx, deal.seller_id, deal, "funded_seller")
+        from app.services.escrow import chats
+
+        await chats.assign(ctx, deal.id)
         return
     if result.outcome in ("extra", "mismatch") and result.payout is not None:
         from app.services.escrow import money
@@ -124,6 +127,20 @@ async def sweep(ctx: AppContext, *, now: datetime | None = None) -> None:
         settling = list((await session.execute(select(Deal.id).where(Deal.status == "settling"))).scalars())
     for deal_id in settling:
         await deals.finish_if_paid(ctx.db, deal_id, now=now)
+    await pool(ctx, now=now)
+
+
+async def pool(ctx: AppContext, *, now: datetime | None = None) -> None:
+    """The deal groups: clean the ones whose deals are over, lend free ones to waiting deals, keep the
+    pinned cards current, warn when few are free."""
+    if ctx.bot is None:
+        return
+    from app.services.escrow import chats
+
+    await chats.cleanup_due(ctx, now=now)
+    await chats.assign_waiting(ctx)
+    await chats.refresh_cards(ctx)
+    await chats.low_pool_alert(ctx)
 
 
 async def sweep_job(ctx: AppContext) -> None:

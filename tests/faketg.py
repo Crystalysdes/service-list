@@ -585,7 +585,125 @@ class FakeTelegram:
                 info["pinned_message"] = self._export(pinned)
         if chat.get("_description"):
             info["description"] = chat["_description"]
+        if chat["type"] in ("group", "supergroup"):
+            info["has_visible_history"] = chat.get("_visible_history", False)
+            if chat.get("_permissions"):
+                info["permissions"] = chat["_permissions"]
+            for key in ("linked_chat_id", "message_auto_delete_time"):
+                if chat.get(f"_{key}"):
+                    info[key] = chat[f"_{key}"]
         return info
+
+    # ------------------------------------------------------------------ groups of the deal-chat pool
+    def m_getChatAdministrators(self, params: dict, files: dict) -> list[dict]:
+        chat = self._chat(params["chat_id"])
+        return [
+            self.m_getChatMember({"chat_id": chat["id"], "user_id": uid}, files)
+            for uid, member in chat.get("_members", {}).items()
+            if member["status"] in ("administrator", "creator")
+        ]
+
+    def m_getChatMemberCount(self, params: dict, files: dict) -> int:
+        chat = self._chat(params["chat_id"])
+        present = ("creator", "administrator", "member", "restricted")
+        return sum(1 for member in chat.get("_members", {}).values() if member["status"] in present)
+
+    def m_createChatInviteLink(self, params: dict, files: dict) -> dict:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_invite_users")
+        link = {
+            "invite_link": f"https://t.me/+deal{abs(chat['id'])}x{next(self._ids)}",
+            "creator": dict(self.bot_user),
+            "creates_join_request": bool(params.get("creates_join_request")),
+            "is_primary": False,
+            "is_revoked": False,
+        }
+        if params.get("name"):
+            link["name"] = params["name"]
+        chat.setdefault("_links", {})[link["invite_link"]] = link
+        return dict(link)
+
+    def m_revokeChatInviteLink(self, params: dict, files: dict) -> dict:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_invite_users")
+        link = chat.get("_links", {}).get(params["invite_link"])
+        if link is None:
+            raise FakeError(400, "Bad Request: INVITE_HASH_EXPIRED")
+        link["is_revoked"] = True
+        return dict(link)
+
+    def _join_request(self, chat: dict[str, Any], user_id: int) -> str:
+        requests = chat.setdefault("_requests", {})
+        if user_id not in requests:
+            raise FakeError(400, "Bad Request: HIDE_REQUESTER_MISSING")
+        return requests.pop(user_id)
+
+    def m_approveChatJoinRequest(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_invite_users")
+        uid = int(params["user_id"])
+        self._join_request(chat, uid)
+        chat["_members"][uid] = {"status": "member"}
+        msg = self._base_message(chat)
+        msg["from"] = dict(self.users[uid])
+        msg["new_chat_members"] = [dict(self.users[uid])]
+        self._store(chat, msg)
+        return True
+
+    def m_declineChatJoinRequest(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_invite_users")
+        self._join_request(chat, int(params["user_id"]))
+        chat.setdefault("_declined", []).append(int(params["user_id"]))
+        return True
+
+    def m_banChatMember(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_restrict_members")
+        uid = int(params["user_id"])
+        member = chat["_members"].get(uid)
+        if member and member["status"] == "creator":
+            raise FakeError(400, "Bad Request: can't remove chat owner")
+        if member and member["status"] == "administrator":
+            raise FakeError(400, "Bad Request: user is an administrator of the chat")
+        chat["_members"][uid] = {"status": "kicked"}
+        return True
+
+    def m_unbanChatMember(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_restrict_members")
+        member = chat["_members"].get(int(params["user_id"]))
+        if member is not None and (member["status"] == "kicked" or not params.get("only_if_banned")):
+            if member["status"] not in ("creator", "administrator"):
+                del chat["_members"][int(params["user_id"])]
+        return True
+
+    def m_setChatTitle(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_change_info")
+        chat["title"] = params["title"]
+        return True
+
+    def m_setChatPermissions(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_restrict_members")
+        chat["_permissions"] = params["permissions"]
+        return True
+
+    def m_setChatMemberTag(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_manage_tags")
+        member = chat["_members"].get(int(params["user_id"]))
+        if member is None or member["status"] != "member":
+            raise FakeError(400, "Bad Request: USER_NOT_PARTICIPANT")
+        member["tag"] = params.get("tag")
+        return True
+
+    def m_unpinAllChatMessages(self, params: dict, files: dict) -> bool:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_pin_messages")
+        self.pins[chat["id"]] = []
+        return True
 
     def m_getChatMember(self, params: dict, files: dict) -> dict:
         chat = self._chat(params["chat_id"])
@@ -599,29 +717,35 @@ class FakeTelegram:
         if member is None:
             return {"status": "left", "user": user}
         if member["status"] == "administrator":
-            return {
-                "status": "administrator",
-                "user": user,
+            rights = {
                 "can_be_edited": False,
                 "is_anonymous": False,
                 "can_manage_chat": True,
-                "can_delete_messages": member.get("can_delete_messages", False),
+                "can_delete_messages": False,
                 "can_manage_video_chats": False,
                 "can_restrict_members": False,
                 "can_promote_members": False,
                 "can_change_info": False,
-                "can_invite_users": member.get("can_invite_users", False),
+                "can_invite_users": False,
                 "can_post_stories": False,
                 "can_edit_stories": False,
                 "can_delete_stories": False,
                 "can_send_welcome_messages": False,
-                "can_post_messages": member.get("can_post_messages", False),
-                "can_edit_messages": member.get("can_edit_messages", False),
-                "can_pin_messages": member.get("can_pin_messages", False),
+                "can_post_messages": False,
+                "can_edit_messages": False,
+                "can_pin_messages": False,
+                "can_manage_tags": False,
             }
+            rights.update({k: v for k, v in member.items() if k.startswith("can_")})
+            return {"status": "administrator", "user": user, **rights}
         if member["status"] == "creator":
             return {"status": "creator", "user": user, "is_anonymous": False}
-        return {"status": member["status"], "user": user}
+        if member["status"] == "kicked":
+            return {"status": "kicked", "user": user, "until_date": 0}
+        result = {"status": member["status"], "user": user}
+        if member.get("tag"):
+            result["tag"] = member["tag"]
+        return result
 
     def m_exportChatInviteLink(self, params: dict, files: dict) -> str:
         chat = self._chat(params["chat_id"])
@@ -954,6 +1078,68 @@ class Harness:
         if request.get("request_username") and chat.get("username"):
             shared["username"] = chat["username"]
         return await self.send(user_id, chat_shared=shared)
+
+    def _member_update(self, chat_id: int, user_id: int, old: str, new: str, by: int | None = None) -> dict:
+        user = self.tg.users[user_id]
+        return {
+            "chat": self.tg.public_chat(chat_id),
+            "from": self.tg.users[by] if by else user,
+            "date": self.tg.clock,
+            "old_chat_member": {
+                "status": old,
+                "user": user,
+                **({"until_date": 0} if old == "kicked" else {}),
+            },
+            "new_chat_member": {
+                "status": new,
+                "user": user,
+                **({"until_date": 0} if new == "kicked" else {}),
+            },
+        }
+
+    async def join_request(self, user_id: int, chat_id: int, invite_link: str) -> bool:
+        """The user opens an invitation link that needs approval; True when the bot let them in (Telegram
+        then sends the chat_member update as well)."""
+        chat = self.tg.chats[chat_id]
+        link = chat.get("_links", {}).get(invite_link)
+        assert link is not None and not link["is_revoked"], "Telegram would say the link is invalid"
+        chat.setdefault("_requests", {})[user_id] = invite_link
+        request = {
+            "chat": self.tg.public_chat(chat_id),
+            "from": self.tg.users[user_id],
+            "user_chat_id": user_id,
+            "date": self.tg.clock,
+            "invite_link": {k: v for k, v in link.items() if not k.startswith("_")},
+        }
+        await self.feed({"chat_join_request": request})
+        joined = chat["_members"].get(user_id, {}).get("status") == "member"
+        if joined:
+            await self.feed({"chat_member": self._member_update(chat_id, user_id, "left", "member")})
+        return joined
+
+    async def add_member(self, chat_id: int, user_id: int, by: int) -> None:
+        """Someone with the right adds a user directly (no request)."""
+        self.tg.chats[chat_id]["_members"][user_id] = {"status": "member"}
+        await self.feed({"chat_member": self._member_update(chat_id, user_id, "left", "member", by)})
+
+    async def leave(self, chat_id: int, user_id: int) -> None:
+        self.tg.chats[chat_id]["_members"].pop(user_id, None)
+        await self.feed({"chat_member": self._member_update(chat_id, user_id, "member", "left")})
+
+    async def group_send(self, chat_id: int, user_id: int, **fields: Any) -> dict[str, Any]:
+        text = fields.pop("text", "")
+        msg = self.tg.group_message(chat_id, user_id, text)
+        if not text:
+            msg.pop("text")
+        msg.update(fields)
+        await self.feed({"message": self.tg._export(msg)})
+        return msg
+
+    async def group_edit(self, chat_id: int, message_id: int, text: str) -> None:
+        msg = self.tg.messages[chat_id][message_id]
+        msg["text"] = text
+        msg["edit_date"] = self.tg.tick()
+        await self.feed({"edited_message": self.tg._export(msg)})
 
     async def group_say(self, chat_id: int, user_id: int, text: str, thread_id: int | None = None) -> None:
         msg = self.tg.group_message(chat_id, user_id, text, thread_id)

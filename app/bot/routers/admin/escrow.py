@@ -24,11 +24,12 @@ from app.bot.flows.start import show_screen
 from app.bot.i18n import h
 from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
+from app.bot.states import DealChatAdd
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import AuditLog, Deal, DealPayout, User
+from app.db.models import AuditLog, Deal, DealChat, DealPayout, User
 from app.services.audit import audit
-from app.services.escrow import cards, deals, money, payouts
+from app.services.escrow import cards, chats, deals, money, payouts
 from app.services.escrow.deals import HELD, OPEN, UNPAID, DealError
 from app.services.escrow.notify import tell
 from app.services.escrow.staff import ROLE_TITLES, after_ban, after_verdict, staff_cancel, staff_dispute
@@ -158,6 +159,11 @@ async def home_markup(session: AsyncSession, role: str | None) -> Any:
         builder.button(text=f"🔄 Активные ({counts['active']})", callback_data="a:g:l:active")
         builder.button(text=f"💸 Выплаты с ошибкой ({counts['payouts']})", callback_data="a:g:l:payouts")
         builder.button(text="📜 Все сделки", callback_data="a:g:l:all")
+        pool = await chats.pool_counts(session)
+        builder.button(
+            text=f"👥 Чаты сделок (свободно {pool.get('free', 0)} из {pool.get('total', 0)})",
+            callback_data="a:g:c",
+        )
     builder.button(text="🔎 Найти сделку", callback_data="a:g:find")
     if role == "owner":
         builder.button(
@@ -389,6 +395,17 @@ async def staff_card(
         )
     if deal.needs_attention:
         lines.append("❗️ Требует внимания: был платёж, который не подошёл к сделке")
+    chat_line = {
+        "assigned": "назначен",
+        "preparing": "готовится",
+        "waiting": "ждёт свободной группы",
+        "dm": "потерян — сделка идёт в личке",
+        "closed": "очищен после сделки",
+    }.get(deal.chat_status)
+    if chat_line:
+        lines.append(
+            f"💬 Чат сделки: {chat_line}" + (f" (<code>{deal.chat_id}</code>)" if deal.chat_id else "")
+        )
 
     builder = InlineKeyboardBuilder()
     if deals.can_judge(deal, staff_id, role) is None:
@@ -416,6 +433,12 @@ async def staff_card(
             if user_id and not (users.get(user_id) and users[user_id].is_banned):
                 title = "покупателя" if side == "buyer" else "продавца"
                 builder.button(text=f"⛔️ Забанить {title}", callback_data=f"a:g:ban:{deal.id}:{side}")
+    if deal.chat_status == "assigned":
+        builder.button(text="🔗 Войти в чат сделки", callback_data=f"a:g:join:{deal.id}")
+    if has_role(role, "admin") and deal.status in HELD and deal.chat_id is None:
+        builder.button(text="🔁 Выдать новый чат", callback_data=f"a:g:rc:{deal.id}")
+    if deal.chat_status != "none":
+        builder.button(text="📜 Переписка файлом", callback_data=f"a:g:tx:{deal.id}")
     builder.button(text="📜 История", callback_data=f"a:g:h:{deal.id}")
     builder.button(text="🔄 Обновить", callback_data=f"a:g:d:{deal.id}")
     builder.adjust(1)
@@ -920,6 +943,248 @@ async def input_setting(message: Message, data: dict[str, Any], fsm: dict[str, A
     text, markup = await _settings_screen(session)
     await message.answer("✅ Сохранено.\n\n" + text, reply_markup=markup)
     return True
+
+
+# ------------------------------------------------------------------------------------------ deal chats
+POOL_STATES = {
+    "free": "🟢 свободна",
+    "assigned": "🔒 занята",
+    "releasing": "🧹 очищается",
+    "quarantine": "⚠️ карантин",
+}
+POOL_REQUEST_ID = 31
+POOL_HELP = (
+    "Как подготовить группу:\n"
+    "1. Создайте приватную группу (без @username) и не включайте темы.\n"
+    "2. В настройках группы: «История чата для новых участников» — «Скрыта».\n"
+    "3. Не назначайте других администраторов (лучше создавать группы со служебного аккаунта).\n"
+    "4. Нажмите «➕ Добавить группу» и выберите её — Telegram сам выдаст боту нужные права, бот проверит "
+    "остальное.\n\nСоветуем держать 20 и больше групп: одна группа — одна оплаченная сделка."
+)
+
+
+def _pool_rights() -> Any:
+    from aiogram.types import ChatAdministratorRights
+
+    flags = dict.fromkeys(chats.REQUIRED_RIGHTS, True)
+    return ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_manage_video_chats=False,
+        can_promote_members=False,
+        can_post_stories=False,
+        can_edit_stories=False,
+        can_delete_stories=False,
+        can_send_welcome_messages=False,
+        **flags,
+    )
+
+
+async def _pool_screen(session: AsyncSession) -> tuple[str, Any]:
+    counts = await chats.pool_counts(session)
+    rows = list(
+        (await session.execute(select(DealChat).order_by(DealChat.state, DealChat.chat_id))).scalars()
+    )
+    lines = [
+        "👥 <b>Чаты сделок</b>",
+        "",
+        f"Свободно: {counts.get('free', 0)} из {counts.get('total', 0)} · "
+        f"заняты: {counts.get('assigned', 0)} · "
+        f"очищаются: {counts.get('releasing', 0)} · на карантине: {counts.get('quarantine', 0)}",
+        "",
+        POOL_HELP,
+    ]
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить группу", callback_data="a:g:c:add", style="success")
+    for row in rows[:40]:
+        state = POOL_STATES.get(row.state, row.state)
+        busy = f" · сделка #{row.deal_id}" if row.deal_id else ""
+        builder.button(
+            text=f"{state} · {(row.title or str(row.chat_id))[:24]}{busy}",
+            callback_data=f"a:g:c:{row.chat_id}",
+        )
+    builder.adjust(1)
+    return "\n".join(lines), back_home(builder, "a:g")
+
+
+@router.callback_query(F.data == "a:g:c", RoleFilter("admin"))
+async def on_pool(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
+    await state.clear()
+    await call.answer()
+    text, markup = await _pool_screen(session)
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "a:g:c:add", RoleFilter("admin"))
+async def on_pool_add(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    from aiogram.types import KeyboardButton, KeyboardButtonRequestChat, ReplyKeyboardMarkup
+
+    await state.set_state(DealChatAdd.waiting)
+    rights = _pool_rights()
+    button = KeyboardButton(
+        text="👥 Выбрать группу",
+        request_chat=KeyboardButtonRequestChat(
+            request_id=POOL_REQUEST_ID,
+            chat_is_channel=False,
+            chat_is_forum=False,
+            chat_has_username=False,
+            user_administrator_rights=rights,
+            bot_administrator_rights=rights,
+            request_title=True,
+        ),
+    )
+    await call.answer()
+    assert call.message is not None
+    await call.message.answer(
+        "👇 Выберите группу кнопкой внизу экрана или пришлите её ID (вида -100…).",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[button]], resize_keyboard=True, one_time_keyboard=True),
+    )
+
+
+async def _add_pool_group(message: Message, state: FSMContext, data: dict[str, Any], chat_id: int) -> None:
+    from aiogram.types import ReplyKeyboardRemove
+
+    await state.clear()
+    try:
+        row, _check = await chats.add_group(data["ctx"], chat_id, data["user"].id)
+    except ValueError:
+        await message.answer("Эта группа сейчас занята сделкой.", reply_markup=ReplyKeyboardRemove())
+        return
+    if row.state == "free":
+        note = f"✅ Группа «{h(row.title or chat_id)}» в пуле — готова к сделке."
+    else:
+        note = (
+            f"⚠️ Группа «{h(row.title or chat_id)}» на карантине: {h(row.problem or '')}\n\n"
+            "Исправьте и нажмите «🔍 Проверить»."
+        )
+    await message.answer(note, reply_markup=ReplyKeyboardRemove())
+    text, markup = await _pool_screen(data["session"])
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(DealChatAdd.waiting, F.chat_shared, F.chat.type == "private")
+async def on_pool_shared(message: Message, state: FSMContext, **data: Any) -> None:
+    assert message.chat_shared is not None
+    await _add_pool_group(message, state, data, message.chat_shared.chat_id)
+
+
+@router.message(DealChatAdd.waiting, F.chat.type == "private")
+async def on_pool_id(message: Message, state: FSMContext, **data: Any) -> None:
+    raw = (message.text or "").strip()
+    if not re.fullmatch(r"-100\d{5,}", raw):
+        await message.answer("Нужна группа: выберите её кнопкой внизу или пришлите ID вида -100…")
+        return
+    await _add_pool_group(message, state, data, int(raw))
+
+
+@router.callback_query(F.data.regexp(r"^a:g:c:-?\d+$"), RoleFilter("admin"))
+async def on_pool_group(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    row = await session.get(DealChat, int(_parts(call)[3]))
+    if row is None:
+        await call.answer("Группы нет в пуле", show_alert=True)
+        return
+    lines = [
+        f"👥 <b>{h(row.title or row.chat_id)}</b> (<code>{row.chat_id}</code>)",
+        f"Состояние: {POOL_STATES.get(row.state, row.state)}",
+    ]
+    if row.deal_id:
+        lines.append(
+            f"Сделка: #{row.deal_id}" + (f", шаг очистки: {row.cleanup_step}" if row.cleanup_step else "")
+        )
+    if row.problem:
+        lines.append(f"Проблема: {h(row.problem)}")
+    if row.checked_at:
+        lines.append(f"Проверена: {fmt_dt(row.checked_at, data['ctx'].config.timezone)}")
+    builder = InlineKeyboardBuilder()
+    if row.state in ("free", "quarantine"):
+        builder.button(text="🔍 Проверить", callback_data=f"a:g:c:chk:{row.chat_id}")
+        builder.button(text="🗑 Убрать из пула", callback_data=f"a:g:c:rm:{row.chat_id}")
+    if row.deal_id:
+        builder.button(text=f"📂 Сделка #{row.deal_id}", callback_data=f"a:g:d:{row.deal_id}")
+    builder.adjust(1)
+    await call.answer()
+    assert call.message is not None
+    await show_screen(call.message, "\n".join(lines), reply_markup=back_home(builder, "a:g:c"))
+
+
+@router.callback_query(F.data.regexp(r"^a:g:c:(chk|rm):-?\d+$"), RoleFilter("admin"))
+async def on_pool_action(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    _, _, _, action, raw = _parts(call)
+    ctx: AppContext = data["ctx"]
+    if action == "rm":
+        done = await chats.remove_group(ctx, int(raw))
+        await call.answer(
+            "Группа убрана из пула" if done else "Занятую группу убрать нельзя", show_alert=not done
+        )
+    else:
+        try:
+            row = await chats.recheck(ctx, int(raw), data["user"].id)
+        except ValueError:
+            await call.answer("Группа занята сделкой", show_alert=True)
+            return
+        await call.answer(
+            "✅ Всё в порядке — группа свободна" if row.state == "free" else f"⚠️ {row.problem}"[:190],
+            show_alert=True,
+        )
+    text, markup = await _pool_screen(session)
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup)
+
+
+@router.callback_query(F.data.regexp(r"^a:g:join:\d+$"))
+async def on_join_chat(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    ctx: AppContext = data["ctx"]
+    deal = await deals.get_deal(session, int(_parts(call)[3]))
+    role = _role(data)
+    if deal is None or not _may_view(deal, role) or (role == "moderator" and deal.status != "disputed"):
+        await call.answer("Чат этой сделки вам недоступен", show_alert=True)
+        return
+    if data["user"].id in (deal.buyer_id, deal.seller_id):
+        await call.answer("Вы сторона этой сделки — входите по своей ссылке", show_alert=True)
+        return
+    link = await chats.staff_link(ctx, deal.id, data["user"].id)
+    if link is None:
+        await call.answer("У сделки сейчас нет чата", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"🔗 Войти в чат сделки #{deal.id}", url=link, style="primary")
+    try:
+        await data["bot"].send_message(
+            data["user"].id,
+            f"Вход в чат сделки #{deal.id}: бот одобрит заявку только для вас. "
+            "Стороны увидят, что подключился гарант.",
+            reply_markup=builder.as_markup(),
+        )
+    except TelegramAPIError:
+        await call.answer("Откройте бота в личке (/start)", show_alert=True)
+        return
+    await call.answer("Ссылка — у вас в личке с ботом")
+
+
+@router.callback_query(F.data.regexp(r"^a:g:tx:\d+$"))
+async def on_transcript(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    ctx: AppContext = data["ctx"]
+    deal = await deals.get_deal(session, int(_parts(call)[3]))
+    if deal is None or not _may_view(deal, _role(data)):
+        await call.answer("Сделка недоступна", show_alert=True)
+        return
+    sent = await chats.send_transcript(ctx, deal, data["user"].id, f"📜 Переписка сделки #{deal.id}")
+    await audit(session, data["user"].id, "deal.transcript", "deal", deal.id)
+    await call.answer(
+        "Файл — у вас в личке с ботом" if sent else "Откройте бота в личке (/start)", show_alert=not sent
+    )
+
+
+@router.callback_query(F.data.regexp(r"^a:g:rc:\d+$"), RoleFilter("admin"))
+async def on_reassign(call: CallbackQuery, **data: Any) -> None:
+    deal_id = int(_parts(call)[3])
+    outcome = await chats.reassign(data["ctx"], deal_id)
+    notes = {
+        "assigned": "Новый чат выдан — сторонам отправлены ссылки",
+        "waiting": "Свободных групп нет — сделка в очереди",
+    }
+    await call.answer(notes.get(outcome, "Сделке сейчас новый чат не нужен"), show_alert=True)
 
 
 @router.callback_query(F.data.regexp(r"^a:g(:|$)"))

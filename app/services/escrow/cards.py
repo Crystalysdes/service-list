@@ -194,12 +194,23 @@ def card_text(
     return "\n".join(lines)
 
 
+def chat_link(deal: Deal, viewer: int | None) -> str | None:
+    """The side's own link into the deal's group, while the group is the deal's."""
+    role = role_of(deal, viewer)
+    if role is None or deal.chat_status != "assigned" or deal.status not in (*HELD, "settling"):
+        return None
+    return (deal.data or {}).get("invites", {}).get(role)
+
+
 def card_keyboard(t: Translator, deal: Deal, viewer: int | None) -> InlineKeyboardMarkup:
     """Only what this viewer may do in this state; every press is checked again by the deal itself."""
     builder = InlineKeyboardBuilder()
     role = role_of(deal, viewer)
     creator = viewer == deal.creator_id
     s, n, v = deal.status, deal.id, deal.version
+    link = chat_link(deal, viewer)
+    if link:
+        builder.button(text=t("g.btn.chat"), url=link, style="primary")
     if s == "pending":
         other = deal.seller_id if deal.creator_role == "buyer" else deal.buyer_id
         if creator and other is not None:
