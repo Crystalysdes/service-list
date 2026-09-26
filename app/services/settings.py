@@ -144,11 +144,45 @@ class Chats(SettingsGroup):
 
 
 class Escrow(SettingsGroup):
-    """Auto-garant: deals through the bot with the money held until both sides confirm."""
+    """Auto-garant: deals through the bot with the money held until both sides confirm.
+
+    A deal copies what it needs at creation (fee, deadlines, the admin-only threshold), so a change here
+    applies to new deals only.
+    """
 
     KEY: ClassVar[str] = "escrow"
 
-    enabled: bool = False
+    enabled: bool = False  # new deals are accepted (the owner switches it on)
+    fee_bps: int = 500  # the service's fee in basis points: 500 = 5%
+    min_cents: int = 500
+    max_cents: int = 100_000
+    delivery_days: list[int] = Field(default_factory=lambda: [1, 3, 7, 14])  # offered when creating
+    accept_hours: int = 24  # the invitation waits this long for the other side
+    pay_hours: int = 24  # after accepting, the buyer pays within this
+    release_hours: int = 72  # the buyer's silence after "delivered" releases the money to the seller
+    grace_hours: int = 24  # after the delivery deadline, before a dispute opens by itself
+    cleanup_minutes: int = 60  # the deal chat is cleaned and reused this long after the end
+    max_open_per_user: int = 3
+    max_unpaid_per_user: int = 2
+    create_cooldown_sec: int = 60
+    admin_only_from_cents: int = 50_000  # verdicts from this amount on are for admins only
+
+    @property
+    def fee_percent(self) -> float:
+        return self.fee_bps / 100
+
+
+class EscrowRuntime(SettingsGroup):
+    """The garant's state kept by the bot: the payout pause and the last check of the Crypto Pay balance."""
+
+    KEY: ClassVar[str] = "escrow_runtime"
+
+    payouts_paused: bool = False
+    pause_reason: str | None = None
+    paused_at: datetime | None = None
+    last_reconcile_at: datetime | None = None
+    last_balance: dict[str, Any] = Field(default_factory=dict)  # cents: available, onhold, owed
+    problems: list[str] = Field(default_factory=list)  # what the last check found
 
 
 class Payments(SettingsGroup):

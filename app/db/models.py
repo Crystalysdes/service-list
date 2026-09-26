@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -481,3 +482,239 @@ class FsmState(Base):
     state: Mapped[str | None] = mapped_column(String(256))
     data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+# ------------------------------------------------------------------------------------------ Auto-garant
+DEAL_STATUSES = (
+    "pending",  # created, waiting for the other side to accept
+    "awaiting_payment",
+    "funded",  # the money is held
+    "delivered",  # the seller says it is done; auto-release is counting down
+    "disputed",
+    "settling",  # decided, payouts in progress
+    "completed",  # the seller was paid
+    "refunded",  # the buyer got the money back (minus the fee)
+    "split",  # a verdict divided the money
+    "cancelled",  # before payment
+    "expired",  # before payment
+)
+
+
+class Deal(TimestampMixin, Base):
+    """An escrow deal. Money in cents of USDT; the settings in force at creation are frozen into it."""
+
+    __tablename__ = "deals"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN (" + ", ".join(f"'{s}'" for s in DEAL_STATUSES) + ")", name="status_valid"
+        ),
+        CheckConstraint("creator_role IN ('buyer', 'seller')", name="role_valid"),
+        CheckConstraint("fee_payer IN ('buyer', 'seller', 'split')", name="fee_payer_valid"),
+        CheckConstraint(
+            "buyer_id IS NULL OR seller_id IS NULL OR buyer_id <> seller_id", name="parties_differ"
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'cancelled', 'expired') "
+            "OR (buyer_id IS NOT NULL AND seller_id IS NOT NULL)",
+            name="parties_bound",
+        ),
+        CheckConstraint(
+            "amount_cents > 0 AND fee_cents >= 0 AND seller_gets_cents > 0 "
+            "AND buyer_pays_cents - seller_gets_cents = fee_cents",
+            name="money",
+        ),
+        CheckConstraint(
+            "coalesce(seller_share_cents, 0) >= 0 AND coalesce(buyer_share_cents, 0) >= 0 "
+            "AND (status NOT IN ('settling', 'completed', 'refunded', 'split') "
+            "OR coalesce(seller_share_cents, 0) + coalesce(buyer_share_cents, 0) "
+            "= buyer_pays_cents - fee_cents)",
+            name="shares",
+        ),
+        CheckConstraint(
+            "verdict_by IS NULL "
+            "OR (verdict_by <> coalesce(buyer_id, 0) AND verdict_by <> coalesce(seller_id, 0))",
+            name="judge_not_party",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(24), unique=True)  # secret; links, payloads and spend_ids
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    creator_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    creator_role: Mapped[str] = mapped_column(String(8))
+    buyer_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    seller_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    counterparty_username: Mapped[str | None] = mapped_column(String(64))  # lowercase, without "@"
+    counterparty_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    title: Mapped[str] = mapped_column(String(128))
+    terms: Mapped[str] = mapped_column(Text)
+    terms_hash: Mapped[str] = mapped_column(String(64))
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    fee_cents: Mapped[int] = mapped_column(Integer)
+    buyer_pays_cents: Mapped[int] = mapped_column(Integer)
+    seller_gets_cents: Mapped[int] = mapped_column(Integer)
+    fee_bps: Mapped[int] = mapped_column(Integer)
+    fee_payer: Mapped[str] = mapped_column(String(8))
+    delivery_days: Mapped[int] = mapped_column(Integer)
+    pay_hours: Mapped[int] = mapped_column(Integer)
+    release_hours: Mapped[int] = mapped_column(Integer)
+    grace_hours: Mapped[int] = mapped_column(Integer)
+    admin_only_from_cents: Mapped[int | None] = mapped_column(Integer)
+    accept_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pay_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deliver_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    release_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    funded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    disputed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    received_cents: Mapped[int | None] = mapped_column(Integer)
+    provider_fee_cents: Mapped[int | None] = mapped_column(Integer)
+    release_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    cancel_proposed_by: Mapped[int | None] = mapped_column(BigInteger)
+    dispute_by: Mapped[int | None] = mapped_column(BigInteger)
+    dispute_reason: Mapped[str | None] = mapped_column(Text)
+    resolution: Mapped[str | None] = mapped_column(String(16))  # release / auto / mutual / verdict
+    verdict_by: Mapped[int | None] = mapped_column(BigInteger)
+    verdict_note: Mapped[str | None] = mapped_column(Text)
+    seller_share_cents: Mapped[int | None] = mapped_column(Integer)
+    buyer_share_cents: Mapped[int | None] = mapped_column(Integer)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    chat_status: Mapped[str] = mapped_column(String(12), default="none", server_default=text("'none'"))
+    card_message_id: Mapped[int | None] = mapped_column(Integer)
+    # {"rejected": [user ids the creator turned down], "invites": {...}, "cards": {...}}
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    needs_attention: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class DealInvoice(TimestampMixin, Base):
+    """A Crypto Pay invoice of a deal (kept apart from the listing invoices)."""
+
+    __tablename__ = "deal_invoices"
+    __table_args__ = (
+        Index(
+            "uq_deal_invoices_one_active", "deal_id", unique=True, postgresql_where=text("status = 'active'")
+        ),
+        Index(
+            "uq_deal_invoices_one_funding",
+            "deal_id",
+            unique=True,
+            postgresql_where=text("disposition = 'funded'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id", ondelete="RESTRICT"), index=True)
+    provider_invoice_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    payload: Mapped[str] = mapped_column(String(64))
+    pay_url: Mapped[str] = mapped_column(String(512))
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(
+        String(16), default="active", index=True
+    )  # active/paid/expired/deleted
+    disposition: Mapped[str | None] = mapped_column(String(12))  # funded / extra / mismatch
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paid_amount: Mapped[str | None] = mapped_column(String(32))
+    fee_amount: Mapped[str | None] = mapped_column(String(32))
+    received_cents: Mapped[int | None] = mapped_column(Integer)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+
+
+class DealPayout(TimestampMixin, Base):
+    """Money sent out of a deal. One per deal and side; spend_id makes the transfer happen once."""
+
+    __tablename__ = "deal_payouts"
+    __table_args__ = (
+        Index(
+            "uq_deal_payouts_deal_purpose",
+            "deal_id",
+            "purpose",
+            unique=True,
+            postgresql_where=text("purpose IN ('seller', 'buyer')"),
+        ),
+        Index(
+            "uq_deal_payouts_source_invoice",
+            "source_invoice_id",
+            unique=True,
+            postgresql_where=text("source_invoice_id IS NOT NULL"),
+        ),
+        Index("ix_deal_payouts_status_next", "status", "next_attempt_at"),
+        CheckConstraint("amount_cents > 0", name="positive"),
+        CheckConstraint("purpose <> 'extra' OR source_invoice_id IS NOT NULL", name="extra_has_source"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id", ondelete="RESTRICT"), index=True)
+    purpose: Mapped[str] = mapped_column(String(8))  # seller / buyer / extra
+    source_invoice_id: Mapped[int | None] = mapped_column(ForeignKey("deal_invoices.id", ondelete="RESTRICT"))
+    recipient_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    # pending / sending / done / retry / failed / unknown / manual
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    spend_id: Mapped[str] = mapped_column(String(64), unique=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    transfer_id: Mapped[int | None] = mapped_column(BigInteger)
+    last_error: Mapped[str | None] = mapped_column(String(256))
+    manual_ref: Mapped[str | None] = mapped_column(Text)
+    decided_by: Mapped[int | None] = mapped_column(BigInteger)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+
+
+class DealChat(TimestampMixin, Base):
+    """A group of the deal-chat pool: free, busy with a deal, being cleaned, or in quarantine."""
+
+    __tablename__ = "deal_chats"
+    __table_args__ = (
+        Index("uq_deal_chats_deal_id", "deal_id", unique=True, postgresql_where=text("deal_id IS NOT NULL")),
+        CheckConstraint("state <> 'free' OR deal_id IS NULL", name="free_is_empty"),
+    )
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    title: Mapped[str | None] = mapped_column(String(256))
+    state: Mapped[str] = mapped_column(
+        String(12), default="free", index=True
+    )  # free/assigned/releasing/quarantine
+    deal_id: Mapped[int | None] = mapped_column(ForeignKey("deals.id", ondelete="SET NULL"))
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_step: Mapped[str | None] = mapped_column(String(16))
+    first_message_id: Mapped[int | None] = mapped_column(Integer)
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_check: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    problem: Mapped[str | None] = mapped_column(Text)
+
+
+class DealEvent(CreatedMixin, Base):
+    """The deal's log: chat messages and edits, join requests, joins, leaves, kicks. Only appended."""
+
+    __tablename__ = "deal_events"
+    __table_args__ = (
+        Index(
+            "uq_deal_events_message",
+            "chat_id",
+            "message_id",
+            unique=True,
+            postgresql_where=text("kind = 'message'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id", ondelete="RESTRICT"), index=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    message_id: Mapped[int | None] = mapped_column(Integer)
+    user_id: Mapped[int | None] = mapped_column(BigInteger)
+    kind: Mapped[str] = mapped_column(String(16))  # message / edit / join_request / join / leave / kick / bot
+    body: Mapped[str | None] = mapped_column(Text)  # the message text or caption
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    media_id: Mapped[int | None] = mapped_column(ForeignKey("media_files.id", ondelete="SET NULL"))
+    tg_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

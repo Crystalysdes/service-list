@@ -36,9 +36,9 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from app.config import Config
 from app.context import AppContext
 from app.db.base import Base, utcnow
-from app.db.models import Backup, Category, Channel, MediaFile, Service
+from app.db.models import Backup, Category, Channel, Deal, MediaFile, Service
 from app.db.session import Database
-from app.services.settings import Chats, Runtime, get_settings, update_settings
+from app.services.settings import Chats, EscrowRuntime, Runtime, get_settings, update_settings
 
 log = logging.getLogger(__name__)
 
@@ -417,6 +417,11 @@ async def restore_archive(
     async with db.session() as session:
         # the new server must prove premium emoji work again before posts with them are touched
         await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
+        # the archive may predate payouts made since: garant payouts wait until the owner has checked
+        if await session.scalar(select(func.count()).select_from(Deal)):
+            await update_settings(
+                session, EscrowRuntime, payouts_paused=True, pause_reason="restore", paused_at=utcnow()
+            )
         await session.commit()
     return RestoreResult(tables=counts, media=len(extracted), created_at=manifest.get("created_at"))
 
