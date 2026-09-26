@@ -41,6 +41,7 @@ def _extra_routers() -> list:
     import importlib
 
     names = [
+        "app.bot.routers.admin.inputs",
         "app.bot.routers.channel",
         "app.bot.routers.admin.importer",
         "app.bot.routers.admin.catalog",

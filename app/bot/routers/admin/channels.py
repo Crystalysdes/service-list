@@ -154,6 +154,10 @@ async def on_channel_ref(
     channel = await save_channel(session, chat, role, invite)
     await audit(session, data["user"].id, "channel.connect", "channel", channel.id, {"role": role})
     await state.clear()
+    await session.commit()
+    engine = data["ctx"].get("sync")
+    if engine is not None:
+        await engine.wake_all()
     await message.answer(
         f"✅ Канал подключён: {h(chat.title or chat.id)} — {ROLE_TITLES[role]}.\n"
         + (
