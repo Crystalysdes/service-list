@@ -91,10 +91,13 @@ class Templates(SettingsGroup):
     footer: dict[str, Any] = Field(default_factory=_footer_default)
     emoji_name_marker: dict[str, Any] = Field(default_factory=_marker_default)
     emoji_name_gap: str = " "
+    emoji_gap: str = ""
     nav_header: dict[str, Any] = Field(default_factory=_nav_header_default)
     nav_header_sep: str = "\n\n"
     nav_label_sep: str = "\n"
-    nav_in_blockquote: bool = True
+    nav_quote: str = "all"  # all / header / none
+    nav_footer: dict[str, Any] = Field(default_factory=dict)
+    nav_footer_sep: str = "\n\n"
     scam_index_header: dict[str, Any] = Field(default_factory=_scam_index_header_default)
     scam_index_prefix: str = "↳ "
     scam_card_title: str = "🚫 SCAM • {name}"
