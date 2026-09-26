@@ -81,6 +81,13 @@ async def _notify_decision(
         elif request.kind == "claim":
             text = t("claim.approved", name=name)
             builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
+        elif follow and follow.get("order_id"):
+            text = t("opt.emoji_approved_pay", name=name, price=billing.money(follow["amount"]))
+            builder.button(
+                text=t("pay.button", price=billing.money(follow["amount"])),
+                callback_data=f"pay:{follow['order_id']}",
+                style="success",
+            )
         else:
             text = t("opt.emoji_approved", name=name)
             builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")

@@ -71,6 +71,7 @@ class Limits(SettingsGroup):
     report_max_photos: int = 10
     owner_reply_hours: int = 48
     waitlist_hold_hours: int = 24
+    allow_own_emoji: bool = False
 
 
 class Reminders(SettingsGroup):

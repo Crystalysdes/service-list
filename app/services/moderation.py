@@ -138,6 +138,22 @@ async def submit_edit(
     return request
 
 
+async def submit_emoji(
+    session: AsyncSession, user: User, service: Service, emoji_id: str, alt: str, months: int = 1
+) -> ModerationRequest:
+    request = ModerationRequest(
+        kind="emoji",
+        service_id=service.id,
+        user_id=user.id,
+        payload={"emoji_id": emoji_id, "alt": alt, "months": months},
+        status="pending",
+    )
+    session.add(request)
+    await session.flush()
+    await audit(session, user.id, "request.emoji", "request", request.id)
+    return request
+
+
 async def open_request(
     session: AsyncSession, service_id: int, kind: str | None = None
 ) -> ModerationRequest | None:
@@ -350,7 +366,7 @@ async def approve(
     elif request.kind == "emoji":
         from app.services.options import apply_custom_emoji
 
-        await apply_custom_emoji(session, service, request.payload)
+        follow.update(await apply_custom_emoji(session, service, request.payload))
     await audit(session, moderator_id, "request.approve", "request", request.id)
     await session.flush()
     return follow

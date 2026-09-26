@@ -60,12 +60,26 @@ async def job_expire_unpaid(ctx: AppContext) -> None:
         await notify_user(ctx, user_id, t("add.expired_unpaid", name=h(name)))
 
 
+async def job_reminders(ctx: AppContext) -> None:
+    from app.services.lifecycle import send_reminders
+
+    await send_reminders(ctx)
+
+
+async def job_expire(ctx: AppContext) -> None:
+    from app.services.lifecycle import expire
+
+    await expire(ctx)
+
+
 def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
     """(job, trigger) pairs."""
     return [
         (job_selftest, IntervalTrigger(hours=6, jitter=120)),
         (job_poll_invoices, IntervalTrigger(seconds=20)),
         (job_expire_unpaid, IntervalTrigger(hours=1, jitter=60)),
+        (job_reminders, IntervalTrigger(minutes=10)),
+        (job_expire, IntervalTrigger(minutes=2)),
     ]
 
 
