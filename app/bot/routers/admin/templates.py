@@ -43,6 +43,10 @@ FRAGMENTS: dict[str, tuple[str, str | None]] = {
     "scam_intro": ("Описание Scam list (RU + EN, закреплено)", KEEP_LINKS),
     "cta": ("Строка «[занять место]» (ведёт в бота)", "bot:start:add_{slug}"),
     "footer": ("Футер категорий «#навигация»", "post:nav"),
+    "garant_link": (
+        "Ссылка «#Авто-Гарант» рядом с «#навигация» (видна, пока гарант принимает сделки)",
+        "bot:start:garant",
+    ),
     "emoji_name_marker": ("Метка у эмодзи-названия «[тык.]»", "service:url"),
     "nav_header": ("Заголовок навигации", None),
     "scam_index_header": ("Заголовок индекса скам-листа", None),

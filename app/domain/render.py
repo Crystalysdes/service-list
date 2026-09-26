@@ -91,9 +91,11 @@ class RenderTemplates:
     nav_quote: str = "all"
     nav_footer: Fragment = field(default_factory=Fragment)
     nav_footer_sep: str = "\n\n"
+    garant: Fragment = field(default_factory=Fragment)  # empty while the garant takes no deals
+    garant_gap: str = "   "
 
     @classmethod
-    def from_settings(cls, tpl: Any) -> RenderTemplates:
+    def from_settings(cls, tpl: Any, *, garant: bool = False) -> RenderTemplates:
         return cls(
             item_prefix=tpl.item_prefix,
             item_sep=tpl.item_sep,
@@ -110,6 +112,8 @@ class RenderTemplates:
             nav_quote=tpl.nav_quote,
             nav_footer=Fragment.from_json(tpl.nav_footer),
             nav_footer_sep=tpl.nav_footer_sep,
+            garant=Fragment.from_json(tpl.garant_link) if garant else Fragment(),
+            garant_gap=tpl.garant_gap,
         )
 
 
@@ -203,6 +207,9 @@ def render_category(view: CategoryView, tpl: RenderTemplates, ctx: LinkContext) 
     if tpl.footer.text:
         rt.text(tpl.footer_sep)
         rt.fragment(nav_footer(tpl.footer))
+    if tpl.garant.text:
+        rt.text(tpl.garant_gap if tpl.footer.text else tpl.footer_sep)
+        rt.fragment(tpl.garant)
     return rt.build().map_links(lambda url: ctx.resolve(url, slug=view.slug))
 
 

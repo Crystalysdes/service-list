@@ -23,6 +23,10 @@ def _footer_default() -> dict[str, Any]:
     return RichText().link("#навигация", "post:nav").build().to_json()
 
 
+def _garant_link_default() -> dict[str, Any]:
+    return RichText().link("#Авто-Гарант", "bot:start:garant").build().to_json()
+
+
 def _marker_default() -> dict[str, Any]:
     return RichText().link("[тык.]", "service:url").build().to_json()
 
@@ -101,6 +105,9 @@ class Templates(SettingsGroup):
     header_styles: list[str] = Field(default_factory=lambda: ["blockquote", "bold"])
     cta: dict[str, Any] = Field(default_factory=_cta_default)
     footer: dict[str, Any] = Field(default_factory=_footer_default)
+    # next to «#навигация» in every category post while the garant takes deals: opens a new deal in the bot
+    garant_link: dict[str, Any] = Field(default_factory=_garant_link_default)
+    garant_gap: str = "   "
     emoji_name_marker: dict[str, Any] = Field(default_factory=_marker_default)
     emoji_name_gap: str = " "
     emoji_gap: str = ""

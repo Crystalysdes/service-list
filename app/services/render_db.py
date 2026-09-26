@@ -88,7 +88,8 @@ async def category_view(
 
 
 async def templates(session: AsyncSession) -> RenderTemplates:
-    return RenderTemplates.from_settings(await get_settings(session, Templates))
+    garant = (await get_settings(session, Escrow)).enabled  # «#Авто-Гарант» only while deals are taken
+    return RenderTemplates.from_settings(await get_settings(session, Templates), garant=garant)
 
 
 async def limits(session: AsyncSession) -> Limits:

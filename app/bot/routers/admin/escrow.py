@@ -29,6 +29,7 @@ from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import AuditLog, Deal, DealChat, DealPayout, User
 from app.services.audit import audit
+from app.services.catalog import request_sync
 from app.services.escrow import cards, chats, deals, money, payouts
 from app.services.escrow.deals import HELD, OPEN, UNPAID, DealError
 from app.services.escrow.notify import tell
@@ -206,6 +207,7 @@ async def on_toggle(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
     await update_settings(session, Escrow, enabled=not settings.enabled)
     await audit(session, data["user"].id, "escrow.enabled", data={"enabled": not settings.enabled})
     await session.commit()
+    request_sync(ctx)  # «#Авто-Гарант» in the category posts and the button under the main post follow
     await call.answer("Приём сделок включён" if not settings.enabled else "Приём сделок остановлен")
     assert call.message is not None
     await _show_home(call.message, {**data, "session": session})

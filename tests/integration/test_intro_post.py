@@ -110,3 +110,24 @@ async def test_menu_has_the_chat_next_to_service_list(h, tg, db, ctx):
     rows = menu["reply_markup"]["inline_keyboard"]
     assert rows[0][1]["url"] == "https://t.me/servicelist_chat"
     assert [b["text"] for b in rows[1]] == ["🛡 Auto-garant"] and "Auto-garant" in menu["text"]
+
+
+async def test_category_posts_link_to_the_garant_while_it_takes_deals(h, tg, db, ctx):
+    ids, engine = await _setup(tg, db, ctx)
+    assert "Авто-Гарант" not in tg.messages[MAIN][ids["travel"]]["text"]
+    async with db.session() as s:
+        await update_settings(s, Escrow, enabled=True)
+        await s.commit()
+    await engine.run_once(ids["channel_id"])
+    post = tg.messages[MAIN][ids["travel"]]
+    last_line = post["text"].rstrip().rsplit("\n", 1)[-1]
+    assert last_line.startswith("#навигация") and last_line.endswith("   #Авто-Гарант")
+    links = {e["url"] for e in post["entities"] if e["type"] == "text_link"}
+    assert "https://t.me/servicelist_bot?start=garant" in links
+    assert (await engine.run_once(ids["channel_id"])).edited == 0  # stable
+
+    async with db.session() as s:
+        await update_settings(s, Escrow, enabled=False)
+        await s.commit()
+    await engine.run_once(ids["channel_id"])
+    assert "Авто-Гарант" not in tg.messages[MAIN][ids["travel"]]["text"]
