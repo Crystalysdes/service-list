@@ -283,6 +283,7 @@ g:
   reason:
     deadline: "the seller did not mark it delivered in time"
     ban: "one of the sides is banned"
+    staff: "the administration stopped the deal"
   card:
     head: "{icon} <b>Deal #{n}</b> · {status}"
     waiting_party: "waiting for someone to accept the invitation"
@@ -450,6 +451,10 @@ g:
     already_sent: "This transfer has already gone through."
     wizard_gone: "The draft is out of date — start again."
   ev:
+    verdict: "⚖️ <b>Decision on deal #{n}</b>\nTo the seller: {seller_share}\nTo the buyer: {buyer_share}\nReason: {note}\n\nThe payout comes in @CryptoBot."
+    staff_dispute: "⚠️ Deal #{n} is stopped: a dispute is open. The money stays with the garant, a moderator will look into it."
+    staff_cancelled: "✖️ Deal #{n} «{title}» was cancelled by the administration before payment."
+    manual_payout: "💸 {value} for deal #{n} were paid to you by hand: {ref}"
     accepted: "✅ {who} accepted the terms of deal #{n} «{title}».\nThe buyer pays {buyer_pays} by {pay_due} — the bot tells you when the money is with the garant."
     confirm_who: "❓ The invitation to deal #{n} was accepted by {who}.\n\nIs this your counterparty? Check the @username and ID — the deal can be paid only after you confirm."
     confirmed: "✅ The creator confirmed you in deal #{n} «{title}»."

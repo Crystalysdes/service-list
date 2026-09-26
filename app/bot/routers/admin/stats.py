@@ -19,7 +19,7 @@ from app.bot.i18n import h
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Feature, ModerationRequest, Order, ReportCase, ScamEntry, Service, User
+from app.db.models import Deal, Feature, ModerationRequest, Order, ReportCase, ScamEntry, Service, User
 from app.services.billing import money
 from app.services.timefmt import zone
 
@@ -95,6 +95,37 @@ async def sources(session: AsyncSession, limit: int = 15) -> list[dict[str, Any]
     ]
 
 
+async def garant_line(session: AsyncSession, now: datetime) -> str:
+    """Auto-garant: finished deals, turnover, the garant's fees, disputes and what is open now."""
+    from app.services.escrow import money as usdt
+    from app.services.escrow.deals import OPEN
+
+    finished = ("completed", "refunded", "split")
+    done, turnover, fees = (
+        await session.execute(
+            select(
+                func.count(Deal.id),
+                func.coalesce(func.sum(Deal.amount_cents), 0),
+                func.coalesce(func.sum(Deal.fee_cents), 0),
+            ).where(Deal.status.in_(finished))
+        )
+    ).one()
+    month = await session.scalar(
+        select(func.count())
+        .select_from(Deal)
+        .where(Deal.status.in_(finished), Deal.closed_at >= now - timedelta(days=30))
+    )
+    disputes = await session.scalar(
+        select(func.count()).select_from(Deal).where(Deal.disputed_at.is_not(None))
+    )
+    open_now = await session.scalar(select(func.count()).select_from(Deal).where(Deal.status.in_(OPEN)))
+    return (
+        f"<b>Гарант:</b> сделок завершено {done} (за 30 дней {month or 0}), "
+        f"оборот {usdt.show(int(turnover))}, комиссии {usdt.show(int(fees))}, споров {disputes or 0}, "
+        f"открыто сейчас {open_now or 0}"
+    )
+
+
 async def stats_text(session: AsyncSession, tz: str) -> str:
     now = utcnow()
     today = datetime.now(zone(tz)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -160,6 +191,7 @@ async def stats_text(session: AsyncSession, tz: str) -> str:
         select(func.count()).select_from(ScamEntry).where(ScamEntry.status == "published")
     )
     lines.append(f"<b>Жалобы:</b> открытых дел {open_cases or 0}; в скам-листе {scams or 0}")
+    lines.append(await garant_line(session, now))
     users = await session.scalar(select(func.count()).select_from(User))
     week = await session.scalar(
         select(func.count()).select_from(User).where(User.created_at >= now - timedelta(days=7))

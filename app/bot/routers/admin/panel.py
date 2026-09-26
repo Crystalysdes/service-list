@@ -60,6 +60,7 @@ def home_keyboard(
     builder.button(text="🧩 Сервисы", callback_data="a:svc")
     builder.button(text="🚫 Скам-лист", callback_data="a:scam")
     builder.button(text="⛔️ Чёрный список", callback_data="a:bl")
+    builder.button(text="🛡 Гарант", callback_data="a:g")
     if role in ("admin", "owner"):
         builder.button(text="💵 Цены и сроки", callback_data="a:prices")
         builder.button(text="😀 Эмодзи", callback_data="a:emoji")

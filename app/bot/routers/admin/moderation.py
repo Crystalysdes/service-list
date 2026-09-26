@@ -354,6 +354,9 @@ async def on_ban_yes(call: CallbackQuery, session: AsyncSession, **data: Any) ->
     ctx: AppContext = data["ctx"]
     rejected = await moderation.ban_user(session, request.user_id, data["user"].id, "бан модератором")
     await session.commit()
+    from app.services.escrow.staff import after_ban
+
+    await after_ban(ctx, request.user_id, data["user"].id)  # paid deals to a dispute, unpaid ones off
     await call.answer("Пользователь забанен")
     if call.message is not None:
         await call.message.delete()

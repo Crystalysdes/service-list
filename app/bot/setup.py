@@ -43,6 +43,7 @@ def build_dispatcher(ctx: AppContext) -> Dispatcher:
         templates,
     )
     from app.bot.routers.admin import channels as admin_channels
+    from app.bot.routers.admin import escrow as admin_escrow
     from app.bot.routers.admin import intro as admin_intro
     from app.bot.routers.admin import menu as admin_menu
     from app.bot.routers.admin import panel as admin_panel
@@ -70,6 +71,7 @@ def build_dispatcher(ctx: AppContext) -> Dispatcher:
         templates.router,
         admin_menu.router,
         admin_intro.router,
+        admin_escrow.router,
         orders.router,
         migration.router,
         add_service.router,

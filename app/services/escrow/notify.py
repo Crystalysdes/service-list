@@ -5,14 +5,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot.i18n import Translator, h
 from app.context import AppContext
 from app.db.models import Deal, User
 from app.services.escrow import money
-from app.services.notify import claim_notification, notify_staff, notify_user
+from app.services.notify import claim_notification, notify_staff, notify_user, remember_alert
 from app.services.timefmt import fmt_dt
 
 log = logging.getLogger(__name__)
@@ -77,9 +77,9 @@ async def alert_owner(ctx: AppContext, text: str) -> None:
         await notify_user(ctx, owner_id, "🛡 <b>Гарант</b>\n" + text)
 
 
-async def to_staff(ctx: AppContext, text: str, reply_markup: Any = None) -> None:
+async def to_staff(ctx: AppContext, text: str, reply_markup: Any = None) -> list[Message]:
     """Deal matters for moderators: the "deals" topic of the moderation group, or staff DMs."""
-    await notify_staff(ctx, "🛡 " + text, topic="deals", reply_markup=reply_markup)
+    return await notify_staff(ctx, "🛡 " + text, topic="deals", reply_markup=reply_markup)
 
 
 async def dispute_alert(ctx: AppContext, deal: Deal, *, reason_only: bool = False) -> None:
@@ -106,4 +106,7 @@ async def dispute_alert(ctx: AppContext, deal: Deal, *, reason_only: bool = Fals
         )
     builder = InlineKeyboardBuilder()
     builder.button(text="📂 Открыть сделку", callback_data=f"a:g:d:{deal.id}")
-    await to_staff(ctx, text, reply_markup=builder.as_markup())
+    sent = await to_staff(ctx, text, reply_markup=builder.as_markup())
+    async with ctx.db.session() as session:  # every copy shows the decision later
+        remember_alert(session, "deal", deal.id, sent)
+        await session.commit()
