@@ -31,7 +31,10 @@ async def staff_targets(
             "reports": chats.topic_reports,
         }.get(topic)
         return [(chats.moderation_chat_id, thread)]
-    return [(owner_id, None) for owner_id in ctx.config.owner_ids]
+    from app.services.users import staff_ids
+
+    min_role = "admin" if topic == "log" else "moderator"
+    return [(user_id, None) for user_id in await staff_ids(session, ctx.config.owner_ids, min_role)]
 
 
 async def notify_staff(

@@ -42,6 +42,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
     else:
         captcha.pop("payload", None)
     user.captcha = captcha or None
+    data["state"] = state
     if not data.get("role") and user.captcha_passed_at is None and await captcha_required(data["session"]):
         await send_captcha(message.chat.id, data)
         return
@@ -61,7 +62,8 @@ async def cmd_help(message: Message, **data: Any) -> None:
 
 
 @router.callback_query(F.data.startswith("cap:"))
-async def on_captcha(call: CallbackQuery, **data: Any) -> None:
+async def on_captcha(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    data["state"] = state
     user = data["user"]
     t: Translator = data["t"]
     message = call.message
@@ -119,7 +121,8 @@ async def on_captcha(call: CallbackQuery, **data: Any) -> None:
 
 
 @router.callback_query(F.data.startswith("lang:"))
-async def on_language(call: CallbackQuery, **data: Any) -> None:
+async def on_language(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    data["state"] = state
     code = (call.data or "").split(":", 1)[1]
     if code not in LANGS:
         await call.answer()

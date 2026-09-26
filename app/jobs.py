@@ -36,10 +36,36 @@ async def job_selftest(ctx: AppContext) -> None:
         engine.wake()
 
 
+async def job_poll_invoices(ctx: AppContext) -> None:
+    from app.services.billing import poll_invoices
+    from app.services.purchases import after_paid
+
+    for result in await poll_invoices(ctx):
+        if result.status in ("ok", "attention", "mismatch"):
+            await after_paid(ctx, result)
+
+
+async def job_expire_unpaid(ctx: AppContext) -> None:
+    from app.bot.i18n import Translator, h
+    from app.db.models import User
+    from app.services.moderation import expire_unpaid
+    from app.services.notify import notify_user
+
+    for user_id, _service_id, name in await expire_unpaid(ctx):
+        if not user_id:
+            continue
+        async with ctx.db.session() as session:
+            user = await session.get(User, user_id)
+        t = Translator(user.lang if user else None)
+        await notify_user(ctx, user_id, t("add.expired_unpaid", name=h(name)))
+
+
 def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
-    """(job, trigger) pairs; later milestones extend this list."""
+    """(job, trigger) pairs."""
     return [
         (job_selftest, IntervalTrigger(hours=6, jitter=120)),
+        (job_poll_invoices, IntervalTrigger(seconds=20)),
+        (job_expire_unpaid, IntervalTrigger(hours=1, jitter=60)),
     ]
 
 

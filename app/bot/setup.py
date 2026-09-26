@@ -16,7 +16,8 @@ def build_dispatcher(ctx: AppContext) -> Dispatcher:
     dp = Dispatcher(storage=PostgresStorage(ctx.db.sessionmaker), ctx=ctx)
     dp.update.outer_middleware(DbSessionMiddleware(ctx.db.sessionmaker))
     dp.update.outer_middleware(UserMiddleware())
-    throttling = ThrottlingMiddleware()
+    limit, window = ctx.services.get("throttle", (8, 4.0))
+    throttling = ThrottlingMiddleware(limit=limit, window=window)
     access = AccessMiddleware()
     for observer in (dp.message, dp.callback_query):
         observer.middleware(throttling)
@@ -59,6 +60,7 @@ def _extra_routers() -> list:
         "app.bot.routers.admin.migration",
         "app.bot.routers.user.add_service",
         "app.bot.routers.user.my_services",
+        "app.bot.routers.user.payments",
         "app.bot.routers.user.options",
         "app.bot.routers.user.report",
         "app.bot.routers.user.claim",

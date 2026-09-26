@@ -12,6 +12,14 @@ log = logging.getLogger(__name__)
 async def start_background(ctx: AppContext) -> None:
     from app.services.sync.engine import SyncEngine
 
+    token = ctx.config.cryptopay_token.get_secret_value() if ctx.config.cryptopay_token else ""
+    if token:
+        from app.services.cryptopay import CryptoPayClient
+
+        ctx.services["cryptopay"] = CryptoPayClient(token, testnet=ctx.config.cryptopay_testnet)
+    else:
+        log.warning("CRYPTOPAY_TOKEN is not set: payments are disabled")
+
     engine = SyncEngine(ctx)
     ctx.services["sync"] = engine
     await engine.start()
@@ -29,3 +37,6 @@ async def stop_background(ctx: AppContext) -> None:
     engine = ctx.services.get("sync")
     if engine is not None:
         await engine.stop()
+    provider = ctx.services.get("cryptopay")
+    if provider is not None and hasattr(provider, "close"):
+        await provider.close()

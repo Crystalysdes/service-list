@@ -71,13 +71,15 @@ def config(tmp_path):
 
 @pytest.fixture
 async def ctx(db, bot, config, tg):
-    return AppContext(
+    context = AppContext(
         config=config,
         db=db,
         bot=bot,
         bot_id=tg.bot_user["id"],
         bot_username=tg.bot_user["username"],
     )
+    context.services["throttle"] = (100_000, 1.0)
+    return context
 
 
 @pytest.fixture
