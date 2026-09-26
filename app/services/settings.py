@@ -139,6 +139,7 @@ class Chats(SettingsGroup):
     topic_applications: int | None = None
     topic_reports: int | None = None
     topic_log: int | None = None
+    topic_deals: int | None = None  # Auto-garant disputes
     appeal_contact: str | None = None  # shown to banned owners, e.g. "@support"
     community_url: str | None = None  # the community chat ("💬 Chat" in the menu); None: from the main post
 

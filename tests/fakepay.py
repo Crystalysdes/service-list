@@ -62,9 +62,13 @@ class FakeCryptoPay:
         return CryptoInvoice.from_api(dict(data))
 
     async def get_invoices(self, invoice_ids):
+        if self.fail:
+            raise OSError("network down")
         return [CryptoInvoice.from_api(dict(self.invoices[i])) for i in invoice_ids if i in self.invoices]
 
     async def delete_invoice(self, invoice_id):
+        if self.fail:
+            raise OSError("network down")
         invoice = self.invoices.get(invoice_id)
         if invoice is not None and invoice["status"] == "paid":
             return False  # a paid invoice cannot be deleted
@@ -121,10 +125,23 @@ class FakeCryptoPay:
             raise TimeoutError("the transfer went through, the answer did not")
         return CryptoTransfer.from_api(dict(data))
 
-    async def get_transfers(self, *, spend_id):
-        return [CryptoTransfer.from_api(dict(t)) for t in self.transfers if t["spend_id"] == spend_id]
+    async def get_transfers(self, *, spend_id=None):
+        if self.fail:
+            raise OSError("network down")
+        found = [t for t in self.transfers if spend_id is None or t["spend_id"] == spend_id]
+        return [CryptoTransfer.from_api(dict(t)) for t in found]
+
+    async def paid_invoices(self):
+        if self.fail:
+            raise OSError("network down")
+        return [CryptoInvoice.from_api(dict(i)) for i in self.invoices.values() if i["status"] == "paid"]
+
+    def expire(self, invoice_id: int) -> None:
+        self.invoices[invoice_id]["status"] = "expired"
 
     async def get_balance(self):
+        if self.fail:
+            raise OSError("network down")
         return {asset: (str(value), "0") for asset, value in self.balance.items()}
 
     def paid_to(self, user_id: int) -> Decimal:

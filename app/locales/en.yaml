@@ -250,3 +250,17 @@ lnk:
   hidden: "🙈 Your service «{name}» is temporarily hidden from the list: the link {url} does not open.\n\nChange the link — the service returns after a moderator checks it. If the link starts working again, it returns automatically."
   grace: "⚠️ The link of your service «{name}» does not open: {url}\n\nPlease update it before {until}, otherwise the service will be temporarily hidden from the list."
   restored: "♻️ The link of «{name}» works again — the service is back in the list."
+g:
+  open_deal: "📂 Deal #{n}"
+  ev:
+    funded_buyer: "✅ <b>Deal #{n} is paid</b>\n{buyer_pays} are held by the garant: the seller gets nothing until you confirm.\n\nThe seller delivers by {deliver_due}. Check the result and tap «✅ Release the money», or «⚠️ Dispute» if something is wrong."
+    funded_seller: "💰 <b>The buyer paid deal #{n}</b>\n{buyer_pays} are held by the garant.\n\nDeliver by {deliver_due} and tap «📦 Delivered». Once the buyer confirms, you get {seller_gets} in @CryptoBot."
+    extra_payment: "↩️ A payment came in for deal #{n} that does not fit it — {back} will be returned to you in @CryptoBot."
+    expired: "⌛️ Deal #{n} «{title}» is cancelled: the time to accept or to pay ran out."
+    auto_released: "⏱ <b>Deal #{n}</b>: the review time is over and no dispute was opened — {seller_gets} go to the seller."
+    release_soon: "⏳ In {hours} h the money of deal #{n} goes to the seller automatically. If something is wrong, open a dispute before {release_due}."
+    deadline_soon: "⏰ Less than a day is left in deal #{n} (until {deliver_due}). When you are done, tap «📦 Delivered»."
+    deadline_passed: "⏰ The deadline of deal #{n} has passed. Mark it delivered within {hours} h, otherwise a dispute opens."
+    deadline_dispute: "⚠️ <b>Deal #{n}</b>: the seller did not mark it delivered in time — a dispute is open. A moderator will look into it; the money stays with the garant."
+    paid_out: "💸 {value} for deal #{n} were sent to you in @CryptoBot."
+    payout_blocked: "💸 There is a payout of {value} for you (deal #{n}), but @CryptoBot does not know your account yet.\n\nOpen @CryptoBot and tap «Start» — the bot retries the payout by itself within half an hour."

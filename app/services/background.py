@@ -19,6 +19,17 @@ async def start_background(ctx: AppContext) -> None:
         ctx.services["cryptopay"] = CryptoPayClient(token, testnet=ctx.config.cryptopay_testnet)
     else:
         log.warning("CRYPTOPAY_TOKEN is not set: payments are disabled")
+    config = ctx.config
+    escrow_token = config.escrow_cryptopay_token.get_secret_value() if config.escrow_cryptopay_token else ""
+    if escrow_token:
+        from app.services.cryptopay import CryptoPayClient
+
+        testnet = (
+            config.cryptopay_testnet
+            if config.escrow_cryptopay_testnet is None
+            else config.escrow_cryptopay_testnet
+        )
+        ctx.services["escrow_pay"] = CryptoPayClient(escrow_token, testnet=testnet)
 
     from app.services.linkcheck import LinkChecker
 
@@ -40,9 +51,10 @@ async def stop_background(ctx: AppContext) -> None:
     engine = ctx.services.get("sync")
     if engine is not None:
         await engine.stop()
-    provider = ctx.services.get("cryptopay")
-    if provider is not None and hasattr(provider, "close"):
-        await provider.close()
+    for name in ("cryptopay", "escrow_pay"):
+        provider = ctx.services.get(name)
+        if provider is not None and hasattr(provider, "close"):
+            await provider.close()
     checker = ctx.services.get("linkcheck")
     if checker is not None:
         await checker.close()

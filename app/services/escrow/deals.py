@@ -176,6 +176,11 @@ async def _locked(session: AsyncSession, *where: Any) -> Deal | None:
     return (await session.execute(stmt.execution_options(populate_existing=True))).scalar_one_or_none()
 
 
+async def lock(session: AsyncSession, deal_id: int) -> Deal | None:
+    """The deal row, locked until the caller's transaction ends (changes to it wait meanwhile)."""
+    return await _locked(session, Deal.id == deal_id)
+
+
 @asynccontextmanager
 async def _change(db: Database, *where: Any) -> AsyncIterator[tuple[AsyncSession, Deal]]:
     """A locked deal in a transaction of its own; a DealError inside rolls everything back."""

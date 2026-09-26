@@ -21,6 +21,9 @@ class Config(BaseSettings):
     owner_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     cryptopay_token: SecretStr | None = None
     cryptopay_testnet: bool = False
+    # Auto-garant: a Crypto Pay app of its own, so deal money never mixes with listing payments
+    escrow_cryptopay_token: SecretStr | None = None
+    escrow_cryptopay_testnet: bool | None = None  # None: as CRYPTOPAY_TESTNET
     timezone: str = "Europe/Moscow"
     data_dir: Path = Path("data")
     backup_passphrase: SecretStr | None = None

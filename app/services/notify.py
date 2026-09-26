@@ -17,7 +17,7 @@ from app.services.settings import Chats, get_settings
 
 log = logging.getLogger(__name__)
 
-TOPICS = ("log", "applications", "reports")
+TOPICS = ("log", "applications", "reports", "deals")
 
 
 async def staff_targets(
@@ -29,6 +29,7 @@ async def staff_targets(
             "log": chats.topic_log,
             "applications": chats.topic_applications,
             "reports": chats.topic_reports,
+            "deals": chats.topic_deals,
         }.get(topic)
         return [(chats.moderation_chat_id, thread)]
     from app.services.users import staff_ids

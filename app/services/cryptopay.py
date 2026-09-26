@@ -206,9 +206,20 @@ class CryptoPayClient:
         }
         return CryptoTransfer.from_api(await self._request("transfer", params))
 
-    async def get_transfers(self, *, spend_id: str) -> list[CryptoTransfer]:
-        result = await self._request("getTransfers", {"spend_id": spend_id[:64], "count": 1000})
+    async def get_transfers(self, *, spend_id: str | None = None) -> list[CryptoTransfer]:
+        """The app's transfers: the one with this spend_id, or the latest 1000."""
+        params: dict[str, Any] = {
+            "asset": None,
+            "spend_id": spend_id[:64] if spend_id else None,
+            "count": 1000,
+        }
+        result = await self._request("getTransfers", params)
         return [CryptoTransfer.from_api(item) for item in _items(result)]
+
+    async def paid_invoices(self) -> list[CryptoInvoice]:
+        """The latest 1000 paid invoices of the app (the reconciliation looks for unknown ones)."""
+        result = await self._request("getInvoices", {"status": "paid", "count": 1000})
+        return [CryptoInvoice.from_api(item) for item in _items(result)]
 
     async def get_balance(self) -> dict[str, tuple[str, str]]:
         """asset -> (available, on hold), amounts as the API gives them."""
