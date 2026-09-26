@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import BlacklistEntry, ModerationRequest, Order, Service, Staff, User
+from app.db.models import BlacklistEntry, Category, ModerationRequest, Order, Service, Staff, User
 from app.jobs import job_poll_invoices
 from app.services import billing
 from app.services.settings import Chats, get_settings, save_settings
@@ -126,6 +126,39 @@ async def test_approve_for_free_publishes_without_payment(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     travel = tg.messages[MAIN][ids["travel"]]["text"]
     assert travel.index("Travel with Coco Jango") < travel.index("Fly Cheap") < travel.index("занять место")
+
+
+async def test_take_a_place_link_starts_in_its_category(h, tg, db, ctx):
+    ids, _pay, _engine = await _setup(tg, db, ctx)
+    travel_post = tg.messages[MAIN][ids["travel"]]
+    link = next(e["url"] for e in travel_post["entities"] if e.get("url", "").endswith("?start=add_travel"))
+
+    # a newcomer taps "[занять место]": captcha and language first, then straight to the name
+    newbie = 7003
+    tg.add_user(newbie, "New", "newbie")
+    await h.open_link(newbie, link)
+    captcha = h.last(newbie)
+    await h.press(newbie, captcha, captcha["text"].split("tap ")[-1].strip())
+    await h.press(newbie, h.last(newbie), "Русский")
+    ask = h.last(newbie)
+    assert "Travel" in ask["text"].split("\n")[0] and "Как называется ваш сервис" in ask["text"]
+    await h.say(newbie, "Fly Cheap")
+    assert "Опишите сервис" in h.last(newbie)["text"]  # the category was not asked
+
+    # an existing user, and a link typed in another case
+    await h.open_link(USER, link.replace("add_travel", "add_Travel"))
+    assert "Как называется ваш сервис" in h.last(USER)["text"]
+
+    # a closed category says so and offers the others
+    async with db.session() as s:
+        travel = (await s.execute(select(Category).where(Category.slug == "travel"))).scalar_one()
+        travel.is_open = False
+        await s.commit()
+    await h.open_link(USER, link)
+    closed, choose = tg.bot_messages(USER)[-2:]
+    assert "Приём заявок в эту ветку сейчас закрыт" in closed["text"]
+    assert "Выберите ветку" in choose["text"]
+    assert not any("Travel" in b["text"] for b in h.buttons(choose))
 
 
 async def test_reject_with_reason_and_edit_flow(h, tg, db, ctx):

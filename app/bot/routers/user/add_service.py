@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.flows.start import register_payload, show_screen
@@ -21,6 +22,7 @@ from app.domain.richtext import Fragment, RichText
 from app.services import billing, moderation, render_db
 from app.services.settings import Limits, get_settings
 
+log = logging.getLogger(__name__)
 router = Router(name="user_add_service")
 router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
@@ -71,13 +73,17 @@ async def start_add(
         await bot.send_message(chat_id, problem)
         return
     await state.clear()
-    if slug:
-        category = (await session.execute(select(Category).where(Category.slug == slug))).scalar_one_or_none()
+    if slug:  # "[занять место]" in a category post: start right in that category
+        category = (
+            await session.execute(select(Category).where(func.lower(Category.slug) == slug.lower()))
+        ).scalar_one_or_none()
         if category is not None and category.is_open and category.is_visible:
             await _ask_name(chat_id, data, category)
             return
         if category is not None:
             await bot.send_message(chat_id, t("add.closed"))
+        else:
+            log.warning("add link with an unknown category %r", slug)
     categories = await _open_categories(session)
     if not categories:
         await bot.send_message(chat_id, t("add.no_categories"))
