@@ -353,6 +353,12 @@ class FakeTelegram:
         return True
 
     def m_answerCallbackQuery(self, params: dict, files: dict) -> bool:
+        answered = self.__dict__.setdefault("_answered", set())
+        if params["callback_query_id"] in answered:  # Telegram takes one answer per press
+            raise FakeError(
+                400, "Bad Request: query is too old and response timeout expired or query ID is invalid"
+            )
+        answered.add(params["callback_query_id"])
         return True
 
     def m_sendMessage(self, params: dict, files: dict) -> dict:

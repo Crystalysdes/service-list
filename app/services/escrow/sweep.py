@@ -25,12 +25,14 @@ RELEASE_REMINDERS = (24, 3)  # hours before the automatic release the buyer is r
 DELIVERY_REMINDER = 24  # hours before the delivery deadline the seller is reminded
 
 
-async def on_funding(ctx: AppContext, result: Funding) -> None:
-    """Tell the sides what a paid invoice did."""
+async def on_funding(ctx: AppContext, result: Funding, *, seen_by: int | None = None) -> None:
+    """Tell the sides what a paid invoice did (``seen_by`` sees it on screen already)."""
     deal = result.deal
     if result.outcome == "funded":
-        await tell(ctx, deal.buyer_id, deal, "funded_buyer")
-        await tell(ctx, deal.seller_id, deal, "funded_seller")
+        if deal.buyer_id != seen_by:
+            await tell(ctx, deal.buyer_id, deal, "funded_buyer")
+        if deal.seller_id != seen_by:
+            await tell(ctx, deal.seller_id, deal, "funded_seller")
         return
     if result.outcome in ("extra", "mismatch") and result.payout is not None:
         from app.services.escrow import money

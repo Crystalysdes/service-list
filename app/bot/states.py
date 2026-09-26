@@ -41,3 +41,14 @@ class OwnerReply(StatesGroup):
 
 class ClaimFlow(StatesGroup):
     search = State()
+
+
+class DealWizard(StatesGroup):
+    title = State()
+    terms = State()
+    amount = State()
+    counterparty = State()
+
+
+class DealDispute(StatesGroup):
+    reason = State()

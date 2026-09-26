@@ -80,3 +80,30 @@ async def alert_owner(ctx: AppContext, text: str) -> None:
 async def to_staff(ctx: AppContext, text: str, reply_markup: Any = None) -> None:
     """Deal matters for moderators: the "deals" topic of the moderation group, or staff DMs."""
     await notify_staff(ctx, "🛡 " + text, topic="deals", reply_markup=reply_markup)
+
+
+async def dispute_alert(ctx: AppContext, deal: Deal, *, reason_only: bool = False) -> None:
+    """Staff learn about a dispute at once, and again when its opener has said why."""
+    from app.services.escrow.cards import who
+    from app.services.escrow.deals import role_of
+
+    async with ctx.db.session() as session:
+        opener = await session.get(User, deal.dispute_by) if deal.dispute_by else None
+    if deal.dispute_by:
+        role = "покупатель" if role_of(deal, deal.dispute_by) == "buyer" else "продавец"
+        by = f"{role} {who(opener, deal.dispute_by)}"
+    else:
+        by = {"deadline": "бот: продавец не успел к сроку", "ban": "бот: участник заблокирован"}.get(
+            deal.dispute_reason or "", "бот"
+        )
+    if reason_only:
+        reason = h(deal.dispute_reason or "")
+        text = f"Причина спора по сделке #{deal.id} от {by}:\n<blockquote>{reason}</blockquote>"
+    else:
+        text = (
+            f"⚠️ <b>Спор по сделке #{deal.id}</b> · {money.show(deal.amount_cents)}\n"
+            f"«{h(deal.title)}»\nОткрыл: {by}"
+        )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📂 Открыть сделку", callback_data=f"a:g:d:{deal.id}")
+    await to_staff(ctx, text, reply_markup=builder.as_markup())
