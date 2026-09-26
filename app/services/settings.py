@@ -102,6 +102,10 @@ class Templates(SettingsGroup):
     scam_index_header: dict[str, Any] = Field(default_factory=_scam_index_header_default)
     scam_index_prefix: str = "↳ "
     scam_card_title: str = "🚫 SCAM • {name}"
+    scam_label_link: str = "Ссылка: "
+    scam_label_category: str = "Ветка: "
+    scam_label_date: str = "Дата: "
+    scam_removed: str = "✅ Запись снята администрацией."
 
 
 class Chats(SettingsGroup):

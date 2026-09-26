@@ -627,8 +627,15 @@ class FakeTelegram:
                 msg["caption_entities"] = entities
         if params.get("reply_markup"):
             msg["reply_markup"] = params["reply_markup"]
+        self._common(msg, params)
         self._store(chat, msg)
         return self._export(msg)
+
+    def _common(self, msg: dict[str, Any], params: dict[str, Any]) -> None:
+        if params.get("message_thread_id"):
+            msg["message_thread_id"] = params["message_thread_id"]
+        if params.get("reply_parameters"):
+            msg["_reply_to"] = params["reply_parameters"].get("message_id")
 
     def m_sendDocument(self, params: dict, files: dict) -> dict:
         chat = self._chat(params["chat_id"])
@@ -638,12 +645,15 @@ class FakeTelegram:
         msg["document"] = {"file_id": file_id, "file_unique_id": f"u{file_id}", "file_name": "file.bin"}
         if params.get("caption"):
             msg["caption"] = _strip_html(params["caption"])
+        self._common(msg, params)
         self._store(chat, msg)
         return self._export(msg)
 
     def m_sendMediaGroup(self, params: dict, files: dict) -> list[dict]:
         chat = self._chat(params["chat_id"])
         self._require(chat, "can_post_messages")
+        if not 2 <= len(params["media"]) <= 10:
+            raise FakeError(400, "Bad Request: wrong number of media in the album")
         result = []
         for item in params["media"]:
             file_id = self._upload(files, item["media"], item.get("type", "photo"))
@@ -654,8 +664,10 @@ class FakeTelegram:
             ]
             if item.get("caption"):
                 msg["caption"] = item["caption"]
-            if params.get("reply_parameters"):
-                msg["_reply_to"] = params["reply_parameters"].get("message_id")
+            if item.get("type") == "document":
+                msg.pop("photo")
+                msg["document"] = {"file_id": file_id, "file_unique_id": f"u{file_id}", "file_name": "f.png"}
+            self._common(msg, params)
             self._store(chat, msg)
             result.append(self._export(msg))
         return result

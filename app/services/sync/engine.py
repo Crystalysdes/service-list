@@ -140,7 +140,9 @@ class SyncEngine:
         self.idle_interval = idle_interval
         self.per_minute = per_minute
         self.workers: dict[int, ChannelWorker] = {}
-        self.planners: dict[str, Any] = {}
+        from app.services.scamlist import reconcile_scam
+
+        self.planners: dict[str, Any] = {"scam": reconcile_scam}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ lifecycle
@@ -727,6 +729,9 @@ class SyncEngine:
                 await self._mark_broken(channel_id, exc.message)
                 raise ChannelBroken(exc.message) from exc
             raise
+
+    async def mark_broken(self, channel_id: int, reason: str) -> None:
+        await self._mark_broken(channel_id, reason)
 
     async def _mark_broken(self, channel_id: int, reason: str) -> None:
         async with self.ctx.db.session() as session:

@@ -36,6 +36,7 @@ class ReportFlow(StatesGroup):
 
 class OwnerReply(StatesGroup):
     text = State()
+    photos = State()
 
 
 class ClaimFlow(StatesGroup):

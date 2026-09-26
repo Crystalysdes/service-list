@@ -65,6 +65,16 @@ def u16len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+def u16_trim(text: str, limit: int) -> str:
+    """The longest prefix of ``text`` that fits into ``limit`` UTF-16 code units."""
+    total = 0
+    for index, char in enumerate(text):
+        total += 2 if ord(char) > 0xFFFF else 1
+        if total > limit:
+            return text[:index]
+    return text
+
+
 def u16_offsets(text: str) -> list[int]:
     """``result[i]`` is the UTF-16 offset of python index ``i``; ``result[len(text)]`` is the total length."""
     offsets = [0] * (len(text) + 1)

@@ -114,6 +114,8 @@ class ThrottlingMiddleware(BaseMiddleware):
         tg_user = data.get("event_from_user")
         if tg_user is None or data.get("role") or not _is_private(event):
             return await handler(event, data)
+        if isinstance(event, Message) and event.media_group_id:
+            return await handler(event, data)  # an album arrives as up to 10 messages at once
         now = time.monotonic()
         hits = self._hits[tg_user.id]
         while hits and now - hits[0] > self.window:
