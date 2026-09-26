@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
@@ -14,13 +17,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.i18n import Translator
 from app.db.base import utcnow
-from app.db.models import Channel
+from app.db.models import Channel, MediaFile
 from app.domain.captcha import is_blocked, new_challenge
 from app.domain.symbols import channel_url
 from app.services.channels import INACTIVE_STATUSES
-from app.services.settings import Captcha, get_settings
+from app.services.media import edit_to_stored, send_stored
+from app.services.settings import Captcha, MenuMedia, get_settings
+
+log = logging.getLogger(__name__)
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+MEDIA_KEYS = ("photo", "video", "animation", "document")
 
 PayloadHandler = Callable[[int, dict[str, Any], str], Awaitable[bool]]
 # prefix -> handler(chat_id, data, payload) ; returns True when handled
@@ -29,6 +36,30 @@ PAYLOAD_HANDLERS: dict[str, PayloadHandler] = {}
 
 def register_payload(prefix: str, handler: PayloadHandler) -> None:
     PAYLOAD_HANDLERS[prefix] = handler
+
+
+def has_media(message: Any) -> bool:
+    return any(getattr(message, key, None) for key in MEDIA_KEYS)
+
+
+async def show_screen(message: Any, text: str, **kwargs: Any) -> Any:
+    """Show a text screen in place of ``message``.
+
+    A text message is edited. A media message (the main menu with its video) cannot become text, so it is
+    replaced by a new message; so is a message that can no longer be edited.
+    """
+    if isinstance(message, Message):
+        if not has_media(message):
+            try:
+                edited = await message.edit_text(text, **kwargs)
+                return edited if isinstance(edited, Message) else message
+            except TelegramBadRequest as exc:
+                if "not modified" in exc.message.lower():
+                    return message
+        else:
+            with contextlib.suppress(TelegramAPIError):
+                await message.delete()
+    return await message.answer(text, **kwargs)
 
 
 async def captcha_required(session: AsyncSession) -> bool:
@@ -85,7 +116,7 @@ def language_keyboard() -> InlineKeyboardMarkup:
 async def send_language_choice(chat_id: int, data: dict[str, Any], *, edit: Message | None = None) -> None:
     t: Translator = data["t"]
     if edit is not None:
-        await edit.edit_text(t("lang.choose"), reply_markup=language_keyboard())
+        await show_screen(edit, t("lang.choose"), reply_markup=language_keyboard())
     else:
         await data["bot"].send_message(chat_id, t("lang.choose"), reply_markup=language_keyboard())
 
@@ -123,15 +154,53 @@ def menu_keyboard(t: Translator, main_url: str | None, scam_url: str | None) -> 
     builder.button(text=t("menu.report"), callback_data="rep:start", style="danger")
     builder.button(text=t("menu.language"), callback_data="m:lang")
     builder.button(text=t("menu.help"), callback_data="m:help")
-    builder.adjust(1, 1, 1, 1, 1, 2)
+    builder.adjust(1, 2)  # Service List on its own row, the rest two per row
     return builder.as_markup()
+
+
+async def menu_media(session: AsyncSession) -> MediaFile | None:
+    settings = await get_settings(session, MenuMedia)
+    if not settings.media_id:
+        return None
+    return await session.get(MediaFile, settings.media_id)
+
+
+async def show_media_menu(
+    chat_id: int, data: dict[str, Any], media: MediaFile, *, edit: Message | None = None
+) -> bool:
+    """The menu as a video / GIF / picture with the menu text as its caption. False if Telegram refused."""
+    t: Translator = data["t"]
+    ctx = data["ctx"]
+    main_url, scam_url = await channel_links(data["session"])
+    markup = menu_keyboard(t, main_url, scam_url)
+    caption = t("menu.title")
+    if isinstance(edit, Message):
+        try:  # turns the previous screen (text or media) into the menu in place
+            await edit_to_stored(ctx, edit, media, caption=caption, reply_markup=markup)
+            return True
+        except TelegramBadRequest as exc:
+            if "not modified" in exc.message.lower():
+                return True
+        except TelegramAPIError:
+            pass
+        with contextlib.suppress(TelegramAPIError):
+            await edit.delete()
+    try:
+        await send_stored(ctx, chat_id, media, caption=caption, reply_markup=markup)
+        return True
+    except TelegramAPIError:
+        log.warning("cannot show the menu media %s", media.id, exc_info=True)
+        return False
 
 
 async def send_menu(chat_id: int, data: dict[str, Any], *, edit: Message | None = None) -> None:
     t: Translator = data["t"]
+    media = await menu_media(data["session"])
+    if media is not None and await show_media_menu(chat_id, data, media, edit=edit):
+        return
     main_url, scam_url = await channel_links(data["session"])
     markup = menu_keyboard(t, main_url, scam_url)
-    if edit is not None:
+    if edit is not None and not has_media(edit):
         try:
             await edit.edit_text(t("menu.title"), reply_markup=markup, link_preview_options=NO_PREVIEW)
             return

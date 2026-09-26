@@ -11,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.flows.start import register_payload
+from app.bot.flows.start import register_payload, show_screen
 from app.bot.i18n import Translator, h
 from app.bot.states import AddService
 from app.db.models import Category
@@ -89,7 +89,7 @@ async def start_add(
     builder.adjust(*([2] * (len(categories) // 2) + [1] * (len(categories) % 2) + [1]))
     await state.set_state(AddService.category)
     if edit is not None:
-        await edit.edit_text(t("add.choose_category"), reply_markup=builder.as_markup())
+        await show_screen(edit, t("add.choose_category"), reply_markup=builder.as_markup())
     else:
         await bot.send_message(chat_id, t("add.choose_category"), reply_markup=builder.as_markup())
 

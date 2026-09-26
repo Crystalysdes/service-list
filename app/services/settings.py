@@ -108,6 +108,15 @@ class Templates(SettingsGroup):
     scam_removed: str = "✅ Запись снята администрацией."
 
 
+class MenuMedia(SettingsGroup):
+    """The video / GIF / picture shown above the bot's main menu (/admin → 🧾 Шаблоны → 🎬)."""
+
+    KEY: ClassVar[str] = "menu"
+
+    media_id: int | None = None  # MediaFile row
+    kind: str | None = None  # video / animation / photo
+
+
 class Chats(SettingsGroup):
     KEY: ClassVar[str] = "chats"
 

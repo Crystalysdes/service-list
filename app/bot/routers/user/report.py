@@ -17,7 +17,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.flows.start import register_payload, send_menu
+from app.bot.flows.start import register_payload, send_menu, show_screen
 from app.bot.i18n import Translator, h
 from app.bot.states import OwnerReply, ReportFlow
 from app.context import AppContext
@@ -98,9 +98,8 @@ async def start_report(chat_id: int, data: dict[str, Any], *, edit: Message | No
     builder.button(text=t("common.cancel"), callback_data="rep:cancel")
     builder.adjust(*([2] * (len(categories) // 2) + [1] * (len(categories) % 2) + [1]))
     if edit is not None:
-        with contextlib.suppress(TelegramAPIError):
-            await edit.edit_text(t("rep.choose"), reply_markup=builder.as_markup())
-            return
+        await show_screen(edit, t("rep.choose"), reply_markup=builder.as_markup())
+        return
     await bot.send_message(chat_id, t("rep.choose"), reply_markup=builder.as_markup())
 
 

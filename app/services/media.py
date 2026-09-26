@@ -7,13 +7,29 @@ import logging
 from typing import Any
 
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import FSInputFile, InputMediaDocument, InputMediaPhoto, Message
+from aiogram.types import (
+    BufferedInputFile,
+    FSInputFile,
+    InputMediaAnimation,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext
 from app.db.models import MediaFile
 
 log = logging.getLogger(__name__)
+
+DOWNLOAD_LIMIT = 20 * 1024 * 1024  # getFile of the Bot API: bigger files cannot be downloaded
+INPUT_MEDIA = {
+    "photo": InputMediaPhoto,
+    "video": InputMediaVideo,
+    "animation": InputMediaAnimation,
+    "document": InputMediaDocument,
+}
 
 
 def image_of(message: Message) -> tuple[str, str | None, str, str | None] | None:
@@ -27,6 +43,36 @@ def image_of(message: Message) -> tuple[str, str | None, str, str | None] | None
     return None
 
 
+def media_of(message: Message) -> tuple[str, str | None, str, str | None, int | None, bool] | None:
+    """(file_id, file_unique_id, kind, mime, size, as_file) of a video, GIF or picture, else None.
+
+    ``as_file`` is set when it came as a document: its file_id cannot be sent as a video or photo, so the
+    file has to be re-uploaded from the local copy.
+    """
+    if message.animation is not None:  # checked first: a GIF message also carries a document
+        a = message.animation
+        return a.file_id, a.file_unique_id, "animation", a.mime_type, a.file_size, False
+    if message.video is not None:
+        v = message.video
+        return v.file_id, v.file_unique_id, "video", v.mime_type, v.file_size, False
+    if message.photo:
+        p = message.photo[-1]
+        return p.file_id, p.file_unique_id, "photo", None, p.file_size, False
+    d = message.document
+    if d is not None:
+        mime = d.mime_type or ""
+        kind = None
+        if mime.startswith("video/"):
+            kind = "video"
+        elif mime == "image/gif":
+            kind = "animation"
+        elif mime.startswith("image/"):
+            kind = "photo"
+        if kind is not None:
+            return d.file_id, d.file_unique_id, kind, mime, d.file_size, True
+    return None
+
+
 async def store_file(
     ctx: AppContext,
     session: AsyncSession,
@@ -34,11 +80,14 @@ async def store_file(
     file_unique_id: str | None,
     kind: str = "photo",
     mime: str | None = None,
+    size: int | None = None,
 ) -> MediaFile:
     record = MediaFile(
-        kind=kind, file_id=file_id, file_unique_id=file_unique_id, bot_id=ctx.bot_id, mime=mime
+        kind=kind, file_id=file_id, file_unique_id=file_unique_id, bot_id=ctx.bot_id, mime=mime, size=size
     )
     bot = ctx.bot
+    if size is not None and size > DOWNLOAD_LIMIT:
+        bot = None  # Telegram will not give it to us; only the file_id is kept
     if bot is not None:
         try:
             file = await bot.get_file(file_id)
@@ -123,3 +172,71 @@ async def _send_items(bot: Any, chat_id: int, items: list[Any], kwargs: dict[str
             return [await bot.send_photo(chat_id, photo=item.media, caption=item.caption, **kwargs)]
         return [await bot.send_document(chat_id, document=item.media, caption=item.caption, **kwargs)]
     return list(await bot.send_media_group(chat_id, media=items, **kwargs))
+
+
+def _source(ctx: AppContext, media: MediaFile) -> Any:
+    """The file_id when it belongs to this bot, else the local copy (a file_id works for one bot only)."""
+    if media.file_id and media.bot_id == ctx.bot_id:
+        return media.file_id
+    if media.local_path:
+        return FSInputFile(media.local_path)
+    return BufferedInputFile(b"", filename="missing")  # Telegram refuses it with a clear error
+
+
+def _sent_file_id(message: Any, kind: str) -> str | None:
+    if not isinstance(message, Message):
+        return None
+    if kind == "photo":
+        return message.photo[-1].file_id if message.photo else None
+    item = getattr(message, kind, None)
+    return item.file_id if item is not None else None
+
+
+async def _remember_file_id(ctx: AppContext, media: MediaFile, file_id: str | None) -> None:
+    """After an upload from the local copy keep the new file_id, so the next send is instant."""
+    if not file_id or (media.bot_id == ctx.bot_id and media.file_id == file_id):
+        return
+    async with ctx.db.session() as session:
+        record = await session.get(MediaFile, media.id)
+        if record is not None:
+            record.file_id = file_id
+            record.bot_id = ctx.bot_id
+            await session.commit()
+    media.file_id, media.bot_id = file_id, ctx.bot_id
+
+
+async def send_stored(
+    ctx: AppContext, chat_id: int, media: MediaFile, *, kind: str | None = None, **kwargs: Any
+) -> Message:
+    """Send a stored file as a photo / video / animation / document (caption, keyboard etc. in kwargs)."""
+    bot = ctx.bot
+    assert bot is not None
+    kind = kind or media.kind or "photo"
+    source = _source(ctx, media)
+    if kind == "video":
+        message = await bot.send_video(chat_id, source, **kwargs)
+    elif kind == "animation":
+        message = await bot.send_animation(chat_id, source, **kwargs)
+    elif kind == "document":
+        message = await bot.send_document(chat_id, source, **kwargs)
+    else:
+        message = await bot.send_photo(chat_id, source, **kwargs)
+    await _remember_file_id(ctx, media, _sent_file_id(message, kind))
+    return message
+
+
+async def edit_to_stored(
+    ctx: AppContext,
+    message: Message,
+    media: MediaFile,
+    *,
+    kind: str | None = None,
+    caption: str | None = None,
+    reply_markup: Any = None,
+) -> Message | bool:
+    """Put a stored file into an existing message (a text message becomes a media one, Bot API 10)."""
+    kind = kind or media.kind or "photo"
+    item = INPUT_MEDIA.get(kind, InputMediaPhoto)(media=_source(ctx, media), caption=caption)
+    edited = await message.edit_media(item, reply_markup=reply_markup)
+    await _remember_file_id(ctx, media, _sent_file_id(edited, kind))
+    return edited

@@ -14,6 +14,7 @@ from app.bot.flows.start import (
     send_captcha,
     send_language_choice,
     send_menu,
+    show_screen,
 )
 from app.bot.i18n import LANGS, Translator
 from app.db.base import utcnow
@@ -148,7 +149,7 @@ async def on_help(call: CallbackQuery, **data: Any) -> None:
     t: Translator = data["t"]
     await call.answer()
     assert call.message is not None
-    await call.message.edit_text(t("help.text"), reply_markup=_back_to_menu(t))
+    await show_screen(call.message, t("help.text"), reply_markup=_back_to_menu(t))
 
 
 @router.callback_query(F.data == "m:lang")

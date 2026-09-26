@@ -11,6 +11,7 @@ import html
 import itertools
 import json
 import re
+import urllib.parse
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -33,6 +34,7 @@ USER_COUNTED = {
     "text_mention",
     "date_time",
 }
+MEDIA_KEYS = ("photo", "video", "animation", "document")
 DEFAULT_ADMIN_RIGHTS = {
     "can_post_messages": True,
     "can_edit_messages": True,
@@ -379,6 +381,8 @@ class FakeTelegram:
         msg = self._get_msg(chat["id"], params["message_id"])
         if msg is None:
             raise FakeError(400, "Bad Request: message to edit not found")
+        if "text" not in msg:
+            raise FakeError(400, "Bad Request: there is no text in the message to edit")
         self._require(chat, "can_edit_messages")
         text, entities = self._process_entities(
             chat, params["text"], params.get("entities"), params.get("parse_mode")
@@ -412,10 +416,44 @@ class FakeTelegram:
         text, entities = self._process_entities(
             chat, params.get("caption", ""), params.get("caption_entities"), params.get("parse_mode")
         )
-        if msg.get("caption") == text and (msg.get("caption_entities") or []) == entities:
+        markup = params.get("reply_markup")
+        if (
+            msg.get("caption") == text
+            and (msg.get("caption_entities") or []) == entities
+            and msg.get("reply_markup") == markup
+        ):
             raise FakeError(400, NOT_MODIFIED)
         msg["caption"] = text
         msg["caption_entities"] = entities
+        if markup:
+            msg["reply_markup"] = markup
+        else:
+            msg.pop("reply_markup", None)
+        return self._export(msg)
+
+    def m_editMessageMedia(self, params: dict, files: dict) -> dict:
+        """Replaces the media of a message, or turns a text message into a media one (Bot API 10)."""
+        chat = self._chat(params["chat_id"])
+        msg = self._get_msg(chat["id"], params["message_id"])
+        if msg is None:
+            raise FakeError(400, "Bad Request: message to edit not found")
+        self._require(chat, "can_edit_messages")
+        media = params["media"]
+        kind = media.get("type", "photo")
+        file_id = self._upload(files, media["media"], kind)
+        for key in (*MEDIA_KEYS, "text", "entities", "_raw_text", "caption", "caption_entities"):
+            msg.pop(key, None)
+        msg.update(self._media_object(kind, file_id))
+        if media.get("caption"):
+            text, entities = self._process_entities(
+                chat, media["caption"], media.get("caption_entities"), media.get("parse_mode")
+            )
+            msg["caption"] = text
+            if entities:
+                msg["caption_entities"] = entities
+        msg.pop("reply_markup", None)
+        self._reply_markup(chat, msg, params.get("reply_markup"))
+        msg["edit_date"] = self.clock
         return self._export(msg)
 
     def m_editMessageReplyMarkup(self, params: dict, files: dict) -> dict:
@@ -629,6 +667,49 @@ class FakeTelegram:
             return file_id
         return value
 
+    @staticmethod
+    def _media_object(kind: str, file_id: str) -> dict[str, Any]:
+        unique = f"u{file_id}"
+        if kind == "photo":
+            return {"photo": [{"file_id": file_id, "file_unique_id": unique, "width": 800, "height": 400}]}
+        if kind in ("video", "animation"):
+            return {
+                kind: {
+                    "file_id": file_id,
+                    "file_unique_id": unique,
+                    "width": 640,
+                    "height": 360,
+                    "duration": 5,
+                }
+            }
+        return {"document": {"file_id": file_id, "file_unique_id": unique, "file_name": "file.bin"}}
+
+    def _send_media(self, params: dict, files: dict, kind: str) -> dict:
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_post_messages")
+        if chat["type"] == "private" and chat.get("_blocked"):
+            raise FakeError(403, "Forbidden: bot was blocked by the user")
+        file_id = self._upload(files, params[kind], kind)
+        msg = self._base_message(chat)
+        msg.update(self._media_object(kind, file_id))
+        if params.get("caption"):
+            text, entities = self._process_entities(
+                chat, params["caption"], params.get("caption_entities"), params.get("parse_mode")
+            )
+            msg["caption"] = text
+            if entities:
+                msg["caption_entities"] = entities
+        self._reply_markup(chat, msg, params.get("reply_markup"))
+        self._common(msg, params)
+        self._store(chat, msg)
+        return self._export(msg)
+
+    def m_sendVideo(self, params: dict, files: dict) -> dict:
+        return self._send_media(params, files, "video")
+
+    def m_sendAnimation(self, params: dict, files: dict) -> dict:
+        return self._send_media(params, files, "animation")
+
     def m_sendPhoto(self, params: dict, files: dict) -> dict:
         chat = self._chat(params["chat_id"])
         self._require(chat, "can_post_messages")
@@ -802,6 +883,13 @@ class Harness:
             "message": self.tg._export(stored),
         }
         await self.feed({"callback_query": cq})
+
+    async def open_link(self, user_id: int, url: str) -> None:
+        """The user taps a t.me link of the bot: Telegram sends /start with the link's payload."""
+        parsed = urllib.parse.urlparse(url)
+        assert parsed.netloc == "t.me" and parsed.path.strip("/") == self.tg.bot_user["username"], url
+        payload = urllib.parse.parse_qs(parsed.query).get("start", [""])[0]
+        await self.say(user_id, f"/start {payload}".strip())
 
     async def bot_membership(
         self, chat_id: int, status: str, by: int, rights: dict[str, bool] | None = None

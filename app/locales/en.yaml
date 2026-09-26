@@ -20,7 +20,7 @@ lang:
   choose: "🌐 Выберите язык / Choose your language"
   set: "Language: English 🇬🇧"
 menu:
-  title: "<b>Service List</b> — trusted services in one place.\n\nAdd your service, manage your listing or report scammers."
+  title: "<b>📋 Service List</b>\nTrusted services in one place.\n\n<b>What you can do:</b>\n➕ <b>Add service</b> — list your service\n🗂 <b>My services</b> — requests, payment, renewal\n🚫 <b>Scam list</b> — services caught scamming\n⚠️ <b>Report service</b> — report a scammer"
   service_list: "📋 Service List"
   add_service: "➕ Add service"
   my_services: "🗂 My services"

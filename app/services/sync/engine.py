@@ -22,7 +22,7 @@ from aiogram.exceptions import (
     TelegramNotFound,
     TelegramRetryAfter,
 )
-from aiogram.types import BufferedInputFile, FSInputFile, LinkPreviewOptions, Message
+from aiogram.types import LinkPreviewOptions, Message
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +32,7 @@ from app.db.models import Channel, ChannelPost, MediaFile
 from app.domain.render import measure
 from app.domain.richtext import Fragment
 from app.services import render_db
+from app.services.media import send_stored
 from app.services.notify import claim_notification, notify_staff
 from app.services.settings import Chats, Runtime, get_settings, update_settings
 
@@ -468,41 +469,16 @@ class SyncEngine:
     async def _send_media(
         self, chat_id: int, media: MediaFile, kind: str | None, fragment: Fragment
     ) -> Message:
-        bot = self.ctx.bot
-        assert bot is not None
-        source: Any
-        if media.file_id and media.bot_id == self.ctx.bot_id:
-            source = media.file_id
-        elif media.local_path:
-            source = FSInputFile(media.local_path)
-        else:
-            source = BufferedInputFile(b"", filename="missing")
-        kwargs = {
-            "caption": fragment.text or None,
-            "caption_entities": fragment.to_entities() or None,
-            "parse_mode": None,
-            "disable_notification": True,
-        }
-        if kind == "video":
-            message = await bot.send_video(chat_id, source, **kwargs)
-            file_id = message.video.file_id if message.video else None
-        elif kind == "animation":
-            message = await bot.send_animation(chat_id, source, **kwargs)
-            file_id = message.animation.file_id if message.animation else None
-        elif kind == "document":
-            message = await bot.send_document(chat_id, source, **kwargs)
-            file_id = message.document.file_id if message.document else None
-        else:
-            message = await bot.send_photo(chat_id, source, **kwargs)
-            file_id = message.photo[-1].file_id if message.photo else None
-        if file_id and (media.bot_id != self.ctx.bot_id or media.file_id != file_id):
-            async with self.ctx.db.session() as session:
-                record = await session.get(MediaFile, media.id)
-                if record is not None:
-                    record.file_id = file_id
-                    record.bot_id = self.ctx.bot_id
-                    await session.commit()
-        return message
+        return await send_stored(
+            self.ctx,
+            chat_id,
+            media,
+            kind=kind or "photo",
+            caption=fragment.text or None,
+            caption_entities=fragment.to_entities() or None,
+            parse_mode=None,
+            disable_notification=True,
+        )
 
     async def _edit_all(
         self, channel_id: int, desired: list[tuple[str, int]], limiter: RateLimiter, result: PassResult

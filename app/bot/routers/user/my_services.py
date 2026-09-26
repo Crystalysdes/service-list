@@ -11,6 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot.flows.start import show_screen
 from app.bot.i18n import Translator, h
 from app.bot.states import EditService
 from app.db.base import utcnow
@@ -62,7 +63,7 @@ async def show_list(call_or_message: CallbackQuery | Message, data: dict[str, An
     builder.adjust(1)
     text = t("my.title") + "\n\n" + (t("my.empty") if not rows else "")
     if isinstance(call_or_message, CallbackQuery) and call_or_message.message is not None:
-        await call_or_message.message.edit_text(text.strip(), reply_markup=builder.as_markup())
+        await show_screen(call_or_message.message, text.strip(), reply_markup=builder.as_markup())
     else:
         assert isinstance(call_or_message, Message)
         await call_or_message.answer(text.strip(), reply_markup=builder.as_markup())

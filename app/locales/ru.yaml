@@ -20,7 +20,7 @@ lang:
   choose: "🌐 Выберите язык / Choose your language"
   set: "Язык: русский 🇷🇺"
 menu:
-  title: "<b>Service List</b> — список проверенных сервисов в одном месте.\n\nДобавьте свой сервис, управляйте размещением или сообщите о мошенниках."
+  title: "<b>📋 Service List</b>\nПроверенные сервисы в одном месте.\n\n<b>Что здесь можно:</b>\n➕ <b>Add service</b> — разместить свой сервис\n🗂 <b>My services</b> — заявки, оплата, продление\n🚫 <b>Scam list</b> — сервисы, пойманные на обмане\n⚠️ <b>Report service</b> — сообщить о мошеннике"
   service_list: "📋 Service List"
   add_service: "➕ Add service"
   my_services: "🗂 My services"
