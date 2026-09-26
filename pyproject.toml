@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "service-list-bot"
+version = "0.1.0"
+description = "Manager bot for the Service List Telegram channel: paid listings, moderation, reports, scam list, backups"
+requires-python = ">=3.11"
+dependencies = [
+  "aiogram==3.31.0",
+  "SQLAlchemy[asyncio]==2.1.1",
+  "asyncpg==0.31.0",
+  "alembic==1.20.0",
+  "APScheduler==3.11.3",
+  "pydantic-settings==2.15.0",
+  "PyYAML==6.0.3",
+  "cryptography>=43",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio==1.4.0", "ruff>=0.16"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["locales/*.yaml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003", "RUF012", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/faketg.py" = ["ASYNC109"]

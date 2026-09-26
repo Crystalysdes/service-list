@@ -1,0 +1,33 @@
+common:
+  back: "⬅️ Назад"
+  cancel: "✖️ Отмена"
+  menu: "🏠 Меню"
+  done: "✅ Готово"
+  yes: "✅ Да"
+  no: "✖️ Нет"
+  banned: "⛔️ Доступ к боту ограничен."
+  throttled: "Слишком часто, подождите секунду."
+  error: "Что-то пошло не так. Попробуйте ещё раз чуть позже."
+  not_available: "Этот раздел пока недоступен."
+  cancelled: "Отменено."
+captcha:
+  prompt: "🤖 Подтвердите, что вы не бот: нажмите на {target}\n🤖 Confirm you are human: tap {target}"
+  wrong: "❌ Неверно. Осталось попыток: {left}\n❌ Wrong. Attempts left: {left}"
+  blocked: "⏳ Слишком много попыток. Попробуйте через {minutes} мин.\n⏳ Too many attempts. Try again in {minutes} min."
+  expired: "⌛️ Время вышло, вот новая проверка.\n⌛️ Time is up, here is a new one."
+  ok: "✅"
+lang:
+  choose: "🌐 Выберите язык / Choose your language"
+  set: "Язык: русский 🇷🇺"
+menu:
+  title: "<b>Service List</b> — список проверенных сервисов в одном месте.\n\nДобавьте свой сервис, управляйте размещением или сообщите о мошенниках."
+  service_list: "📋 Service List"
+  add_service: "➕ Add service"
+  my_services: "🗂 My services"
+  scam_list: "🚫 Scam list"
+  report: "⚠️ Report service"
+  language: "🌐 Язык"
+  help: "ℹ️ Помощь"
+  channel_not_ready: "Канал ещё не подключён, загляните чуть позже."
+help:
+  text: "<b>Как это работает</b>\n\n➕ <b>Add service</b> — опишите сервис и пришлите ссылку. После проверки модератором бот пришлёт счёт, после оплаты сервис появится в нужной ветке канала.\n\n🗂 <b>My services</b> — ваши сервисы: топ-1/2/3, премиум-эмодзи перед названием, название из анимированных эмодзи, продление и статистика.\n\n⚠️ <b>Report service</b> — пожаловаться на сервис (нужны скриншоты и подробное описание).\n\n🚫 <b>Scam list</b> — сервисы, признанные мошенническими."

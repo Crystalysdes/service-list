@@ -1,0 +1,33 @@
+common:
+  back: "⬅️ Back"
+  cancel: "✖️ Cancel"
+  menu: "🏠 Menu"
+  done: "✅ Done"
+  yes: "✅ Yes"
+  no: "✖️ No"
+  banned: "⛔️ Access to the bot is restricted."
+  throttled: "Too fast, please wait a second."
+  error: "Something went wrong. Please try again a bit later."
+  not_available: "This section is not available yet."
+  cancelled: "Cancelled."
+captcha:
+  prompt: "🤖 Подтвердите, что вы не бот: нажмите на {target}\n🤖 Confirm you are human: tap {target}"
+  wrong: "❌ Неверно. Осталось попыток: {left}\n❌ Wrong. Attempts left: {left}"
+  blocked: "⏳ Слишком много попыток. Попробуйте через {minutes} мин.\n⏳ Too many attempts. Try again in {minutes} min."
+  expired: "⌛️ Время вышло, вот новая проверка.\n⌛️ Time is up, here is a new one."
+  ok: "✅"
+lang:
+  choose: "🌐 Выберите язык / Choose your language"
+  set: "Language: English 🇬🇧"
+menu:
+  title: "<b>Service List</b> — trusted services in one place.\n\nAdd your service, manage your listing or report scammers."
+  service_list: "📋 Service List"
+  add_service: "➕ Add service"
+  my_services: "🗂 My services"
+  scam_list: "🚫 Scam list"
+  report: "⚠️ Report service"
+  language: "🌐 Language"
+  help: "ℹ️ Help"
+  channel_not_ready: "The channel is not connected yet, please check back later."
+help:
+  text: "<b>How it works</b>\n\n➕ <b>Add service</b> — describe your service and send its link. After a moderator approves it, the bot sends an invoice; once paid, the service appears in its branch of the channel.\n\n🗂 <b>My services</b> — your services: top 1/2/3, a premium emoji before the name, a name made of animated emoji, renewals and stats.\n\n⚠️ <b>Report service</b> — report a service (screenshots and a detailed description are required).\n\n🚫 <b>Scam list</b> — services found to be scams."
