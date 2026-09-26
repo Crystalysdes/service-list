@@ -181,3 +181,47 @@ def test_nav_footer_always_links_to_the_navigation():
     assert links(nav_footer(site)) == [(0, 8, "https://example.com/nav")]  # another site stays
     emoji_only = RichText().emoji("5368324170671202286", "⭐").text(" Навигация").build()
     assert links(nav_footer(emoji_only)) == []  # premium emoji cannot sit inside a link
+
+
+def test_updated_intro_keeps_the_owner_text_and_formatting():
+    from app.domain.intro import updated_intro
+    from app.domain.richtext import RichText
+
+    rt = RichText()
+    rt.emoji("5100000000000000001", "🦕")
+    rt.text(" ")
+    rt.text("SERVICE LIST", "bold")
+    rt.text(" — Ваш главный хаб тёмных сервисов!\n\n")
+    with rt.wrap("blockquote"):
+        rt.text("Огромный список услуг, отсортированных по категориям для удобного поиска.", "italic")
+    rt.text("\n\n⚠️ Важно: Мы не несём ответственности за сделки вне нашего гаранта.\n\n")
+    rt.text("💡 Хотите добавить свой сервис? Пишите в поддержку или админу! — детали у поддержки.\n\n")
+    rt.text("ℹ️ Канал создан для информационных целей. Исследуйте, будьте осторожны!\n\n")
+    rt.text("Link: t.me/+eKC1bWcFHBE3Njky\nChat: t.me/+Nh-HD70XwLRjYjFi")
+    current = rt.build()
+
+    new = updated_intro(current, 5)
+    blocks = new.text.split("\n\n")
+    assert blocks[0] == "🦕 SERVICE LIST — Ваш главный хаб тёмных сервисов!"
+    assert blocks[2].startswith("🛡 Auto-garant — безопасные сделки") and "комиссия 5%" in blocks[2]
+    assert blocks[3].startswith("⚠️ Важно")
+    assert blocks[4].startswith("➕ Хотите добавить свой сервис? Жмите кнопку под постом")
+    assert "Пишите в поддержку" not in new.text
+    assert blocks[-1] == "Link: t.me/+eKC1bWcFHBE3Njky\nChat: t.me/+Nh-HD70XwLRjYjFi"
+    by_type = {}
+    for entity in new.entities:
+        by_type.setdefault(entity.type, []).append(new.entity_text(entity))
+    assert by_type["custom_emoji"] == ["🦕"] and "SERVICE LIST" in by_type["bold"]
+    assert by_type["blockquote"][0].startswith("Огромный список")
+    assert by_type["text_link"] == ["Auto-garant"]
+    assert updated_intro(new, 5).text == new.text  # applying it again changes nothing
+
+
+def test_updated_intro_on_an_unexpected_text_adds_before_the_links():
+    from app.domain.intro import updated_intro
+    from app.domain.richtext import Fragment
+
+    new = updated_intro(Fragment.plain("Service List\n\nLink: t.me/+abc"), 5)
+    blocks = new.text.split("\n\n")
+    assert blocks[0] == "Service List" and blocks[-1] == "Link: t.me/+abc"
+    assert blocks[1].startswith("🛡 Auto-garant") and blocks[2].startswith("➕ Хотите добавить")

@@ -140,6 +140,15 @@ class Chats(SettingsGroup):
     topic_reports: int | None = None
     topic_log: int | None = None
     appeal_contact: str | None = None  # shown to banned owners, e.g. "@support"
+    community_url: str | None = None  # the community chat ("💬 Chat" in the menu); None: from the main post
+
+
+class Escrow(SettingsGroup):
+    """Auto-garant: deals through the bot with the money held until both sides confirm."""
+
+    KEY: ClassVar[str] = "escrow"
+
+    enabled: bool = False
 
 
 class Payments(SettingsGroup):

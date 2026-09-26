@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Any
 
 from aiogram import F, Router
@@ -44,6 +45,8 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         "⚙️ <b>Настройки</b>",
         "",
         f"Контакт для апелляций: {h(chats.appeal_contact or 'не задан')}",
+        "Ссылка на чат (кнопка «💬 Chat» в меню): "
+        + h(chats.community_url or "не задана — берётся из строки «Chat:» главного поста"),
         f"Капча при входе: {'включена' if captcha.enabled else 'выключена'}",
         "Свои премиум-эмодзи от пользователей (через модерацию): "
         + ("да" if limits.allow_own_emoji else "нет"),
@@ -58,6 +61,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     ]
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Контакт для апелляций", callback_data="a:set:appeal")
+    builder.button(text="💬 Ссылка на чат", callback_data="a:set:chat")
     builder.button(
         text="🔕 Выключить капчу" if captcha.enabled else "🤖 Включить капчу", callback_data="a:set:captcha"
     )
@@ -125,6 +129,33 @@ async def input_appeal(message: Message, data: dict[str, Any], fsm: dict[str, An
         return False
     await update_settings(session, Chats, appeal_contact=None if value == "-" else value)
     await audit(session, data["user"].id, "settings.appeal")
+    await session.commit()
+    text, markup = await _screen(session, data["ctx"])
+    await message.answer("✅ Сохранено.\n\n" + text, reply_markup=markup)
+    return True
+
+
+@router.callback_query(F.data == "a:set:chat")
+async def on_chat(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    await ask(
+        call,
+        state,
+        "set_chat",
+        "Ссылка на чат сообщества для кнопки «💬 Chat» в меню бота: t.me/… или @username. «-» — брать её "
+        "из строки «Chat:» главного поста.",
+        "a:set",
+    )
+
+
+@input_handler("set_chat")
+async def input_chat(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
+    session: AsyncSession = data["session"]
+    value = (message.text or "").strip()
+    if value != "-" and not re.match(r"^(https?://)?(t\.me|telegram\.me)/\S+$|^@[A-Za-z0-9_]{4,32}$", value):
+        await message.answer("Нужна ссылка вида t.me/… или @username (или «-»).")
+        return False
+    await update_settings(session, Chats, community_url=None if value == "-" else value)
+    await audit(session, data["user"].id, "settings.chat")
     await session.commit()
     text, markup = await _screen(session, data["ctx"])
     await message.answer("✅ Сохранено.\n\n" + text, reply_markup=markup)

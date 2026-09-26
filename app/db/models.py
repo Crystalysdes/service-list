@@ -366,6 +366,10 @@ class StaticPost(TimestampMixin, Base):
     link_preview: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     nav_label: Mapped[str | None] = mapped_column(String(64))
     nav_order: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # inline buttons under the post: [{"text", "url"}], url may be symbolic (bot:start:…, channel:chat)
+    buttons: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
 
 
 class ChannelPost(Base):

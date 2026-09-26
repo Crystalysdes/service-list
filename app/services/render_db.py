@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,10 +24,12 @@ from app.domain.render import (
 from app.domain.richtext import Fragment
 from app.domain.symbols import LinkContext, channel_post_base, channel_url
 from app.services.channels import INACTIVE_STATUSES
+from app.services.settings import Chats, Escrow, Runtime, Templates, get_settings
 from app.services.settings import Limits as LimitSettings
-from app.services.settings import Runtime, Templates, get_settings
 
 VISIBLE_STATUSES = ("active",)
+GARANT_START = "bot:start:garant"
+CHAT_LINE_RE = re.compile(r"^\s*chat\s*:\s*(\S+)", re.IGNORECASE)
 
 
 def active_feature(service: Service, kind: str) -> Any:
@@ -100,6 +103,52 @@ async def limits(session: AsyncSession) -> Limits:
     return Limits(max_user_entities=entity_cap, max_custom_emoji=emoji_cap)
 
 
+async def intro_post(session: AsyncSession) -> StaticPost | None:
+    """The channel's main post (the first "intro" static post)."""
+    return (
+        (
+            await session.execute(
+                select(StaticPost)
+                .where(StaticPost.kind == "intro")
+                .order_by(StaticPost.post_order, StaticPost.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _as_url(raw: str) -> str | None:
+    raw = raw.strip().rstrip(".,;)")
+    if raw.startswith("@") and len(raw) > 1:
+        return f"https://t.me/{raw[1:]}"
+    if raw.startswith(("https://", "http://")):
+        return raw
+    if raw.startswith(("t.me/", "telegram.me/")):
+        return "https://" + raw
+    return None
+
+
+async def community_url(session: AsyncSession) -> str | None:
+    """The community chat: set in the settings, otherwise the "Chat: …" line of the main post."""
+    chats = await get_settings(session, Chats)
+    if chats.community_url:
+        return _as_url(chats.community_url)
+    post = await intro_post(session)
+    if post is None:
+        return None
+    fragment = Fragment.from_json(post.content)
+    for line in fragment.lines():
+        match = CHAT_LINE_RE.match(line.text)
+        if match is None:
+            continue
+        for entity in fragment.entities:  # the address may sit behind a text link on that line
+            if entity.type == "text_link" and entity.url and line.start <= entity.offset < line.end:
+                return entity.url
+        return _as_url(match.group(1))
+    return None
+
+
 async def channel_urls(session: AsyncSession) -> dict[str, str]:
     urls: dict[str, str] = {}
     rows = await session.execute(
@@ -111,6 +160,9 @@ async def channel_urls(session: AsyncSession) -> dict[str, str]:
         url = channel_url(channel.chat_id, channel.username, channel.invite_link)
         if url and channel.role not in urls:
             urls[channel.role] = url
+    chat = await community_url(session)
+    if chat:
+        urls["chat"] = chat
     return urls
 
 
@@ -142,6 +194,7 @@ class RenderedBlock:
     media: MediaFile | None = None
     media_kind: str | None = None
     link_preview: bool = False
+    buttons: tuple[tuple[str, str], ...] = ()  # (text, url) of inline buttons under the post
 
     @property
     def is_caption(self) -> bool:
@@ -149,7 +202,31 @@ class RenderedBlock:
 
     def content_hash(self) -> str:
         media_key = self.media.sha256 or self.media.file_unique_id if self.media is not None else None
-        return self.fragment.content_hash(media_key, self.link_preview)
+        extra: list[Any] = [media_key, self.link_preview]
+        if self.buttons:  # only then, so posts without buttons keep their hash
+            extra.append([list(button) for button in self.buttons])
+        return self.fragment.content_hash(*extra)
+
+
+async def static_buttons(
+    session: AsyncSession, post: StaticPost, ctx: LinkContext
+) -> tuple[tuple[str, str], ...]:
+    """Buttons of a static post with their links resolved; the garant one only while deals are on."""
+    result = []
+    escrow_on: bool | None = None
+    for item in post.buttons or []:
+        text, url = str(item.get("text") or "").strip(), str(item.get("url") or "")
+        if not text or not url:
+            continue
+        if url.startswith(GARANT_START):
+            if escrow_on is None:
+                escrow_on = (await get_settings(session, Escrow)).enabled
+            if not escrow_on:
+                continue
+        resolved = ctx.resolve(url)
+        if resolved:
+            result.append((text[:64], resolved))
+    return tuple(result)
 
 
 async def nav_items(session: AsyncSession) -> list[NavItem]:
@@ -185,6 +262,7 @@ async def render_block(
             media=media,
             media_kind=post.media_kind,
             link_preview=post.link_preview,
+            buttons=await static_buttons(session, post, ctx),
         )
     if kind == "nav":
         return RenderedBlock(kind, 0, render_nav(await nav_items(session), tpl, ctx))

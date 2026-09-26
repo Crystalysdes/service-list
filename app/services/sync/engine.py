@@ -22,7 +22,7 @@ from aiogram.exceptions import (
     TelegramNotFound,
     TelegramRetryAfter,
 )
-from aiogram.types import LinkPreviewOptions, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,16 @@ SELFTEST_MAX_AGE = timedelta(hours=7)
 
 class ChannelBroken(Exception):
     pass
+
+
+def buttons_markup(buttons: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup | None:
+    """URL buttons under a channel post, two per row."""
+    if not buttons:
+        return None
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=text, url=url) for text, url in row] for row in rows]
+    )
 
 
 class RateLimiter:
@@ -439,7 +449,9 @@ class SyncEngine:
             await limiter.acquire()
             try:
                 if media is not None:
-                    message = await self._send_media(chat_id, media, block.media_kind, fragment)
+                    message = await self._send_media(
+                        chat_id, media, block.media_kind, fragment, buttons_markup(block.buttons)
+                    )
                 else:
                     message = await self._call(
                         bot.send_message(
@@ -449,6 +461,7 @@ class SyncEngine:
                             parse_mode=None,
                             link_preview_options=WITH_PREVIEW if block.link_preview else NO_PREVIEW,
                             disable_notification=True,
+                            reply_markup=buttons_markup(block.buttons),
                         ),
                         channel_id,
                     )
@@ -470,7 +483,7 @@ class SyncEngine:
         await self._verify(fragment, message, f"{kind}:{block_id}")
 
     async def _send_media(
-        self, chat_id: int, media: MediaFile, kind: str | None, fragment: Fragment
+        self, chat_id: int, media: MediaFile, kind: str | None, fragment: Fragment, reply_markup: Any = None
     ) -> Message:
         return await send_stored(
             self.ctx,
@@ -481,6 +494,7 @@ class SyncEngine:
             caption_entities=fragment.to_entities() or None,
             parse_mode=None,
             disable_notification=True,
+            reply_markup=reply_markup,
         )
 
     async def _edit_all(
@@ -544,6 +558,7 @@ class SyncEngine:
             channel_title = channel.title or str(channel.chat_id)
             is_caption = block.media is not None
             preview = WITH_PREVIEW if block.link_preview else NO_PREVIEW
+            markup = buttons_markup(block.buttons)
         message: Message | None = None
         status = "ok"
         while True:
@@ -557,6 +572,7 @@ class SyncEngine:
                             caption=fragment.text,
                             caption_entities=fragment.to_entities(),
                             parse_mode=None,
+                            reply_markup=markup,
                         ),
                         channel_id,
                     )
@@ -569,6 +585,7 @@ class SyncEngine:
                             entities=fragment.to_entities(),
                             parse_mode=None,
                             link_preview_options=preview,
+                            reply_markup=markup,
                         ),
                         channel_id,
                     )

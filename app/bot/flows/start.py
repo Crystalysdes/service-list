@@ -10,7 +10,7 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +22,8 @@ from app.domain.captcha import is_blocked, new_challenge
 from app.domain.symbols import channel_url
 from app.services.channels import INACTIVE_STATUSES
 from app.services.media import edit_to_stored, send_stored
-from app.services.settings import Captcha, MenuMedia, get_settings
+from app.services.render_db import community_url
+from app.services.settings import Captcha, Escrow, MenuMedia, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -139,23 +140,49 @@ async def channel_links(session: AsyncSession) -> tuple[str | None, str | None]:
     return main_url, scam_url
 
 
-def menu_keyboard(t: Translator, main_url: str | None, scam_url: str | None) -> InlineKeyboardMarkup:
+def menu_keyboard(
+    t: Translator,
+    main_url: str | None,
+    scam_url: str | None,
+    chat_url: str | None = None,
+    garant: bool = False,
+) -> InlineKeyboardMarkup:
+    """Service List (and the community chat) on top, Auto-garant on its own row, the rest two per row."""
+
+    def button(key: str, **kwargs: Any) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=t(key), **kwargs)
+
     builder = InlineKeyboardBuilder()
-    if main_url:
-        builder.button(text=t("menu.service_list"), url=main_url, style="primary")
-    else:
-        builder.button(text=t("menu.service_list"), callback_data="m:nochan", style="primary")
-    builder.button(text=t("menu.add_service"), callback_data="add:start", style="success")
-    builder.button(text=t("menu.my_services"), callback_data="my:list")
-    if scam_url:
-        builder.button(text=t("menu.scam_list"), url=scam_url)
-    else:
-        builder.button(text=t("menu.scam_list"), callback_data="m:nochan")
-    builder.button(text=t("menu.report"), callback_data="rep:start", style="danger")
-    builder.button(text=t("menu.language"), callback_data="m:lang")
-    builder.button(text=t("menu.help"), callback_data="m:help")
-    builder.adjust(1, 2)  # Service List on its own row, the rest two per row
+    first = [
+        button("menu.service_list", url=main_url, style="primary")
+        if main_url
+        else button("menu.service_list", callback_data="m:nochan", style="primary")
+    ]
+    if chat_url:
+        first.append(button("menu.chat", url=chat_url))
+    builder.row(*first)
+    if garant:
+        builder.row(button("menu.garant", callback_data="g:home", style="primary"))
+    builder.row(
+        button("menu.add_service", callback_data="add:start", style="success"),
+        button("menu.my_services", callback_data="my:list"),
+    )
+    builder.row(
+        button("menu.scam_list", url=scam_url)
+        if scam_url
+        else button("menu.scam_list", callback_data="m:nochan"),
+        button("menu.report", callback_data="rep:start", style="danger"),
+    )
+    builder.row(button("menu.language", callback_data="m:lang"), button("menu.help", callback_data="m:help"))
     return builder.as_markup()
+
+
+async def menu_parts(session: AsyncSession, t: Translator) -> tuple[str, InlineKeyboardMarkup]:
+    """The menu text and keyboard as they are right now (links, chat, whether deals are on)."""
+    main_url, scam_url = await channel_links(session)
+    garant = (await get_settings(session, Escrow)).enabled
+    text = t("menu.title") + (t("menu.garant_line") if garant else "")
+    return text, menu_keyboard(t, main_url, scam_url, await community_url(session), garant)
 
 
 async def menu_media(session: AsyncSession) -> MediaFile | None:
@@ -171,9 +198,7 @@ async def show_media_menu(
     """The menu as a video / GIF / picture with the menu text as its caption. False if Telegram refused."""
     t: Translator = data["t"]
     ctx = data["ctx"]
-    main_url, scam_url = await channel_links(data["session"])
-    markup = menu_keyboard(t, main_url, scam_url)
-    caption = t("menu.title")
+    caption, markup = await menu_parts(data["session"], t)
     if isinstance(edit, Message):
         try:  # turns the previous screen (text or media) into the menu in place
             await edit_to_stored(ctx, edit, media, caption=caption, reply_markup=markup)
@@ -198,17 +223,14 @@ async def send_menu(chat_id: int, data: dict[str, Any], *, edit: Message | None 
     media = await menu_media(data["session"])
     if media is not None and await show_media_menu(chat_id, data, media, edit=edit):
         return
-    main_url, scam_url = await channel_links(data["session"])
-    markup = menu_keyboard(t, main_url, scam_url)
+    text, markup = await menu_parts(data["session"], t)
     if edit is not None and not has_media(edit):
         try:
-            await edit.edit_text(t("menu.title"), reply_markup=markup, link_preview_options=NO_PREVIEW)
+            await edit.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
             return
         except Exception:  # message too old / not modified -> send a fresh one
             pass
-    await data["bot"].send_message(
-        chat_id, t("menu.title"), reply_markup=markup, link_preview_options=NO_PREVIEW
-    )
+    await data["bot"].send_message(chat_id, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
 
 
 async def continue_after_gate(chat_id: int, data: dict[str, Any], *, edit: Message | None = None) -> None:

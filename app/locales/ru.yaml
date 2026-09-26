@@ -22,6 +22,9 @@ lang:
 menu:
   title: "<b>📋 Service List</b>\nПроверенные сервисы в одном месте.\n\n<b>Что здесь можно:</b>\n➕ <b>Add service</b> — разместить свой сервис\n🗂 <b>My services</b> — заявки, оплата, продление\n🚫 <b>Scam list</b> — сервисы, пойманные на обмане\n⚠️ <b>Report service</b> — сообщить о мошеннике"
   service_list: "📋 Service List"
+  chat: "💬 Chat"
+  garant: "🛡 Auto-garant"
+  garant_line: "\n🛡 <b>Auto-garant</b> — сделка через гаранта: деньги заморожены, пока обе стороны не подтвердят"
   add_service: "➕ Add service"
   my_services: "🗂 My services"
   scam_list: "🚫 Scam list"

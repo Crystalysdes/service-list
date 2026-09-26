@@ -86,6 +86,7 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         "",
     ]
     builder = InlineKeyboardBuilder()
+    builder.button(text="📌 Главный пост канала", callback_data="a:intro")
     builder.button(text="🎬 Заставка меню бота", callback_data="a:menu")
     for key, title in TEXTS.items():
         lines.append(f"• {title}: «{h(getattr(tpl, key))}»")
