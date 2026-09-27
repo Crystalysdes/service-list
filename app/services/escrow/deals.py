@@ -3,9 +3,9 @@
 Every change is one short transaction of its own: the deal row is locked (``FOR NO KEY UPDATE``), the change
 is checked against the state the deal is in *now*, and a money decision writes its payout rows in the same
 transaction. So two presses, the auto-release timer and a verdict arriving together end in exactly one
-outcome with at most one payout per side; the unique indexes of ``deal_payouts`` and Crypto Pay's
-``spend_id`` are further lines of defence. Nothing here talks to Telegram or Crypto Pay: callers send the
-messages after the commit and the payout worker sends the money.
+outcome with at most one payout per side; the unique indexes of ``deal_payouts`` are a further line of
+defence. Nothing here talks to Telegram or Apirone: callers send the messages after the commit and the
+payout worker sends the money.
 
 Callers never pass a session: a handler's own session holds its user row until the update is done, so the
 transitions keep to their own connections and never touch ``users`` for writing.
@@ -25,10 +25,10 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import utcnow
-from app.db.models import BlacklistEntry, Deal, DealInvoice, DealPayout, User
+from app.db.models import BlacklistEntry, Deal, DealInvoice, DealPayout, DealReceipt, User
 from app.db.session import Database
 from app.services.audit import audit
-from app.services.escrow import money
+from app.services.escrow import money, wallets
 from app.services.settings import Escrow, get_settings
 
 UNPAID = ("pending", "awaiting_payment")
@@ -43,6 +43,11 @@ REASON_MAX = 2000
 NOTE_MAX = 1000
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 LOCK_NS = 0x45534352  # "ESCR": advisory locks of the garant, in the two-key space (apart from the bot's own)
+GATEWAY = "apirone"
+# a deal made before the move to Apirone: its money is in the Crypto Pay app, the bot no longer sends it
+LEGACY_NOTE = "сделка на CryptoBot — выплатите из приложения гаранта в @CryptoBot и отметьте вручную"
+UNPAID_REMOTE = ("created", "partpaid", "expired")  # the invoice's money can still be called off
+CONFIRMING_REMOTE = ("paid", "overpaid")  # paid, the network has not confirmed it yet
 
 
 class DealError(Exception):
@@ -65,25 +70,44 @@ class Draft:
     fee_payer: str  # buyer / seller / split
     delivery_days: int
     counterparty: str | None = None  # @username of the other side, when known
+    address: str | None = None  # a seller's payout address (not part of the terms)
+
+
+@dataclass(frozen=True)
+class Seen:
+    """One transaction to an invoice's address, as the invoice or the account's history shows it."""
+
+    txid: str
+    amount: int  # minor units
+    confirmed: bool
+    source: str  # invoice / history
+    raw: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class Funding:
-    """What a paid invoice did: funded the deal, or came on top and goes back to the buyer."""
+    """What the money seen at an invoice did."""
 
-    outcome: str  # funded / extra / mismatch / duplicate
+    # funded / partial (less than the invoice so far) / confirming (paid, not confirmed yet) / refund (money
+    # that no longer fits the deal goes back) / mismatch (the owner looks) / none
+    outcome: str
     deal: Deal
-    payout: DealPayout | None = None
+    payouts: tuple[DealPayout, ...] = ()
+    received: int = 0  # minor units seen at the address
+    missing: int = 0  # minor units still to pay
+    fresh: bool = False  # this look saw money (or its confirmation) for the first time
 
 
 # ------------------------------------------------------------------------------------------ helpers
 def new_code() -> str:
-    """The deal's secret: invitation link, invoice payload and spend_ids (``[A-Za-z0-9_-]``, 16 chars)."""
+    """The deal's secret: invitation link, invoice payload and payout names (``[A-Za-z0-9_-]``, 16 chars)."""
     return secrets.token_urlsafe(12)
 
 
-def spend_id(code: str, purpose: str, invoice_id: int | None = None) -> str:
-    """Crypto Pay carries out a spend_id once: the same payout can never go out twice."""
+def spend_id(code: str, purpose: str, invoice_id: int | None = None, receipt_id: int | None = None) -> str:
+    """A payout's unique name: one per side of a deal, one per refunded surplus or late payment."""
+    if purpose == "extra" and receipt_id is not None:
+        return f"esc-{code}-r{receipt_id}"
     if purpose == "extra":
         return f"esc-{code}-x{invoice_id}"
     return f"esc-{code}-{purpose}"
@@ -220,17 +244,33 @@ async def _done(session: AsyncSession, deal: Deal, actor: int | None, action: st
     return deal
 
 
-def _payout(deal: Deal, purpose: str, recipient: int, amount: int, now: datetime, **extra: Any) -> DealPayout:
-    return DealPayout(
+def _payout(
+    deal: Deal,
+    purpose: str,
+    recipient: int,
+    amount: int,
+    now: datetime,
+    *,
+    receipt_id: int | None = None,
+    **extra: Any,
+) -> DealPayout:
+    payout = DealPayout(
         deal_id=deal.id,
         purpose=purpose,
         recipient_id=recipient,
         amount_cents=amount,
         status="pending",
-        spend_id=spend_id(deal.code, purpose, extra.get("source_invoice_id")),
+        spend_id=spend_id(deal.code, purpose, extra.get("source_invoice_id"), receipt_id),
         next_attempt_at=now,
         **extra,
     )
+    if deal.gateway != GATEWAY:  # the money is in the Crypto Pay app: staff pay it by hand
+        payout.status = "failed"
+        payout.last_error = LEGACY_NOTE
+    elif amount < money.MIN_PAYOUT_CENTS:  # the network fee would eat it: the owner decides
+        payout.status = "failed"
+        payout.last_error = "below_min"
+    return payout
 
 
 async def _settle(
@@ -289,6 +329,15 @@ async def payouts_of(session: AsyncSession, deal_id: int) -> list[DealPayout]:
     )
 
 
+async def _checked_address(session: AsyncSession, text: str) -> str:
+    from app.services.evm import AddressError
+
+    try:
+        return await wallets.check(session, text)
+    except AddressError as exc:
+        raise DealError(f"address_{exc.code}") from exc
+
+
 # ------------------------------------------------------------------------------------------ before payment
 async def create_deal(
     db: Database, creator_id: int, creator_username: str | None, draft: Draft, *, now: datetime | None = None
@@ -327,10 +376,16 @@ async def create_deal(
             total = money.amounts(draft.amount_cents, settings.fee_bps, draft.fee_payer)
         except money.AmountError as exc:
             raise DealError("amount_low", min=settings.min_cents) from exc
+        address = None
+        if draft.role == "seller" and draft.address:
+            address = await _checked_address(session, draft.address)
+            await wallets.remember(session, creator_id, address)
         deal = Deal(
             code=new_code(),
             status="pending",
             version=0,
+            gateway=GATEWAY,
+            seller_address=address,
             creator_id=creator_id,
             creator_role=draft.role,
             buyer_id=creator_id if draft.role == "buyer" else None,
@@ -441,15 +496,27 @@ async def confirm_counterparty(
         return await _done(session, deal, by_user, "confirm" if approve else "turn_down", other=other)
 
 
-async def _active_invoices(session: AsyncSession, deal_id: int) -> int:
-    return int(
-        await session.scalar(
-            select(func.count())
-            .select_from(DealInvoice)
-            .where(DealInvoice.deal_id == deal_id, DealInvoice.status == "active")
+async def _close_invoice(session: AsyncSession, deal: Deal, remote_status: str | None, status: str) -> None:
+    """Before an unpaid deal ends, its live invoice stops being the deal's way to pay. At Apirone this needs
+    the invoice's status just read (``remote_status``): one paid meanwhile (even unconfirmed) keeps the deal.
+    Money that reached the address anyway goes back to the buyer (see :func:`take_payments`)."""
+    invoice = (
+        await session.execute(
+            select(DealInvoice)
+            .where(DealInvoice.deal_id == deal.id, DealInvoice.status == "active")
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        or 0
-    )
+    ).scalar_one_or_none()
+    if invoice is None:
+        return
+    if invoice.address is not None:  # Apirone's
+        _need(remote_status is not None, "provider")
+        _need(remote_status != "completed", "already_paid")
+        _need(remote_status in UNPAID_REMOTE, "confirming")
+        invoice.remote_status = remote_status
+        status = "expired" if remote_status == "expired" else status
+    invoice.status = status  # a Crypto Pay invoice of a deal from before the move: nobody polls it any more
 
 
 async def withdraw_acceptance(db: Database, deal_id: int, by_user: int) -> Deal:
@@ -465,28 +532,36 @@ async def withdraw_acceptance(db: Database, deal_id: int, by_user: int) -> Deal:
 
 
 async def cancel_unpaid(
-    db: Database, deal_id: int, by_user: int | None, *, staff: bool = False, now: datetime | None = None
+    db: Database,
+    deal_id: int,
+    by_user: int | None,
+    *,
+    staff: bool = False,
+    remote_status: str | None = None,
+    now: datetime | None = None,
 ) -> Deal:
-    """Before payment: the creator, the bound other side or staff call the deal off. The unpaid invoice
-    must be deleted at Crypto Pay first (an invoice paid meanwhile funds the deal instead)."""
+    """Before payment: the creator, the bound other side or staff call the deal off. With an invoice this
+    needs its status just read at Apirone (``remote_status``): paid meanwhile, the deal goes on instead."""
     now = now or utcnow()
     async with _change(db, Deal.id == deal_id) as (session, deal):
         _need(deal.status in UNPAID, "state")
         _need(staff or by_user == deal.creator_id or role_of(deal, by_user) is not None, "not_party")
-        _need(await _active_invoices(session, deal.id) == 0, "invoice_active")
+        await _close_invoice(session, deal, remote_status, "closed")
         deal.status = "cancelled"
         deal.closed_at = now
         return await _done(session, deal, by_user, "cancel", staff=staff)
 
 
-async def expire_unpaid(db: Database, deal_id: int, *, now: datetime | None = None) -> Deal | None:
-    """The invitation or the payment time ran out (None: not due, or an invoice is still alive)."""
+async def expire_unpaid(
+    db: Database, deal_id: int, *, remote_status: str | None = None, now: datetime | None = None
+) -> Deal | None:
+    """The invitation or the payment time ran out (None: not due, or its invoice may still be paid)."""
     now = now or utcnow()
     try:
         async with _change(db, Deal.id == deal_id) as (session, deal):
             due = deal.accept_due_at if deal.status == "pending" else deal.pay_due_at
             _need(deal.status in UNPAID and due is not None and due <= now, "state")
-            _need(await _active_invoices(session, deal.id) == 0, "invoice_active")
+            await _close_invoice(session, deal, remote_status, "closed")
             deal.status = "expired"
             deal.closed_at = now
             return await _done(session, deal, None, "expire")
@@ -494,20 +569,68 @@ async def expire_unpaid(db: Database, deal_id: int, *, now: datetime | None = No
         return None
 
 
+async def set_address(
+    db: Database, deal_id: int, user_id: int, text: str, *, now: datetime | None = None
+) -> tuple[Deal, list[DealPayout]]:
+    """A side says where its money goes: its own side only, and never while a payout of that side is on its
+    way (the address is fixed when a payout is claimed). Payouts that waited for it are due at once.
+
+    The address is not part of the terms: the deal's version stays, the other side's buttons keep working."""
+    now = now or utcnow()
+    async with _change(db, Deal.id == deal_id) as (session, deal):
+        role = role_of(deal, user_id)
+        _need(role is not None, "not_party")
+        _need(deal.gateway == GATEWAY, "state")
+        address = await _checked_address(session, text)
+        mine = [p for p in await payouts_of(session, deal.id) if p.recipient_id == user_id]
+        _need(not any(p.status in ("sending", "unknown") for p in mine), "payout_busy")
+        waiting = [p for p in mine if p.status in ("no_address", "pending", "retry", "failed")]
+        _need(deal.status in OPEN or bool(waiting), "state")
+        old = getattr(deal, f"{role}_address")
+        setattr(deal, f"{role}_address", address)
+        woken = []
+        for payout in mine:
+            if payout.status == "no_address":
+                payout.status = "pending"
+                payout.next_attempt_at = now
+                payout.last_error = None
+                woken.append(payout)
+        await wallets.remember(session, user_id, address)
+        await audit(
+            session, user_id, "deal.address", "deal", deal.id, {"role": role, "old": old, "new": address}
+        )
+        await session.commit()
+        return deal, woken
+
+
 # ------------------------------------------------------------------------------------------ payment
-async def fund(
+def txid_key(txid: str) -> str:
+    """One spelling for a transaction id, whichever look reported it."""
+    text = txid.strip().lower()
+    return text if text.startswith("0x") or not re.fullmatch(r"[0-9a-f]{64}", text) else "0x" + text
+
+
+async def take_payments(
     db: Database,
     invoice_row_id: int,
     *,
-    asset: str,
-    paid_cents: int | None,
-    received_cents: int | None,
-    fee_cents: int | None,
-    raw: dict[str, Any] | None = None,
+    remote_status: str | None = None,
+    seen: list[Seen] | tuple[Seen, ...] = (),
+    overpaid: bool = False,
     now: datetime | None = None,
 ) -> Funding:
-    """A paid invoice. It funds the deal only when the deal waits for exactly this payment; any other money
-    (a second invoice, a deal cancelled meanwhile, a wrong amount) goes back to the buyer."""
+    """Money seen at an invoice's address. Each transaction is written once, whichever look saw it first;
+    then, under the deal's lock:
+
+    * the deal waits for this invoice and Apirone says it is completed (paid and confirmed) with at least
+      its amount: the deal is funded. More than that goes back to the buyer when the invoice itself says it
+      was overpaid (``overpaid``); otherwise the owner looks.
+    * the deal still waits: the caller tells the buyer what is missing, or that the network is confirming.
+    * the deal no longer waits for this money (funded already, called off, expired): the confirmed payments
+      nobody has decided on go back to the buyer, one payout for what this look found. A payment the account's
+      history shows with the amount of one the invoice already had may be the same one spelled another way:
+      the owner decides it.
+    """
     now = now or utcnow()
     async with db.session() as session:
         deal_id = await session.scalar(select(DealInvoice.deal_id).where(DealInvoice.id == invoice_row_id))
@@ -522,38 +645,169 @@ async def fund(
                 .execution_options(populate_existing=True)
             )
         ).scalar_one()
-        if invoice.status == "paid":
-            return Funding("duplicate", deal)
-        invoice.status = "paid"
-        invoice.paid_at = now
-        invoice.paid_amount = money.to_str(paid_cents) if paid_cents is not None else None
-        invoice.fee_amount = money.to_str(fee_cents) if fee_cents is not None else None
-        invoice.received_cents = received_cents
-        if raw is not None:
-            invoice.raw = raw
-        exact = asset == money.ASSET and paid_cents == invoice.amount_cents
-        if exact and deal.status == "awaiting_payment" and invoice.amount_cents == deal.buyer_pays_cents:
-            invoice.disposition = "funded"
-            deal.status = "funded"
-            deal.funded_at = now
-            deal.deliver_due_at = now + timedelta(days=deal.delivery_days)
-            deal.received_cents = received_cents
-            deal.provider_fee_cents = fee_cents
-            await session.flush()
-            return Funding("funded", await _done(session, deal, deal.buyer_id, "funded", invoice=invoice.id))
-        invoice.disposition = "extra" if exact else "mismatch"
-        deal.needs_attention = True
-        payout = None
-        if received_cents and deal.buyer_id is not None:
-            payout = _payout(deal, "extra", deal.buyer_id, received_cents, now, source_invoice_id=invoice.id)
-            if received_cents < money.MIN_PAYOUT_CENTS:  # too small to transfer: the owner decides
-                payout.status = "failed"
-                payout.last_error = "below_min"
-            session.add(payout)
+        if deal.gateway != GATEWAY or invoice.address is None:
+            return Funding("none", deal)
+        rows = await session.execute(
+            select(DealReceipt)
+            .where(DealReceipt.invoice_id == invoice.id)
+            .order_by(DealReceipt.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        receipts = {row.txid: row for row in rows.scalars()}
+        fresh = False
+        for item in seen:
+            key = txid_key(item.txid)
+            row = receipts.get(key)
+            if row is None:
+                row = DealReceipt(
+                    deal_id=deal.id,
+                    invoice_id=invoice.id,
+                    txid=key,
+                    amount=str(item.amount),
+                    cents=money.from_minor(item.amount),
+                    confirmed=item.confirmed,
+                    source=item.source,
+                    raw=item.raw or {},
+                )
+                session.add(row)
+                receipts[key] = row
+                fresh = True
+            elif item.confirmed and not row.confirmed:
+                row.confirmed = True
+                fresh = True
+            elif int(row.amount) != item.amount:
+                deal.needs_attention = True  # two looks disagree on one transaction: the first one stays
+        if remote_status:
+            invoice.remote_status = remote_status
         await session.flush()
-        outcome = invoice.disposition
-        deal = await _done(session, deal, deal.buyer_id, "extra_payment", invoice=invoice.id, outcome=outcome)
-        return Funding(outcome, deal, payout)
+        total = sum(int(row.amount) for row in receipts.values())
+        need = money.to_minor(invoice.amount_cents)
+        if deal.status == "awaiting_payment" and invoice.status == "active":
+            if invoice.remote_status == "completed" and total >= need:
+                return await _fund(session, deal, invoice, list(receipts.values()), total, overpaid, now)
+            if invoice.remote_status == "completed":  # confirmed with less than asked: the owner looks
+                deal.needs_attention = True
+                await session.commit()
+                return Funding("mismatch", deal, received=total, missing=need - total, fresh=fresh)
+            outcome = (
+                "confirming" if invoice.remote_status in CONFIRMING_REMOTE else "partial" if total else "none"
+            )
+            await session.commit()
+            return Funding(outcome, deal, received=total, missing=max(need - total, 0), fresh=fresh)
+        batch = [row for row in receipts.values() if row.purpose is None and row.confirmed]
+        if not batch or deal.buyer_id is None:
+            await session.commit()
+            return Funding("none", deal, received=total, fresh=fresh)
+        known = {int(row.amount) for row in receipts.values() if row.source == "invoice"}
+        doubtful = [row for row in batch if row.source == "history" and int(row.amount) in known]
+        for row in doubtful:
+            row.purpose = "review"
+        batch = [row for row in batch if row not in doubtful]
+        payouts: list[DealPayout] = []
+        cents = money.from_minor(sum(int(row.amount) for row in batch))
+        if cents > 0:
+            payout = _payout(
+                deal, "extra", deal.buyer_id, cents, now, source_invoice_id=invoice.id, receipt_id=batch[0].id
+            )
+            session.add(payout)
+            await session.flush()
+            payouts.append(payout)
+        for row in batch:
+            row.purpose = "refund" if cents > 0 else "review"  # less than a cent: not worth a transfer
+            row.payout_id = payouts[0].id if payouts else None
+        deal.needs_attention = True
+        await session.flush()
+        deal = await _done(
+            session,
+            deal,
+            deal.buyer_id,
+            "extra_payment",
+            invoice=invoice.id,
+            cents=cents,
+            review=len(doubtful),
+        )
+        return Funding("refund" if payouts else "mismatch", deal, tuple(payouts), total, fresh=True)
+
+
+async def _fund(
+    session: AsyncSession,
+    deal: Deal,
+    invoice: DealInvoice,
+    receipts: list[DealReceipt],
+    total: int,
+    overpaid: bool,
+    now: datetime,
+) -> Funding:
+    """The invoice is paid and confirmed: the money is held for the deal; a surplus goes back."""
+    for row in receipts:
+        row.confirmed = True
+        row.purpose = "deal"
+    invoice.status = "paid"
+    invoice.disposition = "funded"
+    invoice.paid_at = now
+    invoice.received_cents = money.from_minor(total)
+    deal.status = "funded"
+    deal.funded_at = now
+    deal.deliver_due_at = now + timedelta(days=deal.delivery_days)
+    deal.received_cents = money.from_minor(total)
+    payouts: list[DealPayout] = []
+    surplus = money.from_minor(total - money.to_minor(invoice.amount_cents))
+    if surplus > 0 and overpaid and deal.buyer_id is not None:
+        payout = _payout(deal, "extra", deal.buyer_id, surplus, now, source_invoice_id=invoice.id)
+        session.add(payout)
+        payouts.append(payout)
+    elif surplus > 0:  # the invoice does not say it was overpaid: the owner looks before anything goes back
+        deal.needs_attention = True
+    await session.flush()
+    deal = await _done(session, deal, deal.buyer_id, "funded", invoice=invoice.id, received=str(total))
+    return Funding("funded", deal, tuple(payouts), total, fresh=True)
+
+
+async def decide_receipt(
+    db: Database, receipt_id: int, owner_id: int, *, refund: bool, now: datetime | None = None
+) -> tuple[DealReceipt, DealPayout | None]:
+    """The owner decides money the bot would not decide itself (see :func:`take_payments`): it goes back to
+    the buyer, or it stays (the same payment written down twice, say)."""
+    now = now or utcnow()
+    async with db.session() as session:
+        deal_id = await session.scalar(select(DealReceipt.deal_id).where(DealReceipt.id == receipt_id))
+        _need(deal_id is not None, "not_found")
+        deal = await _locked(session, Deal.id == deal_id)
+        assert deal is not None
+        receipt = (
+            await session.execute(
+                select(DealReceipt)
+                .where(DealReceipt.id == receipt_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        _need(receipt.purpose == "review" and receipt.payout_id is None and receipt.confirmed, "state")
+        payout = None
+        if refund:
+            _need(deal.buyer_id is not None and receipt.cents > 0, "state")
+            assert deal.buyer_id is not None
+            payout = _payout(
+                deal,
+                "extra",
+                deal.buyer_id,
+                receipt.cents,
+                now,
+                source_invoice_id=receipt.invoice_id,
+                receipt_id=receipt.id,
+            )
+            session.add(payout)
+            await session.flush()
+            receipt.purpose = "refund"
+            receipt.payout_id = payout.id
+        else:
+            receipt.purpose = "deal"
+        await audit(
+            session, owner_id, "deal.receipt", "deal", deal.id, {"receipt": receipt.id, "refund": refund}
+        )
+        await session.commit()
+        return receipt, payout
 
 
 # ------------------------------------------------------------------------------------------ while held

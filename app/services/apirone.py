@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 BASE = "https://apirone.com/api/"
 T = TypeVar("T")
-_EVM_RE = re.compile(r"0x[0-9a-fA-F]{40}")
+_EVM_RE = re.compile(r"(?<![0-9a-fA-Fx])0x[0-9a-fA-F]{40}(?![0-9a-fA-F])")  # not a transaction id's start
 GET_TIMEOUT = 15.0
 TRANSFER_TIMEOUT = 45.0  # a transfer answered later is an unknown outcome (the bot stops within 60 s)
 

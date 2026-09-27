@@ -1,65 +1,73 @@
-"""Payouts of the garant: transfers from its Crypto Pay app to the Telegram account of the one who gets money.
+"""Payouts of the garant: transfers from its Apirone account to the address each side gave.
 
-A payout is claimed (``sending``) and committed before the transfer is asked for. A lost answer makes it
-``unknown``: it is looked up by its spend_id before anything else, and a retry reuses the spend_id, so Crypto
-Pay carries it out once whatever happens. Nothing goes out while the app's balance does not cover what the
-garant owes, while payouts are paused (by the owner, by a shortfall, after a restore) or to a recipient who
-has never opened @CryptoBot (they are told how to fix it and the payout waits).
+Apirone has no idempotency key, so the rule is: **the bot never sends a payout a second time unless it is
+sure the first did not go**. A payout is claimed (``sending``, its address fixed) and committed before the
+transfer; a transfer without a clear answer makes it ``unknown`` and from then on it is only looked for in
+the account's history: found, it is done; not found for half an hour, it waits for the owner (``failed``),
+who may send it again only after a fresh look at the history. Before any transfer the history is checked
+for money that already went to that address since the deal began and that no payout explains (sent before
+a restore, sent by hand): exactly one such transfer of the payout's size is taken as this payout's, anything
+else stops the payout for the owner. Nothing goes out while payouts are paused, while the account does not
+cover what the garant owes, or to an address another transfer of the bot may be on its way to.
+
+The fees (the network's and Apirone's) come out of the amount sent: the recipient sees them.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import select, update
 
 from app.bot.i18n import h
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Deal, DealInvoice, DealPayout
+from app.db.models import Deal, DealPayout
+from app.services.apirone import PROVIDER_ERRORS, ApironeError, ApironeTransfer, outcome_unknown
 from app.services.audit import audit
-from app.services.cryptopay import PROVIDER_ERRORS, CryptoPayError, outcome_unknown
-from app.services.escrow import deals, money
-from app.services.escrow.deals import HELD, DealError
-from app.services.escrow.invoices import provider, take_payment
+from app.services.escrow import deals, ledger, money
+from app.services.escrow.deals import GATEWAY, DealError, txid_key
+from app.services.escrow.ledger import Moved, check_balance, money_lock, pause, provider, why
 from app.services.redact import describe
 from app.services.settings import EscrowRuntime, get_settings, update_settings
 
 log = logging.getLogger(__name__)
 
+__all__ = ["check_balance", "pause", "why"]
+
 RETRY_DELAYS = (60, 300, 900, 1800, 3600, 3 * 3600, 6 * 3600)  # seconds, by attempt
-RECIPIENT_DELAY = timedelta(minutes=30)  # the recipient has to open @CryptoBot first
-RECIPIENT_GIVE_UP = timedelta(days=7)  # then the payout waits for the owner
 MAX_ATTEMPTS = 10
 STALE_SENDING = timedelta(minutes=5)  # a claim this old was cut off (the bot stopped mid-transfer)
+GIVE_UP = timedelta(minutes=30)  # an unknown outcome not found in the history by then waits for the owner
+RETRY_AFTER_DOUBT = timedelta(hours=2)  # the owner may send a doubtful payout again only this long after
 BATCH = 20
-OWED = ("pending", "retry", "failed")  # not sent for sure; "sending"/"unknown" may be gone already
 FINISHED = ("done", "manual")
 
 
 @dataclass(frozen=True)
 class Sent:
     payout: DealPayout
-    outcome: str  # done / retry / recipient / unknown / failed / paused
+    # done (sent now) / found (it had gone already: the history shows it) / retry / address (the recipient
+    # has to give an address) / address_rejected / unknown / failed / paused / wait
+    outcome: str
     closed: Deal | None = None  # the deal, when this payout was its last one
 
 
-def _kind(name: str) -> str:
-    """Crypto Pay error name → what to do about it."""
-    upper = name.upper()
-    if "SPEND" in upper:
-        return "already"
-    if "USER" in upper or "RECIPIENT" in upper:
-        return "recipient"
-    if any(word in upper for word in ("FUNDS", "COINS", "BALANCE")):
-        return "funds"
-    if any(word in upper for word in ("DISABLED", "UNAUTHORIZED", "TOKEN", "FORBIDDEN", "NOT_ALLOWED")):
+def _kind(exc: ApironeError) -> str:
+    """A refusal of Apirone → what to do about it."""
+    if exc.later:
+        return "later"
+    if exc.status in (401, 403, 404):
         return "config"
-    if "AMOUNT" in upper:
+    text = exc.message.lower()
+    if any(word in text for word in ("insufficient", "not enough", "balance", "funds")):
+        return "funds"
+    if "address" in text or "destination" in text:
+        return "address"
+    if any(word in text for word in ("amount", "dust", "fee", "minimum", "small")):
         return "amount"
     return "other"
 
@@ -84,8 +92,17 @@ async def _move(
         return row
 
 
-async def _done(
-    ctx: AppContext, payout: DealPayout, sources: tuple[str, ...], transfer: Any, now: datetime
+async def _finish(
+    ctx: AppContext, row: DealPayout | None, payout: DealPayout, outcome: str, now: datetime
+) -> Sent:
+    if row is None:
+        return Sent(payout, outcome)
+    closed = await deals.finish_if_paid(ctx.db, row.deal_id, now=now) if row.purpose in deals.ROLES else None
+    return Sent(row, outcome, closed)
+
+
+async def _sent(
+    ctx: AppContext, payout: DealPayout, sources: tuple[str, ...], transfer: ApironeTransfer, now: datetime
 ) -> Sent:
     row = await _move(
         ctx,
@@ -94,316 +111,310 @@ async def _done(
         status="done",
         done_at=now,
         transfer_id=transfer.transfer_id,
+        txid=txid_key(transfer.txids[0]) if transfer.txids else None,
+        fee_minor=str(transfer.fee) if transfer.fee is not None else None,
         raw=transfer.raw,
         last_error=None,
     )
-    if row is None:
-        return Sent(payout, "done")
-    closed = await deals.finish_if_paid(ctx.db, row.deal_id, now=now) if row.purpose in deals.ROLES else None
-    return Sent(row, "done", closed)
+    return await _finish(ctx, row, payout, "done", now)
 
 
-# ------------------------------------------------------------------------------------------ money on hand
-async def obligations(session: Any) -> dict[str, int]:
-    """Cents the garant owes: what paid deals hold (all but the fee) and payouts not sent yet."""
-    held = await session.scalar(
-        select(func.coalesce(func.sum(Deal.seller_gets_cents), 0)).where(Deal.status.in_(HELD))
+async def _found(
+    ctx: AppContext, payout: DealPayout, sources: tuple[str, ...], moved: Moved, now: datetime
+) -> Sent:
+    """The history shows this payout's transfer: done, without sending anything."""
+    row = await _move(
+        ctx,
+        payout.id,
+        sources,
+        status="done",
+        done_at=now,
+        address=payout.address or next(iter(sorted(moved.addresses)), None),
+        txid=moved.txid,
+        raw={"history": moved.item.raw},
+        last_error=None,
     )
-    owed = await session.scalar(
-        select(func.coalesce(func.sum(DealPayout.amount_cents), 0)).where(DealPayout.status.in_(OWED))
-    )
-    doubtful = await session.scalar(
-        select(func.coalesce(func.sum(DealPayout.amount_cents), 0)).where(
-            DealPayout.status.in_(("sending", "unknown"))
-        )
-    )
-    return {"held": int(held or 0), "owed": int(owed or 0), "doubtful": int(doubtful or 0)}
+    if row is not None:
+        await ledger.forget_unknown(ctx, moved.txid)
+    return await _finish(ctx, row, payout, "found", now)
 
 
-async def pause(ctx: AppContext, reason: str, *, now: datetime | None = None) -> bool:
-    """Stop payouts; True when they were running (the caller tells the owner once)."""
-    async with ctx.db.session() as session:
-        runtime = await get_settings(session, EscrowRuntime)
-        if runtime.payouts_paused:
-            return False
-        await update_settings(
-            session, EscrowRuntime, payouts_paused=True, pause_reason=reason, paused_at=now or utcnow()
-        )
-        await session.commit()
-    return True
-
-
-async def resume(ctx: AppContext, owner_id: int, *, unchecked: bool = False) -> str | None:
-    """Payouts go again after Crypto Pay's list of transfers is checked: after a restore the bot may not know
-    a transfer it made, and that deal's other payouts are held, never paid a second time.
-
-    When Crypto Pay does not give the list: after a restore payouts stay paused (``DealError("provider")``
-    with ``why``) unless the owner says to go on without the check (``unchecked``); after any other pause
-    the bot's own records are complete, so they go. Returns why the check was skipped, if it was."""
-    skipped = None
-    pay = provider(ctx)
-    if pay is not None:
-        try:
-            transfers = await pay.get_transfers()
-        except PROVIDER_ERRORS as exc:
-            skipped = why(exc)
-        else:
-            await hold_unknown_transfers(ctx, transfers)
-    async with ctx.db.session() as session:
-        runtime = await get_settings(session, EscrowRuntime)
-        if skipped is not None and runtime.pause_reason == "restore" and not unchecked:
-            raise DealError("provider", why=skipped)
-        await update_settings(session, EscrowRuntime, payouts_paused=False, pause_reason=None, paused_at=None)
-        await audit(
-            session, owner_id, "escrow.payouts_resumed", data={"unchecked": skipped} if skipped else None
-        )
-        await session.commit()
-    return skipped
-
-
-def deal_code_of(spend_id: str) -> str | None:
-    """``esc-{code}-{purpose}`` → code (see :func:`deals.spend_id`)."""
-    if not spend_id.startswith("esc-"):
-        return None
-    code, _sep, _purpose = spend_id[4:].rpartition("-")
-    return code or None
-
-
-async def hold_unknown_transfers(ctx: AppContext, transfers: list[Any] | None = None) -> list[Any] | None:
-    """Garant transfers the bot has no row for (made before a restore, say): each one's deal is marked for
-    attention and its other payouts that have not gone out are stopped, so that deal is never paid twice.
-    Returns those transfers (None: Crypto Pay did not give the list)."""
-    if transfers is None:
-        pay = provider(ctx)
-        if pay is None:
-            return None
-        try:
-            transfers = await pay.get_transfers()
-        except PROVIDER_ERRORS:
-            return None
-    ours = [t for t in transfers if t.spend_id.startswith("esc-")]
-    async with ctx.db.session() as session:
-        known = set(
-            (
-                await session.execute(
-                    select(DealPayout.spend_id).where(DealPayout.spend_id.in_([t.spend_id for t in ours]))
-                )
-            ).scalars()
-        )
-        unknown = [t for t in ours if t.spend_id not in known]
-        for transfer in unknown:
-            code = deal_code_of(transfer.spend_id)
-            deal = (await session.execute(select(Deal).where(Deal.code == code))).scalar_one_or_none()
-            if deal is None:
-                continue
-            deal.needs_attention = True
-            await session.execute(
-                update(DealPayout)
-                .where(DealPayout.deal_id == deal.id, DealPayout.status.in_(("pending", "retry")))
-                .values(status="failed", last_error=f"по сделке уже был перевод {transfer.spend_id}")
-            )
-        await session.commit()
-    return unknown
-
-
-async def check_balance(
-    ctx: AppContext, *, now: datetime | None = None, errors: list[BaseException] | None = None
-) -> tuple[bool | None, dict[str, int]]:
-    """Does the app's USDT cover everything owed? None: Crypto Pay did not say (why goes to ``errors``). A
-    shortfall pauses payouts."""
-    now = now or utcnow()
-    pay = provider(ctx)
-    async with ctx.db.session() as session:
-        owe = await obligations(session)
-    if pay is None:
-        return None, owe
-    try:
-        balance = await pay.get_balance()
-    except PROVIDER_ERRORS as exc:
-        log.warning("escrow getBalance failed: %s", describe(exc))
-        if errors is not None:
-            errors.append(exc)
-        return None, owe
-    available, onhold = balance.get(money.ASSET, ("0", "0"))
-    numbers = {**owe, "available": money.from_api(available) or 0, "onhold": money.from_api(onhold) or 0}
-    ok = numbers["available"] >= owe["held"] + owe["owed"]
-    async with ctx.db.session() as session:
-        await update_settings(session, EscrowRuntime, last_balance={**numbers, "at": now.isoformat()})
-        await session.commit()
-    if not ok and await pause(ctx, "balance", now=now):
-        from app.services.escrow.notify import alert_owner
-
-        await alert_owner(
-            ctx,
-            "⛔️ Баланс приложения гаранта меньше обязательств — выплаты остановлены.\n"
-            f"На балансе: {money.show(numbers['available'])}\n"
-            f"Заморожено в сделках: {money.show(owe['held'])}\n"
-            f"Ждут выплаты: {money.show(owe['owed'])}\n\n"
-            "Пополните приложение в @CryptoBot и включите выплаты: /admin → 🛡 Гарант.",
-        )
-    return ok, numbers
+def address_for(deal: Deal, payout: DealPayout) -> str | None:
+    return deal.seller_address if payout.purpose == "seller" else deal.buyer_address
 
 
 # ------------------------------------------------------------------------------------------ the worker
-async def _look_up(ctx: AppContext, pay: Any, payout: DealPayout, now: datetime) -> Sent:
-    """A payout whose transfer may or may not have happened: Crypto Pay knows by its spend_id."""
-    try:
-        found = await pay.get_transfers(spend_id=payout.spend_id)
-    except PROVIDER_ERRORS:
-        return Sent(payout, "unknown")
-    match = next((t for t in found if t.spend_id == payout.spend_id), None)
-    if match is not None:
-        return await _done(ctx, payout, ("sending", "unknown", "retry", "pending", "failed"), match, now)
-    row = await _move(ctx, payout.id, ("sending", "unknown"), status="retry", next_attempt_at=now)
-    return Sent(row or payout, "retry")
+class _History:
+    """The account's untaken payments, read once per pass from the earliest moment asked for."""
+
+    def __init__(self, ctx: AppContext, pay: Any) -> None:
+        self.ctx, self.pay = ctx, pay
+        self.since: datetime | None = None
+        self.moved: list[Moved] = []
+
+    async def since_(self, moment: datetime) -> list[Moved]:
+        if self.since is None or moment < self.since:
+            self.moved = await ledger.untaken(self.ctx, self.pay, moment - ledger.SLACK)
+            self.since = moment
+        return [m for m in self.moved if m.after(moment)]
+
+    def take(self, moved: Moved) -> None:
+        self.moved = [m for m in self.moved if m.txid != moved.txid]
 
 
-async def _claim(ctx: AppContext, payout_id: int, now: datetime) -> DealPayout | None:
-    return await _move(
+async def _alert_failed(ctx: AppContext, payout: DealPayout, reason: str) -> None:
+    from app.services.escrow.notify import alert_owner
+
+    value = money.show(payout.amount_cents)
+    await alert_owner(
         ctx,
-        payout_id,
-        ("pending", "retry"),
-        status="sending",
-        claimed_at=now,
-        attempts=DealPayout.attempts + 1,
+        f"💸 Выплата по сделке #{payout.deal_id} ({value}) остановлена: {h(reason)}\n"
+        "Она ждёт решения в /admin → 🛡 Гарант → 💸 Выплаты с ошибкой.",
     )
 
 
-def _comment(payout: DealPayout) -> str:
-    what = {"seller": "оплата продавцу", "buyer": "возврат покупателю", "extra": "возврат лишнего платежа"}
-    return f"Service List · сделка #{payout.deal_id}: {what.get(payout.purpose, 'выплата')}"
+async def _settle_doubts(ctx: AppContext, pay: Any, rows: list[DealPayout], now: datetime) -> list[Sent]:
+    """Payouts whose transfer may or may not have happened: only ever looked for, never sent again."""
+    results = []
+    history = _History(ctx, pay)
+    for payout in rows:
+        if payout.status == "sending":  # cut off mid-transfer: from now on its outcome is unknown
+            payout = (
+                await _move(
+                    ctx, payout.id, ("sending",), status="unknown", doubt_at=now, last_error="прервано"
+                )
+                or payout
+            )
+        try:
+            moved = await history.since_(payout.claimed_at or now)
+        except PROVIDER_ERRORS as exc:
+            log.warning("escrow history failed: %s", describe(exc))
+            return [*results, *(Sent(p, "unknown") for p in rows[len(results) :])]
+        low = (payout.address or "").lower()
+        fitting = [m for m in moved if low in m.addresses and ledger.fits(m.amount, payout.amount_cents)]
+        if len(fitting) == 1:
+            history.take(fitting[0])
+            results.append(await _found(ctx, payout, ("unknown",), fitting[0], now))
+            continue
+        doubt_at = payout.doubt_at or now
+        if fitting or doubt_at + GIVE_UP <= now:
+            reason = (
+                "в истории несколько похожих переводов на этот адрес — проверьте, какой из них её"
+                if fitting
+                else "исход перевода неизвестен, в истории его нет — проверьте историю аккаунта Apirone"
+            )
+            row = await _move(ctx, payout.id, ("unknown",), status="failed", last_error=reason[:256])
+            if row is not None:
+                await _alert_failed(ctx, row, reason)
+            results.append(Sent(row or payout, "failed"))
+            continue
+        results.append(Sent(payout, "unknown"))
+    return results
 
 
-async def _transfer(ctx: AppContext, pay: Any, payout: DealPayout, now: datetime) -> Sent:
-    try:
-        transfer = await pay.transfer(
-            user_id=payout.recipient_id,
-            asset=money.ASSET,
-            amount=money.to_str(payout.amount_cents),
-            spend_id=payout.spend_id,
-            comment=_comment(payout),
-        )
-    except Exception as exc:
-        if outcome_unknown(exc):
-            log.warning("escrow transfer %s: no answer (%s)", payout.spend_id, describe(exc))
-            row = await _move(ctx, payout.id, ("sending",), status="unknown", last_error=describe(exc)[:256])
-            return Sent(row or payout, "unknown")
-        if not isinstance(exc, CryptoPayError):
-            raise
-        return await _refused(ctx, pay, payout, exc.name, now)
-    return await _done(ctx, payout, ("sending",), transfer, now)
-
-
-async def _refused(ctx: AppContext, pay: Any, payout: DealPayout, name: str, now: datetime) -> Sent:
-    """Crypto Pay answered with an error: nothing was sent (except "already used": look it up)."""
+async def _refused(ctx: AppContext, payout: DealPayout, exc: ApironeError, now: datetime) -> Sent:
+    """Apirone said no: nothing was sent."""
     from app.services.escrow.notify import alert_owner
 
-    kind = _kind(name)
-    if kind == "already":
-        return await _look_up(ctx, pay, payout, now)
-    if kind == "recipient":
-        give_up = payout.created_at is not None and payout.created_at + RECIPIENT_GIVE_UP < now
-        status = "failed" if give_up else "retry"
+    kind = _kind(exc)
+    message = exc.message[:200]
+    if kind == "later":
         row = await _move(
             ctx,
             payout.id,
             ("sending",),
-            status=status,
-            last_error=name,
-            next_attempt_at=now + RECIPIENT_DELAY,
+            status="retry",
+            attempts=max(payout.attempts - 1, 0),
+            next_attempt_at=now + timedelta(minutes=5),
         )
-        return Sent(row or payout, "failed" if give_up else "recipient")
+        return Sent(row or payout, "paused")
     if kind in ("funds", "config"):
         row = await _move(
             ctx,
             payout.id,
             ("sending",),
             status="retry",
-            last_error=name,
+            last_error=message,
             next_attempt_at=now + timedelta(minutes=5),
         )
-        if await pause(ctx, f"{kind}:{name}", now=now):
-            reason = (
-                "на балансе приложения не хватает USDT"
-                if kind == "funds"
-                else "Crypto Pay не даёт делать переводы (включите Transfers в настройках приложения)"
-            )
+        if await pause(ctx, f"{kind}:{message}", now=now):
+            reason = "на аккаунте Apirone не хватает USDT" if kind == "funds" else why(exc)
             await alert_owner(
-                ctx, f"⛔️ Выплаты остановлены: {reason}. Ошибка Crypto Pay: <code>{h(name)}</code>."
+                ctx, f"⛔️ Выплаты остановлены: {h(reason)}.\nОтвет Apirone: <code>{h(message)}</code>"
             )
         return Sent(row or payout, "paused")
-    if kind == "amount" or payout.attempts >= MAX_ATTEMPTS:
-        row = await _move(ctx, payout.id, ("sending",), status="failed", last_error=name)
-        await alert_owner(
+    if kind == "address":
+        row = await _move(
             ctx,
-            f"💸 Выплата по сделке #{payout.deal_id} ({money.show(payout.amount_cents)}) не прошла: "
-            f"<code>{h(name)}</code>. Она ждёт решения в /admin → 🛡 Гарант → 💸 Выплаты с ошибкой.",
+            payout.id,
+            ("sending",),
+            status="no_address",
+            address=None,
+            last_error=f"адрес отклонён: {message}",
         )
+        return Sent(row or payout, "address_rejected")
+    if kind == "amount" or payout.attempts >= MAX_ATTEMPTS:
+        row = await _move(ctx, payout.id, ("sending",), status="failed", last_error=message)
+        await _alert_failed(ctx, payout, f"Apirone: {message}")
         return Sent(row or payout, "failed")
     row = await _move(
         ctx,
         payout.id,
         ("sending",),
         status="retry",
-        last_error=name,
+        last_error=message,
         next_attempt_at=now + _delay(payout.attempts),
     )
     return Sent(row or payout, "retry")
 
 
-def _lock(ctx: AppContext) -> asyncio.Lock:
-    return ctx.services.setdefault("escrow_payout_lock", asyncio.Lock())
+async def _history_says(
+    ctx: AppContext, payout: DealPayout, deal: Deal, history: _History, now: datetime
+) -> Sent | None:
+    """What the history says about a payout not sent yet: exactly one transfer of its size to its address
+    since the deal began is its own (made before a restore): done. Any other there stops it for the owner.
+    None: nothing went there."""
+    address = address_for(deal, payout)
+    if not address:
+        return None
+    low = address.lower()
+    moved = [m for m in await history.since_(deal.created_at) if low in m.addresses]
+    if len(moved) == 1 and ledger.fits(moved[0].amount, payout.amount_cents):
+        history.take(moved[0])
+        return await _found(ctx, payout, ("pending", "retry"), moved[0], now)
+    if moved:
+        reason = (
+            f"на адрес {low} с начала сделки уже уходили деньги, которые бот не может отнести к выплате — "
+            "проверьте историю аккаунта Apirone"
+        )
+        row = await _move(ctx, payout.id, ("pending", "retry"), status="failed", last_error=reason[:256])
+        if row is not None:
+            await _alert_failed(ctx, payout, reason)
+        return Sent(row or payout, "failed")
+    return None
+
+
+async def _unsent(ctx: AppContext, *, due_by: datetime | None = None) -> list[tuple[DealPayout, Deal]]:
+    """Payouts of Apirone deals not sent yet (``due_by``: only those due by then)."""
+    where = [Deal.gateway == GATEWAY, DealPayout.status.in_(("pending", "retry"))]
+    if due_by is not None:
+        where.append((DealPayout.next_attempt_at.is_(None)) | (DealPayout.next_attempt_at <= due_by))
+    async with ctx.db.session() as session:
+        rows = await session.execute(
+            select(DealPayout, Deal)
+            .join(Deal, Deal.id == DealPayout.deal_id)
+            .where(*where)
+            .order_by(DealPayout.id)
+        )
+        return [(payout, deal) for payout, deal in rows.all()]
+
+
+async def _match_sent(
+    ctx: AppContext, pay: Any, now: datetime, history: _History | None = None
+) -> list[Sent]:
+    """Before anything is sent or counted as owed: payouts the history shows as already sent are done.
+    Nothing goes out here (it runs while payouts are paused too). Raises what Apirone raises."""
+    history = history or _History(ctx, pay)
+    results = []
+    async with ctx.db.session() as session:
+        busy = await ledger.busy_addresses(session)
+    for payout, deal in await _unsent(ctx):
+        address = address_for(deal, payout)
+        if address and address.lower() not in busy:  # a doubtful transfer there is settled first
+            sent = await _history_says(ctx, payout, deal, history, now)
+            if sent is not None:
+                results.append(sent)
+    return results
+
+
+async def _send(ctx: AppContext, pay: Any, payout: DealPayout, deal: Deal, now: datetime) -> Sent:
+    address = address_for(deal, payout)
+    if not address:
+        row = await _move(ctx, payout.id, ("pending", "retry"), status="no_address")
+        return Sent(row or payout, "address")
+    low = address.lower()
+    async with ctx.db.session() as session:
+        if low in await ledger.busy_addresses(session):
+            return Sent(payout, "wait")  # another transfer may be on its way there: it is settled first
+        held = ledger.held_addresses(await get_settings(session, EscrowRuntime))
+    sides = {a.lower() for a in (deal.seller_address, deal.buyer_address) if a}
+    if held & sides:  # money left for one side of this deal without the bot: the owner says what it was
+        return Sent(payout, "wait")
+    claimed = await _move(
+        ctx,
+        payout.id,
+        ("pending", "retry"),
+        status="sending",
+        claimed_at=now,
+        address=low,
+        attempts=DealPayout.attempts + 1,
+    )
+    if claimed is None:
+        return Sent(payout, "wait")
+    try:
+        transfer = await pay.transfer(low, money.to_minor(claimed.amount_cents))
+    except Exception as exc:
+        if outcome_unknown(exc):
+            log.warning("escrow transfer %s: outcome unknown (%s)", claimed.spend_id, describe(exc))
+            row = await _move(
+                ctx, claimed.id, ("sending",), status="unknown", doubt_at=now, last_error=describe(exc)[:256]
+            )
+            return Sent(row or claimed, "unknown")
+        if not isinstance(exc, ApironeError):
+            raise
+        return await _refused(ctx, claimed, exc, now)
+    return await _sent(ctx, claimed, ("sending",), transfer, now)
 
 
 async def run(ctx: AppContext, *, now: datetime | None = None) -> list[Sent]:
-    """One pass: settle the doubtful payouts, then send the due ones if the balance allows."""
+    """One pass: settle the doubtful transfers, take in the payouts the history shows as sent, then send
+    the due ones if payouts run and the balance allows."""
     pay = provider(ctx)
     if pay is None:
         return []
-    async with _lock(ctx):
+    async with money_lock(ctx):
         now = now or utcnow()
         results: list[Sent] = []
+        apirone = select(Deal.id).where(Deal.gateway == GATEWAY)
         async with ctx.db.session() as session:
             doubtful = list(
                 (
                     await session.execute(
-                        select(DealPayout).where(
+                        select(DealPayout)
+                        .where(
+                            DealPayout.deal_id.in_(apirone),
                             (DealPayout.status == "unknown")
                             | (
                                 (DealPayout.status == "sending")
                                 & (DealPayout.claimed_at < now - STALE_SENDING)
-                            )
-                        )
-                    )
-                ).scalars()
-            )
-        for payout in doubtful:  # first: one that turns out not sent is due again right away
-            results.append(await _look_up(ctx, pay, payout, now))
-        async with ctx.db.session() as session:
-            runtime = await get_settings(session, EscrowRuntime)
-            due = list(
-                (
-                    await session.execute(
-                        select(DealPayout)
-                        .where(
-                            DealPayout.status.in_(("pending", "retry")),
-                            (DealPayout.next_attempt_at.is_(None)) | (DealPayout.next_attempt_at <= now),
+                            ),
                         )
                         .order_by(DealPayout.id)
-                        .limit(BATCH)
                     )
                 ).scalars()
             )
+        if doubtful:
+            results += await _settle_doubts(ctx, pay, doubtful, now)
+        from app.services.escrow import withdrawals
+
+        await withdrawals.settle(ctx, pay, now=now)
+        if not await _unsent(ctx):
+            return results
+        try:
+            results += await _match_sent(ctx, pay, now)
+        except PROVIDER_ERRORS as exc:  # without the history nothing goes out
+            log.warning("escrow payouts wait for the history: %s", describe(exc))
+            return results
+        async with ctx.db.session() as session:
+            runtime = await get_settings(session, EscrowRuntime)
+        due = (await _unsent(ctx, due_by=now))[:BATCH]
         if runtime.payouts_paused or not due:
             return results
         ok, _numbers = await check_balance(ctx, now=now)
         if not ok:
             return results
-        for payout in due:
-            claimed = await _claim(ctx, payout.id, now)
-            if claimed is None:
-                continue
-            sent = await _transfer(ctx, pay, claimed, now)
+        for payout, deal in due:
+            sent = await _send(ctx, pay, payout, deal, now)
             results.append(sent)
             if sent.outcome == "paused":
                 break
@@ -411,16 +422,52 @@ async def run(ctx: AppContext, *, now: datetime | None = None) -> list[Sent]:
 
 
 # ------------------------------------------------------------------------------------------ the owner's hands
-async def retry_now(ctx: AppContext, payout_id: int, staff_id: int) -> DealPayout:
-    row = await _move(
-        ctx,
-        payout_id,
-        ("failed", "retry"),
-        status="retry",
-        attempts=0,
-        next_attempt_at=utcnow(),
-        last_error=None,
-    )
+async def _nothing_went(ctx: AppContext, payout: DealPayout, deal: Deal) -> Moved | None:
+    """A fresh look at the history for this payout's money (``DealError("provider")`` without an answer):
+    the one transfer it shows to the payout's address, if any."""
+    pay = provider(ctx)
+    address = (payout.address or address_for(deal, payout) or "").lower()
+    if pay is None or not address:
+        return None
+    try:
+        moved = await ledger.untaken(ctx, pay, deal.created_at - ledger.SLACK)
+    except PROVIDER_ERRORS as exc:
+        raise DealError("provider", why=why(exc)) from exc
+    fitting = [m for m in moved if address in m.addresses and ledger.fits(m.amount, payout.amount_cents)]
+    return fitting[0] if fitting else None
+
+
+async def retry_now(
+    ctx: AppContext, payout_id: int, staff_id: int, *, now: datetime | None = None
+) -> DealPayout:
+    """Send a stopped payout again. One whose transfer was ever in doubt only after a while and after the
+    history shows nothing went (``DealError("too_soon")`` / ``"already_sent"``)."""
+    now = now or utcnow()
+    async with money_lock(ctx):
+        async with ctx.db.session() as session:
+            payout = await session.get(DealPayout, payout_id)
+            deal = await session.get(Deal, payout.deal_id) if payout else None
+        if payout is None or deal is None or payout.status not in ("failed", "retry"):
+            raise DealError("state")
+        if deal.gateway != GATEWAY:
+            raise DealError("legacy")
+        if payout.doubt_at is not None:
+            if (payout.claimed_at or payout.doubt_at) + RETRY_AFTER_DOUBT > now:
+                raise DealError("too_soon")
+            found = await _nothing_went(ctx, payout, deal)
+            if found is not None:
+                await _found(ctx, payout, ("failed", "retry"), found, now)
+                raise DealError("already_sent")
+        row = await _move(
+            ctx,
+            payout_id,
+            ("failed", "retry"),
+            status="retry",
+            attempts=0,
+            next_attempt_at=now,
+            last_error=None,
+            doubt_at=None,
+        )
     if row is None:
         raise DealError("state")
     async with ctx.db.session() as session:
@@ -433,7 +480,7 @@ async def hold(ctx: AppContext, payout_id: int, owner_id: int) -> DealPayout:
     """The owner stops the automatic retries of a payout before paying it another way: from then on only
     they decide (retry again, or mark it paid by hand). A payout being sent right now cannot be stopped."""
     stopped = "повторы остановлены владельцем"
-    row = await _move(ctx, payout_id, ("retry",), status="failed", last_error=stopped)
+    row = await _move(ctx, payout_id, ("pending", "retry", "no_address"), status="failed", last_error=stopped)
     if row is None:
         raise DealError("state")
     async with ctx.db.session() as session:
@@ -445,31 +492,30 @@ async def hold(ctx: AppContext, payout_id: int, owner_id: int) -> DealPayout:
 async def mark_manual(
     ctx: AppContext, payout_id: int, owner_id: int, ref: str, *, now: datetime | None = None
 ) -> Sent:
-    """The owner paid it another way (a check, a transfer by hand): only a payout that surely did not go
-    out, with a reference to how it was paid."""
+    """The owner paid it another way: only a payout that surely did not go out, with a reference to how it
+    was paid. A transfer of it that the history shows is taken instead (``already_sent``)."""
     now = now or utcnow()
     ref = ref.strip()[:500]
     if not ref:
         raise DealError("no_reason")
-    async with ctx.db.session() as session:
-        payout = await session.get(DealPayout, payout_id)
-    if payout is None:
-        raise DealError("not_found")
-    if payout.status != "failed":  # a payout still retried must be stopped first (hold): no double payment
-        raise DealError("state")
-    pay = provider(ctx)
-    if pay is not None:  # the last attempt may have gone through after all
-        try:
-            found = await pay.get_transfers(spend_id=payout.spend_id)
-        except PROVIDER_ERRORS as exc:
-            raise DealError("provider") from exc
-        match = next((t for t in found if t.spend_id == payout.spend_id), None)
-        if match is not None:
-            await _done(ctx, payout, ("failed",), match, now)
-            raise DealError("already_sent")
-    row = await _move(
-        ctx, payout_id, ("failed",), status="manual", manual_ref=ref, decided_by=owner_id, done_at=now
-    )
+    async with money_lock(ctx):
+        async with ctx.db.session() as session:
+            payout = await session.get(DealPayout, payout_id)
+            deal = await session.get(Deal, payout.deal_id) if payout else None
+        if payout is None or deal is None:
+            raise DealError("not_found")
+        if (
+            payout.status != "failed"
+        ):  # a payout still retried must be stopped first (hold): no double payment
+            raise DealError("state")
+        if deal.gateway == GATEWAY:
+            found = await _nothing_went(ctx, payout, deal)
+            if found is not None:
+                await _found(ctx, payout, ("failed",), found, now)
+                raise DealError("already_sent")
+        row = await _move(
+            ctx, payout_id, ("failed",), status="manual", manual_ref=ref, decided_by=owner_id, done_at=now
+        )
     if row is None:
         raise DealError("state")
     async with ctx.db.session() as session:
@@ -479,136 +525,203 @@ async def mark_manual(
     return Sent(row, "done", closed)
 
 
-# ------------------------------------------------------------------------------------------ reconciliation
-TRANSFERS_HINT = (
-    "в приложении гаранта не включены переводы: @CryptoBot → Crypto Pay → My Apps → приложение гаранта → "
-    "Security → Transfers → Enable"
-)
-
-
-def why(exc: BaseException) -> str:
-    """What Crypto Pay said, with the fix when it is a known one."""
-    if isinstance(exc, CryptoPayError) and exc.name == "BAD_RESPONSE":
-        status = f" (HTTP {exc.code})" if exc.code else ""
-        return f"Crypto Pay ответил не по API{status} — сбой у Crypto Pay или в сети"
-    if not isinstance(exc, CryptoPayError) or outcome_unknown(exc):
-        return "нет ответа (сеть или Crypto Pay недоступен)"
-    kind = _kind(exc.name)
-    if kind == "config" and "UNAUTHORIZED" not in exc.name.upper() and "TOKEN" not in exc.name.upper():
-        return f"{exc.name} — {TRANSFERS_HINT}"
-    if kind == "config":
-        return (
-            f"{exc.name} — проверьте ESCROW_CRYPTOPAY_TOKEN и сеть (основная или тестовая) "
-            "в servicelist config"
+async def resume(ctx: AppContext, owner_id: int, *, unchecked: bool = False) -> str | None:
+    """Payouts go again. After a restore the account's history since the archive was made is read first:
+    the transfers the restored records do not know become the owner's to name, and payouts to their
+    addresses wait (``DealError("provider", why=…)`` when the history does not come, unless the owner says
+    to go on without it: ``unchecked``). Returns why the check was skipped, if it was."""
+    skipped = None
+    async with ctx.db.session() as session:
+        runtime = await get_settings(session, EscrowRuntime)
+    pay = provider(ctx)
+    if runtime.pause_reason == "restore" and pay is not None:
+        since = (runtime.restored_backup_at or utcnow() - timedelta(days=30)) - ledger.SLACK
+        async with money_lock(ctx):
+            try:
+                moved = await ledger.untaken(ctx, pay, since)
+            except PROVIDER_ERRORS as exc:
+                skipped = why(exc)
+                if not unchecked:
+                    raise DealError("provider", why=skipped) from exc
+            else:
+                await ledger.note_unknown(ctx, moved)
+    async with ctx.db.session() as session:
+        await update_settings(
+            session,
+            EscrowRuntime,
+            payouts_paused=False,
+            pause_reason=None,
+            paused_at=None,
+            restored_backup_at=None,
         )
-    return exc.name
+        await audit(
+            session, owner_id, "escrow.payouts_resumed", data={"unchecked": skipped} if skipped else None
+        )
+        await session.commit()
+    return skipped
 
 
-async def transfers_problem(ctx: AppContext) -> str | None:
-    """Before deals are switched on: can the garant's app read its balance and its transfers?"""
+async def name_unknown(ctx: AppContext, txid: str, owner_id: int, *, payout_id: int | None = None) -> None:
+    """The owner says what a transfer nobody explained was: this payout's (it is done with it) or their own
+    (``payout_id`` None: nothing of the garant's is tied to it)."""
+    async with money_lock(ctx):
+        async with ctx.db.session() as session:
+            runtime = await get_settings(session, EscrowRuntime)
+            entry = next((e for e in runtime.unknown_payments if e.get("txid") == txid), None)
+            if entry is None or entry.get("status") != "open":
+                raise DealError("state")
+            payout = await session.get(DealPayout, payout_id) if payout_id is not None else None
+        if payout_id is not None:
+            if payout is None or payout.status not in ("pending", "retry", "failed", "no_address", "unknown"):
+                raise DealError("state")
+            row = await _move(
+                ctx,
+                payout.id,
+                ("pending", "retry", "failed", "no_address", "unknown"),
+                status="done",
+                done_at=utcnow(),
+                address=payout.address or (entry.get("addresses") or [None])[0],
+                txid=txid,
+                raw={"history": entry},
+                last_error=None,
+                decided_by=owner_id,
+            )
+            if row is None:
+                raise DealError("state")
+            if row.purpose in deals.ROLES:
+                await deals.finish_if_paid(ctx.db, row.deal_id)
+        async with ctx.db.session() as session:
+            runtime = await get_settings(session, EscrowRuntime)
+            entries = []
+            for e in runtime.unknown_payments:
+                if e.get("txid") != txid:
+                    entries.append(e)
+                elif payout_id is None:
+                    entries.append({**e, "status": "owner", "by": owner_id})
+            await update_settings(session, EscrowRuntime, unknown_payments=entries)
+            await audit(session, owner_id, "escrow.unknown_payment", data={"txid": txid, "payout": payout_id})
+            await session.commit()
+
+
+# ------------------------------------------------------------------------------------------ checks
+async def setup_problem(ctx: AppContext) -> str | None:
+    """Before deals are switched on: is the Apirone account there, does it count USDT BEP20 in the units the
+    bot expects, does the transfer key work, does the money stay on the account? None when all is well."""
     pay = provider(ctx)
     if pay is None:
-        return "не задан ESCROW_CRYPTOPAY_TOKEN (servicelist config)"
+        return "не заданы ESCROW_APIRONE_ACCOUNT и ESCROW_APIRONE_TRANSFER_KEY (servicelist config)"
     try:
-        await pay.get_balance()
-        await pay.get_transfers(spend_id="esc-check")
+        factor = await pay.units_factor()
+        info = await pay.account_info()
+        await pay.balance()
+        await pay.history(limit=1)
+        await pay.invoices(limit=1)  # needs the transfer key: a wrong one shows here
     except PROVIDER_ERRORS as exc:
         return why(exc)
+    if factor != money.UNITS_FACTOR:
+        return (
+            f"Apirone считает {money.CURRENCY} в единицах {factor if factor is not None else '(не сказал)'}, "
+            f"бот — в {money.UNITS_FACTOR}: включать нельзя, пока это не проверено"
+        )
+    if _forwards(info):
+        return "в аккаунте Apirone включена пересылка поступлений на другой адрес — выключите её"
+    async with ctx.db.session() as session:
+        legacy = list(
+            (
+                await session.execute(
+                    select(Deal.id).where(Deal.gateway != GATEWAY, Deal.status.in_(deals.OPEN)).limit(10)
+                )
+            ).scalars()
+        )
+    if legacy:
+        return "есть незавершённые сделки CryptoBot: " + ", ".join(f"#{n}" for n in legacy)
     return None
 
 
-def _reconcile_lock(ctx: AppContext) -> asyncio.Lock:
+def _forwards(info: Any) -> bool:
+    """Does the account send what it receives on (``destinations`` of our currency)?"""
+    entries = info.get("info") if isinstance(info, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and str(entry.get("currency", "")).lower() == money.CURRENCY:
+            return bool(entry.get("destinations"))
+    return False
+
+
+# ------------------------------------------------------------------------------------------ reconciliation
+def _reconcile_lock(ctx: AppContext) -> Any:
+    import asyncio
+
     return ctx.services.setdefault("escrow_reconcile_lock", asyncio.Lock())
 
 
 async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str]:
-    """Every few minutes (and on the owner's button): anything Crypto Pay knows that the bot does not (a paid
-    invoice without a row, a transfer with a garant spend_id the bot never made), then the balance against
-    what is owed. One at a time: the job and the button never take the same payment in twice."""
+    """Every ten minutes (and on the owner's button): money in and out that the bot has not written down,
+    then the balance against what is owed. One at a time: the job and the button never take the same
+    payment in twice."""
     if provider(ctx) is None:
         return []
     async with _reconcile_lock(ctx):
         return await _reconcile(ctx, now or utcnow())
 
 
-def transient(exc: BaseException) -> bool:
-    """No answer or a garbled one: it may be gone by the next try."""
-    return not isinstance(exc, CryptoPayError) or outcome_unknown(exc)
+WINDOW = timedelta(days=1)  # every check looks back this far before the last one (the history's lag)
+FIRST_WINDOW = timedelta(days=30)
 
 
 async def _reconcile(ctx: AppContext, now: datetime) -> list[str]:
+    from app.services.escrow import invoices
+    from app.services.escrow.sweep import on_funding
+
     pay = provider(ctx)
     problems: list[str] = []
     passing: set[str] = set()  # told to the owner only when the next check finds them again
 
     def failed(what: str, exc: BaseException) -> None:
-        problems.append(f"Crypto Pay не отдаёт {what}: {why(exc)}")
-        if transient(exc):
+        problems.append(f"Apirone не отдаёт {what}: {why(exc)}")
+        if ledger.transient(exc):
             passing.add(problems[-1])
 
+    async with ctx.db.session() as session:
+        before = await get_settings(session, EscrowRuntime)
+    since = (before.scanned_at or now - FIRST_WINDOW) - WINDOW
+    scanned = True
     try:
-        paid = await pay.paid_invoices()
+        fundings, strangers = await invoices.scan_receipts(ctx, since)
     except PROVIDER_ERRORS as exc:
-        paid = None
-        failed("список оплаченных счетов", exc)
-    if paid:
+        failed("историю поступлений", exc)
+        scanned = False
+    else:
+        problems += strangers
+        for funding in fundings:
+            await on_funding(ctx, funding)
+    async with money_lock(ctx):
+        try:
+            await _match_sent(ctx, pay, now)  # a payout already sent is not owed: not a shortfall below
+            moved = await ledger.untaken(ctx, pay, since)
+        except PROVIDER_ERRORS as exc:
+            failed("историю переводов", exc)
+            scanned = False
+        else:
+            await ledger.note_unknown(ctx, moved, now=now)
+    if scanned:  # the next check starts from here (and looks a day further back)
         async with ctx.db.session() as session:
-            rows = {
-                row.provider_invoice_id: row
-                for row in (
-                    await session.execute(
-                        select(DealInvoice).where(
-                            DealInvoice.provider_invoice_id.in_([i.invoice_id for i in paid])
-                        )
-                    )
-                ).scalars()
-            }
-        for invoice in paid:
-            row = rows.get(invoice.invoice_id)
-            if row is None:
-                problems.append(
-                    f"оплаченный счёт #{invoice.invoice_id} ({invoice.payload or 'без payload'}) бот не знает"
-                )
-            elif row.status != "paid":  # paid after being dropped: take the money in
-                from app.services.escrow.sweep import on_funding
-
-                await on_funding(ctx, await take_payment(ctx, row.id, invoice))
-    try:
-        transfers = await pay.get_transfers()
-    except PROVIDER_ERRORS as exc:
-        transfers = None
-        failed("список переводов", exc)
-    if transfers:
-        await hold_unknown_transfers(ctx, transfers)  # their deals are not paid again meanwhile
-        ours = [t for t in transfers if t.spend_id.startswith("esc-")]
-        async with ctx.db.session() as session:
-            known = {
-                p.spend_id: p
-                for p in (
-                    await session.execute(
-                        select(DealPayout).where(DealPayout.spend_id.in_([t.spend_id for t in ours]))
-                    )
-                ).scalars()
-            }
-        for transfer in ours:
-            payout = known.get(transfer.spend_id)
-            if payout is None:
-                problems.append(
-                    f"перевод {transfer.spend_id} ({transfer.amount} {transfer.asset}) пользователю "
-                    f"{transfer.user_id} бот не делал"
-                )
-            elif payout.status not in FINISHED:
-                await _done(ctx, payout, ("pending", "retry", "sending", "unknown", "failed"), transfer, now)
-    # last, once payouts that did go out are marked: the balance against what is still owed
+            await update_settings(session, EscrowRuntime, scanned_at=now)
+            await session.commit()
+    async with ctx.db.session() as session:
+        runtime = await get_settings(session, EscrowRuntime)
+    opened = [e for e in runtime.unknown_payments if e.get("status") == "open"]
+    if opened:
+        problems.append(f"непонятных исходящих переводов: {len(opened)} — выплаты на их адреса ждут решения")
+    # last, once what went out is written down: the balance against what is still owed
     errors: list[BaseException] = []
     ok, numbers = await check_balance(ctx, now=now, errors=errors)
     shortfall = None
     if ok is None and errors:
-        failed("баланс приложения гаранта", errors[0])
+        failed("баланс аккаунта", errors[0])
     elif ok is False:  # check_balance has paused payouts and told the owner
         shortfall = (
-            f"баланс {money.show(numbers['available'])} меньше обязательств "
-            f"{money.show(numbers['held'] + numbers['owed'])}"
+            f"доступно {money.show(numbers['available'])} меньше обязательств "
+            f"{money.show(ledger.owed_total(numbers))}"
         )
         problems.append(shortfall)
     async with ctx.db.session() as session:
@@ -618,6 +731,7 @@ async def _reconcile(ctx: AppContext, now: datetime) -> list[str]:
             p
             for p in problems
             if p != shortfall
+            and not p.startswith("непонятных исходящих")  # note_unknown told the owner itself
             and (p in before.problems and p not in before.told if p in passing else p not in before.problems)
         ]
         told = [p for p in problems if p in passing and (p in fresh or p in before.told)]

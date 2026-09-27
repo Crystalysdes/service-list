@@ -1,7 +1,5 @@
-"""Minimal Crypto Pay API client (@CryptoBot).
-
-Invoices priced in USD and paid in USDT/TON/BTC (listings and options), invoices in a crypto asset
-(escrow deals), transfers from the app balance to a Telegram user and the balance itself.
+"""Minimal Crypto Pay API client (@CryptoBot): invoices priced in USD and paid in USDT/TON/BTC, for listings
+and options. (The Auto-garant has its own gateway: app/services/apirone.py.)
 """
 
 from __future__ import annotations
@@ -33,7 +31,7 @@ class CryptoPayError(Exception):
 
 
 # a reply that is not the API's JSON (a proxy's error page) or no reply at all: the request may have
-# been carried out, so a transfer must be checked by its spend_id before anything else
+# been carried out
 UNKNOWN_OUTCOME = (aiohttp.ClientError, TimeoutError, OSError)
 # every way a call can fail: an error from the API, a garbled reply, no reply
 PROVIDER_ERRORS = (CryptoPayError, *UNKNOWN_OUTCOME)
@@ -64,29 +62,6 @@ class CryptoInvoice:
             ),
             amount=str(data.get("amount", "")),
             payload=data.get("payload"),
-            raw=data,
-        )
-
-
-@dataclass
-class CryptoTransfer:
-    transfer_id: int
-    spend_id: str
-    user_id: int
-    asset: str
-    amount: str
-    status: str  # completed
-    raw: dict[str, Any]
-
-    @classmethod
-    def from_api(cls, data: dict[str, Any]) -> CryptoTransfer:
-        return cls(
-            transfer_id=int(data["transfer_id"]),
-            spend_id=str(data.get("spend_id") or ""),
-            user_id=int(data.get("user_id") or 0),
-            asset=str(data.get("asset") or ""),
-            amount=str(data.get("amount") or ""),
-            status=str(data.get("status") or ""),
             raw=data,
         )
 
@@ -184,77 +159,11 @@ class CryptoPayClient:
             params["paid_btn_url"] = paid_btn_url
         return await self._request("createInvoice", params, CryptoInvoice.from_api)
 
-    async def create_crypto_invoice(
-        self,
-        *,
-        asset: str,
-        amount: str,
-        description: str,
-        payload: str,
-        expires_in: int,
-        paid_btn_url: str | None,
-    ) -> CryptoInvoice:
-        """An invoice in a crypto asset (escrow deals are in USDT): exactly that asset and amount."""
-        params: dict[str, Any] = {
-            "currency_type": "crypto",
-            "asset": asset,
-            "amount": amount,
-            "description": description[:1024],
-            "payload": payload,
-            "expires_in": expires_in,
-            "allow_comments": False,
-            "allow_anonymous": False,
-        }
-        if paid_btn_url:
-            params["paid_btn_name"] = "openBot"
-            params["paid_btn_url"] = paid_btn_url
-        return await self._request("createInvoice", params, CryptoInvoice.from_api)
-
     async def get_invoices(self, invoice_ids: list[int]) -> list[CryptoInvoice]:
         if not invoice_ids:
             return []
         return await self._request(
             "getInvoices", {"invoice_ids": ",".join(str(i) for i in invoice_ids), "count": 1000}, _invoices
-        )
-
-    async def transfer(
-        self, *, user_id: int, asset: str, amount: str, spend_id: str, comment: str | None = None
-    ) -> CryptoTransfer:
-        """Send coins from the app balance to a Telegram user; ``spend_id`` makes it happen once."""
-        params = {
-            "user_id": user_id,
-            "asset": asset,
-            "amount": amount,
-            "spend_id": spend_id[:64],
-            "comment": comment[:1024] if comment else None,
-            "disable_send_notification": False,
-        }
-        return await self._request("transfer", params, CryptoTransfer.from_api)
-
-    async def get_transfers(self, *, spend_id: str | None = None) -> list[CryptoTransfer]:
-        """The app's transfers: the one with this spend_id, or the latest 1000."""
-        params: dict[str, Any] = {
-            "asset": None,
-            "spend_id": spend_id[:64] if spend_id else None,
-            "count": 1000,
-        }
-        return await self._request(
-            "getTransfers", params, lambda result: [CryptoTransfer.from_api(item) for item in _items(result)]
-        )
-
-    async def paid_invoices(self) -> list[CryptoInvoice]:
-        """The latest 1000 paid invoices of the app (the reconciliation looks for unknown ones)."""
-        return await self._request("getInvoices", {"status": "paid", "count": 1000}, _invoices)
-
-    async def get_balance(self) -> dict[str, tuple[str, str]]:
-        """asset -> (available, on hold), amounts as the API gives them."""
-        return await self._request(
-            "getBalance",
-            {},
-            lambda result: {
-                str(item["currency_code"]): (str(item.get("available", "0")), str(item.get("onhold", "0")))
-                for item in _items(result)
-            },
         )
 
     async def delete_invoice(self, invoice_id: int) -> bool:

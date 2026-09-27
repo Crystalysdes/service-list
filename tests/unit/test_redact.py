@@ -44,3 +44,10 @@ def test_log_lines_and_tracebacks_are_cleaned():
     line = formatter.format(record)
     assert BOT_TOKEN not in line and PAY_TOKEN not in line and "my-backup-passphrase" not in line
     assert "bot***" in line and redact(f"x {PAY_TOKEN} y") == "x *** y"
+
+
+def test_apirone_errors_are_described_by_what_apirone_said():
+    from app.services.apirone import ApironeError
+
+    assert describe(ApironeError("Insufficient funds", 400)) == "Apirone: Insufficient funds (HTTP 400)"
+    assert describe(ApironeError("no answer in time", unknown=True)) == "Apirone: no answer in time"

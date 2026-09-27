@@ -21,9 +21,10 @@ class Config(BaseSettings):
     owner_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     cryptopay_token: SecretStr | None = None
     cryptopay_testnet: bool = False
-    # Auto-garant: a Crypto Pay app of its own, so deal money never mixes with listing payments
-    escrow_cryptopay_token: SecretStr | None = None
-    escrow_cryptopay_testnet: bool | None = None  # None: as CRYPTOPAY_TESTNET
+    # Auto-garant: an Apirone account of its own (USDT BEP20); deal money never mixes with listing payments.
+    # The account number is a secret too: Apirone shows an account's history and balance to anyone who has it.
+    escrow_apirone_account: SecretStr | None = None
+    escrow_apirone_transfer_key: SecretStr | None = None
     timezone: str = "Europe/Moscow"
     data_dir: Path = Path("data")
     backup_passphrase: SecretStr | None = None

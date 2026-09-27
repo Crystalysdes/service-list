@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.i18n import Translator, h
 from app.db.models import Deal, DealPayout, User
-from app.services.escrow import money
-from app.services.escrow.deals import HELD, role_of
+from app.services.escrow import money, wallets
+from app.services.escrow.deals import GATEWAY, HELD, OPEN, role_of
 from app.services.timefmt import fmt_date, fmt_dt
 
 ROLE_ICONS = {"buyer": "🛒", "seller": "💼"}
@@ -92,6 +92,46 @@ def rules(t: Translator, deal: Deal) -> str:
         grace_hours=deal.grace_hours,
         fee=money.show(deal.fee_cents),
     )
+
+
+WAITING = ("no_address", "pending", "retry", "failed")  # a payout that has not started going out
+
+
+def may_set_address(
+    deal: Deal, viewer: int | None, payouts: list[DealPayout] | tuple[DealPayout, ...]
+) -> bool:
+    """The seller while the deal is open (or its payout has not started); the buyer while money of theirs
+    waits to go back. Never once a payout of that side is on its way."""
+    role = role_of(deal, viewer)
+    if role is None or deal.gateway != GATEWAY:
+        return False
+    mine = [p for p in payouts if p.recipient_id == viewer]
+    if any(p.status in ("sending", "unknown") for p in mine):
+        return False
+    if any(p.status in WAITING for p in mine):
+        return True
+    return role == "seller" and deal.status in OPEN
+
+
+def _address_line(t: Translator, deal: Deal, viewer: int | None) -> str | None:
+    role = role_of(deal, viewer)
+    if role is None or deal.gateway != GATEWAY:
+        return None
+    address = deal.seller_address if role == "seller" else deal.buyer_address
+    if address:
+        return t(f"g.card.address_{role}", address=address)
+    return t("g.card.no_address") if role == "seller" and deal.status in OPEN else None
+
+
+def _payout_line(t: Translator, payout: DealPayout) -> str:
+    role = t(f"g.to.{payout.purpose}")
+    value = money.show(payout.amount_cents)
+    if payout.status in ("done", "manual"):
+        tx = t("g.card.tx", url=wallets.tx_url(payout.txid)) if payout.txid else h(payout.manual_ref or "")
+        return t("g.card.payout_sent", role=role, value=value, tx=tx)
+    if payout.status == "no_address":
+        return t("g.card.payout_address", role=role, value=value)
+    return t("g.card.payout_wait", role=role, value=value)
 
 
 def _party_line(t: Translator, deal: Deal, role: str, users: dict[int, User]) -> str:
@@ -183,14 +223,11 @@ def card_text(
         )
     if deal.verdict_note:
         lines.append(t("g.card.verdict", note=h(deal.verdict_note)))
+    address = _address_line(t, deal, viewer)
+    if address:
+        lines.append(address)
     for payout in payouts:
-        lines.append(
-            t(
-                f"g.card.payout_{'sent' if payout.status in ('done', 'manual') else 'wait'}",
-                role=t(f"g.to.{payout.purpose}"),
-                value=money.show(payout.amount_cents),
-            )
-        )
+        lines.append(_payout_line(t, payout))
     return "\n".join(lines)
 
 
@@ -202,7 +239,9 @@ def chat_link(deal: Deal, viewer: int | None) -> str | None:
     return (deal.data or {}).get("invites", {}).get(role)
 
 
-def card_keyboard(t: Translator, deal: Deal, viewer: int | None) -> InlineKeyboardMarkup:
+def card_keyboard(
+    t: Translator, deal: Deal, viewer: int | None, payouts: list[DealPayout] | tuple[DealPayout, ...] = ()
+) -> InlineKeyboardMarkup:
     """Only what this viewer may do in this state; every press is checked again by the deal itself."""
     builder = InlineKeyboardBuilder()
     role = role_of(deal, viewer)
@@ -245,6 +284,8 @@ def card_keyboard(t: Translator, deal: Deal, viewer: int | None) -> InlineKeyboa
         else:
             builder.button(text=t("g.btn.agree_cancel"), callback_data=f"g:ac:{n}:{v}")
             builder.button(text=t("g.btn.decline_cancel"), callback_data=f"g:nc:{n}")
+    if may_set_address(deal, viewer, payouts):
+        builder.button(text=t("g.btn.address"), callback_data=f"g:addr:{n}")
     builder.button(text=t("g.btn.refresh"), callback_data=f"g:d:{n}")
     builder.button(text=t("g.btn.list"), callback_data="g:list")
     builder.adjust(1)
@@ -278,21 +319,20 @@ def invitation_text(t: Translator, deal: Deal, users: dict[int, User], rep: Repu
 
 def preview_text(t: Translator, deal: Deal, users: dict[int, User]) -> str:
     """The wizard's last step: the deal exactly as the other side will see it, and the rules."""
-    return "\n".join(
-        [
-            t("g.w.preview"),
-            "",
-            f"<b>{h(deal.title)}</b>",
-            f"<blockquote expandable>{h(deal.terms)}</blockquote>",
-            _party_line(t, deal, "buyer", users),
-            _party_line(t, deal, "seller", users),
-            "",
-            t("g.card.money", payer=t(f"g.payer.{deal.fee_payer}"), **amount_params(deal)),
-            t("g.card.days", days=deal.delivery_days),
-            "",
-            rules(t, deal),
-        ]
-    )
+    lines = [
+        t("g.w.preview"),
+        "",
+        f"<b>{h(deal.title)}</b>",
+        f"<blockquote expandable>{h(deal.terms)}</blockquote>",
+        _party_line(t, deal, "buyer", users),
+        _party_line(t, deal, "seller", users),
+        "",
+        t("g.card.money", payer=t(f"g.payer.{deal.fee_payer}"), **amount_params(deal)),
+        t("g.card.days", days=deal.delivery_days),
+    ]
+    if deal.seller_address:  # the creator's own: the other side does not see it
+        lines.append(t("g.card.address_seller", address=deal.seller_address))
+    return "\n".join([*lines, "", rules(t, deal)])
 
 
 def invitation_keyboard(t: Translator, deal: Deal) -> InlineKeyboardMarkup:

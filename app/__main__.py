@@ -41,7 +41,8 @@ def main(argv: list[str]) -> int:
             for secret in (
                 config.bot_token,
                 config.cryptopay_token,
-                config.escrow_cryptopay_token,
+                config.escrow_apirone_account,
+                config.escrow_apirone_transfer_key,
                 config.backup_passphrase,
             )
             if secret is not None

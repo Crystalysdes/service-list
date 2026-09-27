@@ -311,3 +311,5 @@ def test_parsing_what_the_sdk_shows():
         {"id": 7, "type": "receipt", "amount": "5", "txs": [], "address": SELLER, "is_confirmed": "yes"}
     )
     assert item.item_id == "7" and item.addresses == {SELLER.lower()} and item.confirmed is None
+    txid = "0x" + "ab" * 32  # a transaction id is not an address, though it starts like one
+    assert HistoryItem.from_api({"id": 8, "txs": [txid], "note": f"sent {txid}"}).addresses == set()

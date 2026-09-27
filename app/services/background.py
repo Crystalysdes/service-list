@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.context import AppContext
@@ -20,16 +21,20 @@ async def start_background(ctx: AppContext) -> None:
     else:
         log.warning("CRYPTOPAY_TOKEN is not set: payments are disabled")
     config = ctx.config
-    escrow_token = config.escrow_cryptopay_token.get_secret_value() if config.escrow_cryptopay_token else ""
-    if escrow_token:
-        from app.services.cryptopay import CryptoPayClient
+    account = (
+        config.escrow_apirone_account.get_secret_value().strip() if config.escrow_apirone_account else ""
+    )
+    key = (
+        config.escrow_apirone_transfer_key.get_secret_value().strip()
+        if config.escrow_apirone_transfer_key
+        else ""
+    )
+    if account and key:
+        from app.services.apirone import ApironeClient
 
-        testnet = (
-            config.cryptopay_testnet
-            if config.escrow_cryptopay_testnet is None
-            else config.escrow_cryptopay_testnet
-        )
-        ctx.services["escrow_pay"] = CryptoPayClient(escrow_token, testnet=testnet)
+        ctx.services["escrow_pay"] = ApironeClient(account, key)
+    elif account or key:
+        log.warning("the garant needs both ESCROW_APIRONE_ACCOUNT and ESCROW_APIRONE_TRANSFER_KEY")
 
     from app.services.linkcheck import LinkChecker
 
@@ -48,6 +53,12 @@ async def stop_background(ctx: AppContext) -> None:
     scheduler = ctx.services.get("scheduler")
     if scheduler is not None:
         scheduler.shutdown(wait=False)
+    lock = ctx.services.get("escrow_payout_lock")
+    if lock is not None:  # a transfer on its way gets its answer before the bot stops (docker allows 60 s)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=50)
+        except TimeoutError:
+            log.warning("stopping while a garant transfer is still waiting for Apirone")
     engine = ctx.services.get("sync")
     if engine is not None:
         await engine.stop()

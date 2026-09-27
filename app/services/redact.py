@@ -1,8 +1,9 @@
 """Keeping tokens out of logs, the database and staff screens.
 
 aiohttp puts the whole request into some errors: a failed file download carries the URL with the bot token
-(``/file/bot<token>/…``), a failed Crypto Pay call carries its headers with the API token. What the bot
-stores or shows about an error is therefore its kind and status only, and every log line is cleaned.
+(``/file/bot<token>/…``), a failed Crypto Pay call carries its headers with the API token, a failed Apirone
+call its URL with the account. What the bot stores or shows about an error is therefore its kind and status
+only, and every log line is cleaned.
 """
 
 from __future__ import annotations
@@ -27,8 +28,12 @@ def describe(exc: BaseException) -> str:
     import aiohttp
     from aiogram.exceptions import TelegramAPIError
 
+    from app.services.apirone import ApironeError
     from app.services.cryptopay import CryptoPayError
 
+    if isinstance(exc, ApironeError):  # its message never holds the transfer key (see apirone._clean)
+        status = f" (HTTP {exc.status})" if exc.status else ""
+        return redact(f"Apirone: {exc.message}{status}")[:300]
     if isinstance(exc, aiohttp.ClientResponseError):
         return f"{type(exc).__name__} (HTTP {exc.status})"
     if isinstance(exc, aiohttp.ClientError):

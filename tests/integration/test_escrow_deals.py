@@ -7,18 +7,28 @@ import itertools
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.db.base import Base, utcnow
-from app.db.models import BlacklistEntry, Deal, DealChat, DealEvent, DealInvoice, DealPayout, User
+from app.db.models import (
+    BlacklistEntry,
+    Deal,
+    DealChat,
+    DealEvent,
+    DealInvoice,
+    DealPayout,
+    DealReceipt,
+    User,
+)
 from app.services.backup import make_backup, restore_archive
-from app.services.escrow import deals
-from app.services.escrow.deals import DealError, Draft
+from app.services.escrow import deals, money
+from app.services.escrow.deals import DealError, Draft, Seen
 from app.services.settings import Escrow, EscrowRuntime, get_settings, update_settings
 from tests.conftest import OWNER_ID
 
 BUYER, SELLER, STRANGER, MOD, ADMIN = 7101, 7102, 7103, 7104, 7105
 _invoice_ids = itertools.count(90_000)
+_txids = itertools.count(1)
 
 
 async def _setup(db, **settings):
@@ -43,27 +53,37 @@ def _draft(**kw) -> Draft:
     return Draft(**fields)
 
 
-async def _invoice(db, deal: Deal, amount: int | None = None) -> int:
+async def _invoice(db, deal: Deal) -> int:
+    """The deal's Apirone invoice (one per deal)."""
     async with db.session() as s:
+        found = await s.scalar(select(DealInvoice.id).where(DealInvoice.deal_id == deal.id))
+        if found is not None:
+            return found
+        number = next(_invoice_ids)
         row = DealInvoice(
             deal_id=deal.id,
-            provider_invoice_id=next(_invoice_ids),
-            payload=f"esc:{deal.code}:0",
-            pay_url="https://t.me/CryptoBot?start=IV1",
-            amount_cents=amount or deal.buyer_pays_cents,
+            provider_invoice_id=f"inv{number}",
+            payload=f"esc:{deal.code}",
+            pay_url=f"https://apirone.com/invoice?id=inv{number}",
+            amount_cents=deal.buyer_pays_cents,
             status="active",
+            address=f"0x{number:040x}",
+            remote_status="created",
         )
         s.add(row)
         await s.commit()
         return row.id
 
 
-async def _paid(db, deal: Deal, **kw) -> deals.Funding:
-    invoice = await _invoice(db, deal, kw.pop("amount", None))
-    paid = kw.pop("paid", deal.buyer_pays_cents)
-    return await deals.fund(
-        db, invoice, asset=kw.pop("asset", "USDT"), paid_cents=paid, received_cents=paid, fee_cents=0, **kw
-    )
+def _seen(cents: int, *, confirmed: bool = True, source: str = "invoice", txid: str | None = None) -> Seen:
+    return Seen(txid or f"0x{next(_txids):064x}", money.to_minor(cents), confirmed, source)
+
+
+async def _paid(db, deal: Deal, paid: int | None = None, *, status: str = "completed", **kw) -> deals.Funding:
+    """Apirone says the deal's invoice got ``paid`` cents (all of it by default) and is ``status``."""
+    invoice = await _invoice(db, deal)
+    seen = [_seen(deal.buyer_pays_cents if paid is None else paid)]
+    return await deals.take_payments(db, invoice, remote_status=status, seen=seen, **kw)
 
 
 async def _funded(db, **kw) -> Deal:
@@ -253,59 +273,83 @@ async def test_settings_are_frozen_into_the_deal(db):
 
 
 async def test_money_that_does_not_fit_the_deal_goes_back(db):
-    await _setup(db)
+    await _setup(db, max_open_per_user=10, max_unpaid_per_user=10)
     deal = await _funded(db)
-    second = await _paid(db, deal)  # a second invoice paid after the deal was already funded
-    assert second.outcome == "extra" and second.payout is not None and second.deal.needs_attention
-    assert (second.payout.recipient_id, second.payout.amount_cents, second.payout.purpose) == (
-        BUYER,
-        10_500,
-        "extra",
+    invoice = await _invoice(db, deal)
+    late = await deals.take_payments(db, invoice, seen=[_seen(10_500, source="history")])  # paid twice
+    assert late.outcome == "mismatch" and late.deal.needs_attention  # the same sum: maybe the same payment
+    async with db.session() as s:
+        purposes = [
+            r.purpose for r in (await s.execute(select(DealReceipt).order_by(DealReceipt.id))).scalars()
+        ]
+    assert purposes == ["deal", "review"] and not await _payouts(db, deal.id)
+    second = await deals.take_payments(db, invoice, seen=[_seen(3_000, source="history")])
+    [payout] = second.payouts
+    assert second.outcome == "refund" and second.deal.status == "funded"  # the deal itself is untouched
+    assert (payout.recipient_id, payout.amount_cents, payout.purpose) == (BUYER, 3_000, "extra")
+    assert payout.spend_id.startswith(f"esc-{deal.code}-r")
+    unconfirmed = await deals.take_payments(
+        db, invoice, seen=[_seen(4_000, confirmed=False, source="history")]
     )
-    assert second.payout.spend_id.startswith(f"esc-{deal.code}-x")
-    assert second.deal.status == "funded"  # the deal itself is untouched
+    assert unconfirmed.outcome == "none" and len(await _payouts(db, deal.id)) == 1  # not before it is sure
+    tiny = await deals.take_payments(db, invoice, seen=[_seen(50, source="history")])
+    [small] = tiny.payouts
+    assert small.status == "failed" and small.last_error == "below_min"  # the network fee would eat it
 
     other = await deals.create_deal(db, BUYER, "buyer_b", _draft(amount_cents=2_000))
     other = await deals.accept_deal(db, other.code, SELLER, "seller_s", other.terms_hash)
-    wrong = await _paid(db, other, paid=1_000)  # less than the invoice
-    assert wrong.outcome == "mismatch" and wrong.deal.status == "awaiting_payment"
-    assert wrong.payout is not None and wrong.payout.amount_cents == 1_000
+    part = await _paid(db, other, 1_000, status="partpaid")
+    assert (part.outcome, part.missing) == ("partial", money.to_minor(1_100))
+    short = await _paid(db, other, 500)  # "completed" with less than the invoice: Apirone and we disagree
+    assert short.outcome == "mismatch" and short.deal.status == "awaiting_payment" and not short.payouts
+    over = await _paid(db, other, 1_000, overpaid=True)  # 2 500 of 2 100
+    assert over.outcome == "funded" and [p.amount_cents for p in over.payouts] == [400]
 
-    tiny = await _paid(db, other, amount=50, paid=50)  # an invoice that is not the deal's price
-    assert (
-        tiny.outcome == "extra" and tiny.payout.status == "failed" and tiny.payout.last_error == "below_min"
-    )
+    third = await deals.create_deal(db, BUYER, "buyer_b", _draft(amount_cents=3_000))
+    third = await deals.accept_deal(db, third.code, SELLER, "seller_s", third.terms_hash)
+    quiet = await _paid(db, third, 3_500)  # more than asked, but the invoice never said "overpaid"
+    assert quiet.outcome == "funded" and not quiet.payouts and quiet.deal.needs_attention
 
-    invoice = await _invoice(db, other)
+    fourth = await deals.create_deal(db, BUYER, "buyer_b", _draft(amount_cents=4_000))
+    fourth = await deals.accept_deal(db, fourth.code, SELLER, "seller_s", fourth.terms_hash)
+    invoice = await _invoice(db, fourth)
+    same = _seen(4_200)
     first, dup = await asyncio.gather(
-        *(
-            deals.fund(db, invoice, asset="USDT", paid_cents=2_100, received_cents=2_100, fee_cents=0)
-            for _ in range(2)
-        )
+        *(deals.take_payments(db, invoice, remote_status="completed", seen=[same]) for _ in range(2))
     )
-    assert sorted([first.outcome, dup.outcome]) == ["duplicate", "funded"]
+    assert sorted([first.outcome, dup.outcome]) == ["funded", "none"]
+    async with db.session() as s:
+        assert (
+            await s.scalar(select(func.count()).select_from(DealReceipt).where(DealReceipt.txid == same.txid))
+            == 1
+        )
 
 
-async def test_cancel_before_payment_needs_the_invoice_gone(db):
+async def test_cancel_before_payment_reads_the_invoice_first(db):
     await _setup(db)
     deal = await deals.create_deal(db, BUYER, "buyer_b", _draft())
     deal = await deals.accept_deal(db, deal.code, SELLER, "seller_s", deal.terms_hash)
     invoice = await _invoice(db, deal)
+    for remote, key in ((None, "provider"), ("paid", "confirming"), ("overpaid", "confirming")):
+        with pytest.raises(DealError) as err:  # unread, or paid and being confirmed: the deal stays
+            await deals.cancel_unpaid(db, deal.id, BUYER, remote_status=remote)
+        assert err.value.key == key
     with pytest.raises(DealError) as err:
-        await deals.cancel_unpaid(db, deal.id, BUYER)
-    assert err.value.key == "invoice_active"
+        await deals.cancel_unpaid(db, deal.id, BUYER, remote_status="completed")
+    assert err.value.key == "already_paid"
     with pytest.raises(DealError) as err:
-        await deals.cancel_unpaid(db, deal.id, STRANGER)
+        await deals.cancel_unpaid(db, deal.id, STRANGER, remote_status="created")
     assert err.value.key == "not_party"
-    assert await deals.expire_unpaid(db, deal.id, now=utcnow() + timedelta(days=5)) is None
-    async with db.session() as s:
-        (await s.get(DealInvoice, invoice)).status = "deleted"
-        await s.commit()
-    assert await deals.expire_unpaid(db, deal.id) is None  # not due yet
-    deal = await deals.cancel_unpaid(db, deal.id, SELLER)
+    later = utcnow() + timedelta(days=5)
+    assert await deals.expire_unpaid(db, deal.id, now=later) is None  # its invoice was not read
+    assert await deals.expire_unpaid(db, deal.id, remote_status="created") is None  # not due yet
+    deal = await deals.cancel_unpaid(db, deal.id, SELLER, remote_status="partpaid")
     assert deal.status == "cancelled" and deal.closed_at is not None
-    late = await _paid(db, deal)  # money that still arrives goes back
-    assert late.outcome == "extra" and late.payout.amount_cents == deal.buyer_pays_cents
+    async with db.session() as s:
+        assert (await s.get(DealInvoice, invoice)).status == "closed"
+    late = await _paid(db, deal, status="partpaid")  # money that still arrives goes back
+    [refund] = late.payouts
+    assert late.outcome == "refund" and refund.amount_cents == deal.buyer_pays_cents
 
     pending = await deals.create_deal(db, BUYER, "buyer_b", _draft())
     expired = await deals.expire_unpaid(db, pending.id, now=utcnow() + timedelta(days=2))
@@ -498,7 +542,7 @@ async def test_backup_keeps_deals_and_pauses_payouts(db, ctx):
     await _setup(db)
     deal = await _funded(db)
     deal = await deals.release(db, deal.id, BUYER)
-    await _paid(db, deal)  # an extra payment with its refund
+    await deals.take_payments(db, await _invoice(db, deal), seen=[_seen(2_000, source="history")])  # + refund
     async with db.session() as s:
         s.add(
             DealChat(

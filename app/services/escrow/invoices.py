@@ -1,104 +1,75 @@
-"""Deal invoices at Crypto Pay (the garant's own app, USDT only).
+"""Deal invoices at Apirone (USDT BEP20).
 
-A deal has at most one live invoice. It lives as long as the deal's payment time and is polled until Crypto
-Pay says it is paid or expired. Before a deal is called off the invoice is deleted at Crypto Pay first: an
-invoice that turns out to be paid funds the deal instead. Money that does not fit the deal goes back to the
-buyer (see :func:`deals.fund`).
+A deal gets one invoice, made at the first "Оплатить" for the rest of the payment time: an address of its
+own and an amount. Money sent to that address belongs to the deal whenever it comes (see
+:func:`deals.take_payments`): the invoice is polled while the deal waits for it, and the account's history
+brings in whatever arrives later. An invoice cannot be deleted at Apirone: before an unpaid deal is called
+off the invoice's status is read first, and one paid meanwhile keeps the deal instead.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select, text
 
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Deal, DealInvoice, User
-from app.services.cryptopay import PROVIDER_ERRORS, CryptoInvoice
+from app.db.models import Deal, DealInvoice, DealReceipt
+from app.services.apirone import PROVIDER_ERRORS, ApironeInvoice
 from app.services.escrow import deals, money
-from app.services.escrow.deals import DealError, Funding
+from app.services.escrow.deals import UNPAID_REMOTE, DealError, Funding, Seen
+from app.services.escrow.ledger import SLACK, addresses_of, movements, provider
+from app.services.evm import short
+from app.services.redact import describe
 
 log = logging.getLogger(__name__)
 
+__all__ = ["provider"]
+
 MIN_TTL = 300  # seconds an invoice lives at least
-FRESH = timedelta(minutes=2)  # an invoice this close to expiry is replaced instead of shown
+INVOICE_LOCK_NS = deals.LOCK_NS + 1  # one invoice is made for a deal at a time
+_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 
 
-def provider(ctx: AppContext) -> Any:
-    return ctx.get("escrow_pay")
+def seen_of(remote: ApironeInvoice) -> list[Seen]:
+    """The invoice's own record of the money: all of it confirmed once the invoice is completed."""
+    confirmed = remote.status == "completed"
+    return [Seen(p.txid, p.amount, confirmed, "invoice") for p in remote.payments]
 
 
-def paid_values(invoice: CryptoInvoice) -> tuple[str, int | None, int | None, int | None]:
-    """(asset, paid, Crypto Pay's fee, received) in cents from a paid invoice."""
-    raw = invoice.raw
-    asset = str(raw.get("paid_asset") or raw.get("asset") or "")
-    paid = money.from_api(raw.get("paid_amount") or raw.get("amount"))
-    fee_asset = raw.get("fee_asset")
-    fee = money.from_api(raw.get("fee_amount")) if fee_asset in (None, asset) else None
-    fee = fee or 0
-    received = paid - fee if paid is not None else None
-    return asset, paid, fee, received
+def was_overpaid(remote: ApironeInvoice) -> bool:
+    history = remote.raw.get("history") if isinstance(remote.raw, dict) else None
+    statuses = [entry.get("status") for entry in history or [] if isinstance(entry, dict)]
+    return remote.status == "overpaid" or "overpaid" in statuses
 
 
-async def take_payment(ctx: AppContext, row_id: int, invoice: CryptoInvoice) -> Funding:
-    asset, paid, fee, received = paid_values(invoice)
-    return await deals.fund(
-        ctx.db, row_id, asset=asset, paid_cents=paid, received_cents=received, fee_cents=fee, raw=invoice.raw
+async def take(ctx: AppContext, row_id: int, remote: ApironeInvoice) -> Funding:
+    return await deals.take_payments(
+        ctx.db, row_id, remote_status=remote.status, seen=seen_of(remote), overpaid=was_overpaid(remote)
     )
 
 
-async def _set_status(ctx: AppContext, row_id: int, status: str) -> None:
-    async with ctx.db.session() as session:
-        row = await session.get(DealInvoice, row_id)
-        if row is not None and row.status == "active":
-            row.status = status
-            await session.commit()
-
-
-@dataclass(frozen=True)
-class Dropped:
-    outcome: str  # gone (can no longer be paid) / paid (it was paid: the payment is taken) / error
-    funding: Funding | None = None
-
-
-async def drop_invoice(ctx: AppContext, row_id: int) -> Dropped:
-    """Make sure an invoice can no longer be paid before its deal is called off."""
-    pay = provider(ctx)
-    async with ctx.db.session() as session:
-        row = await session.get(DealInvoice, row_id)
-    if row is None or row.status != "active":
-        return Dropped("gone")
-    if pay is None:
-        return Dropped("error")
-    try:
-        deleted = await pay.delete_invoice(row.provider_invoice_id)
-    except PROVIDER_ERRORS:
-        log.warning("deleteInvoice %s failed", row.provider_invoice_id, exc_info=True)
-        deleted = False
-    if deleted:
-        await _set_status(ctx, row.id, "deleted")
-        return Dropped("gone")
-    try:  # refused: it may have been paid or have expired
-        remote = await pay.get_invoices([row.provider_invoice_id])
-    except PROVIDER_ERRORS:
-        return Dropped("error")
-    found = next((i for i in remote if i.invoice_id == row.provider_invoice_id), None)
-    if found is not None and found.status == "paid":
-        return Dropped("paid", await take_payment(ctx, row.id, found))
-    if found is None or found.status == "expired":
-        await _set_status(ctx, row.id, "expired")
-        return Dropped("gone")
-    return Dropped("error")
+async def deal_invoice(session: Any, deal_id: int) -> DealInvoice | None:
+    """The deal's Apirone invoice (one per deal), whatever became of it."""
+    return (
+        await session.execute(
+            select(DealInvoice)
+            .where(DealInvoice.deal_id == deal_id, DealInvoice.address.is_not(None))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
 
 
 async def _active(session: Any, deal_id: int) -> DealInvoice | None:
     return (
         await session.execute(
-            select(DealInvoice).where(DealInvoice.deal_id == deal_id, DealInvoice.status == "active")
+            select(DealInvoice)
+            .where(DealInvoice.deal_id == deal_id, DealInvoice.status == "active")
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
 
@@ -106,101 +77,105 @@ async def _active(session: Any, deal_id: int) -> DealInvoice | None:
 async def invoice_for(
     ctx: AppContext, deal_id: int, by_user: int, *, now: datetime | None = None
 ) -> DealInvoice:
-    """The buyer's invoice for the deal: the live one, or a new one for the rest of the payment time."""
+    """The buyer's invoice for the deal: the one it has, or a new one for the rest of the payment time.
+    Made one at a time per deal: two presses never leave an address nobody watches."""
     now = now or utcnow()
     pay = provider(ctx)
     if pay is None:
         raise DealError("pay_off")
     async with ctx.db.session() as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:ns, :key)"), {"ns": INVOICE_LOCK_NS, "key": deal_id}
+        )
         deal = await deals.get_deal(session, deal_id)
         if deal is None:
             raise DealError("not_found")
         if by_user != deal.buyer_id:
             raise DealError("not_buyer")
+        if deal.gateway != deals.GATEWAY:
+            raise DealError("pay_off")
         if deal.status != "awaiting_payment" or deal.pay_due_at is None or deal.pay_due_at <= now:
             raise DealError("state")
         await deals.refuse_barred_parties(session, deal, by_user)  # nobody pays a banned seller
-        current = await _active(session, deal.id)
-        buyer = await session.get(User, deal.buyer_id)
-        count = await session.scalar(
-            select(func.count()).select_from(DealInvoice).where(DealInvoice.deal_id == deal.id)
-        )
-    if current is not None:
-        if current.expires_at is None or current.expires_at > now + FRESH:
+        current = await deal_invoice(session, deal.id)
+        if current is not None:
+            if current.status != "active":
+                raise DealError("state")
             return current
-        dropped = await drop_invoice(ctx, current.id)
-        if dropped.outcome == "paid":
-            raise DealError("already_paid")
-        if dropped.outcome == "error":
-            raise DealError("provider")
-    ttl = max(MIN_TTL, int((deal.pay_due_at - now).total_seconds()))
-    who = f"@{buyer.username}" if buyer and buyer.username else (buyer.first_name if buyer else None) or "—"
-    description = f"Сделка #{deal.id} «{deal.title}»: оплата покупателем {who} (ID {deal.buyer_id})"
-    try:
-        created = await pay.create_crypto_invoice(
-            asset=money.ASSET,
-            amount=money.to_str(deal.buyer_pays_cents),
-            description=description,
-            payload=f"esc:{deal.code}:{int(count or 0) + 1}",
-            expires_in=ttl,
-            paid_btn_url=f"https://t.me/{ctx.bot_username}?start=garant" if ctx.bot_username else None,
-        )
-    except PROVIDER_ERRORS as exc:
-        log.warning("escrow createInvoice failed: %s", exc)
-        raise DealError("provider") from exc
-    async with ctx.db.session() as session:
-        locked = await deals.lock(session, deal.id)
-        existing = await _active(session, deal.id)
-        if locked is not None and locked.status == "awaiting_payment" and existing is None:
-            row = DealInvoice(
-                deal_id=deal.id,
-                provider_invoice_id=created.invoice_id,
-                payload=f"esc:{deal.code}:{int(count or 0) + 1}",
-                pay_url=created.pay_url,
-                amount_cents=deal.buyer_pays_cents,
-                status="active",
-                expires_at=now + timedelta(seconds=ttl),
-                raw=created.raw,
+        ttl = max(MIN_TTL, int((deal.pay_due_at - now).total_seconds()))
+        amount = money.to_minor(deal.buyer_pays_cents)
+        try:
+            created = await pay.create_invoice(amount, ttl, f"Service List · сделка #{deal.id}")
+        except PROVIDER_ERRORS as exc:
+            log.warning("escrow invoice for deal %s failed: %s", deal.id, describe(exc))
+            raise DealError("provider") from exc
+        if (
+            created.amount != amount
+            or not _ADDRESS_RE.match(created.address)
+            or created.currency not in ("", money.CURRENCY)
+        ):  # never shown to the buyer: an invoice for another sum, coin or address is not ours to use
+            log.error(
+                "escrow invoice %s does not match deal %s: %r", created.invoice_id, deal.id, created.raw
             )
-            session.add(row)
-            await session.commit()
-            return row
-    # another press made an invoice meanwhile, or the deal changed: this one must not stay payable
-    try:
-        await pay.delete_invoice(created.invoice_id)
-    except PROVIDER_ERRORS:
-        log.warning("cannot delete a spare deal invoice %s", created.invoice_id, exc_info=True)
-    if existing is not None:
-        return existing
-    raise DealError("state")
+            raise DealError("provider")
+        other = await session.scalar(
+            select(DealInvoice.deal_id).where(DealInvoice.address == created.address).limit(1)
+        )
+        if other is not None:  # money there could be either deal's: the garant stops taking payments
+            log.error("escrow invoice %s reuses the address of deal %s", created.invoice_id, other)
+            from app.services.escrow.notify import alert_owner
+
+            await alert_owner(
+                ctx,
+                f"⛔️ Apirone выдал для сделки #{deal.id} адрес, который уже был у сделки #{other}: "
+                "деньги на нём не разделить, поэтому бот не показывает такие счета. Напишите в поддержку "
+                "Apirone; пока это не решено, оплатить сделку нельзя.",
+                once=f"escrow_address_reuse:{created.address}",
+            )
+            raise DealError("provider")
+        locked = await deals.lock(session, deal.id)
+        if locked is None or locked.status != "awaiting_payment":
+            raise DealError("state")
+        row = DealInvoice(
+            deal_id=deal.id,
+            provider_invoice_id=created.invoice_id,
+            payload=f"esc:{deal.code}",
+            pay_url=created.invoice_url or None,
+            amount_cents=deal.buyer_pays_cents,
+            status="active",
+            address=created.address,
+            remote_status=created.status,
+            expires_at=created.expire or now + timedelta(seconds=ttl),
+            raw=created.raw,
+        )
+        session.add(row)
+        await session.commit()
+        return row
 
 
-async def poll(ctx: AppContext, *, now: datetime | None = None) -> list[Funding]:
-    """Ask Crypto Pay about every live deal invoice: take payments, mark the expired ones."""
-    now = now or utcnow()
+async def poll(ctx: AppContext) -> list[Funding]:
+    """Ask Apirone about every invoice a deal is waiting on."""
     pay = provider(ctx)
     if pay is None:
         return []
     async with ctx.db.session() as session:
         rows = list(
-            (await session.execute(select(DealInvoice).where(DealInvoice.status == "active"))).scalars()
+            (
+                await session.execute(
+                    select(DealInvoice).where(
+                        DealInvoice.status == "active", DealInvoice.address.is_not(None)
+                    )
+                )
+            ).scalars()
         )
-    if not rows:
-        return []
-    try:
-        remote = {i.invoice_id: i for i in await pay.get_invoices([r.provider_invoice_id for r in rows])}
-    except PROVIDER_ERRORS:
-        log.warning("escrow getInvoices failed", exc_info=True)
-        return []
     results = []
     for row in rows:
-        found = remote.get(row.provider_invoice_id)
-        if found is not None and found.status == "paid":
-            results.append(await take_payment(ctx, row.id, found))
-        elif (found is not None and found.status == "expired") or (
-            found is None and row.expires_at is not None and row.expires_at < now - timedelta(hours=1)
-        ):
-            await _set_status(ctx, row.id, "expired")
+        try:
+            remote = await pay.invoice(row.provider_invoice_id)
+        except PROVIDER_ERRORS as exc:
+            log.warning("escrow invoice %s: %s", row.provider_invoice_id, describe(exc))
+            continue
+        results.append(await take(ctx, row.id, remote))
     return results
 
 
@@ -209,23 +184,63 @@ async def check_now(ctx: AppContext, deal_id: int) -> Funding | None:
     pay = provider(ctx)
     async with ctx.db.session() as session:
         row = await _active(session, deal_id)
-    if pay is None or row is None:
+    if pay is None or row is None or row.address is None:
         return None
     try:
-        remote = await pay.get_invoices([row.provider_invoice_id])
+        remote = await pay.invoice(row.provider_invoice_id)
     except PROVIDER_ERRORS:
         return None
-    for found in remote:
-        if found.invoice_id == row.provider_invoice_id and found.status == "paid":
-            return await take_payment(ctx, row.id, found)
-    return None
+    return await take(ctx, row.id, remote)
+
+
+async def _read_before_closing(ctx: AppContext, row: DealInvoice) -> str:
+    """The invoice's status right before its deal ends: what it holds is written down first, and one that
+    turns out paid funds the deal (``DealError("already_paid")``, the sides are told)."""
+    pay = provider(ctx)
+    if pay is None:
+        raise DealError("provider")
+    try:
+        remote = await pay.invoice(row.provider_invoice_id)
+    except PROVIDER_ERRORS as exc:
+        raise DealError("provider") from exc
+    funding = await take(ctx, row.id, remote)
+    if funding.outcome == "funded":
+        from app.services.escrow.sweep import on_funding
+
+        await on_funding(ctx, funding)
+        raise DealError("already_paid")
+    return remote.status
+
+
+async def _refund_after(ctx: AppContext, row: DealInvoice | None) -> None:
+    """Once the deal has ended: what reached its address and is confirmed goes back to the buyer. The
+    invoice does not say which of its payments are confirmed: the account's history does (read now when
+    there is money waiting; otherwise the next reconciliation brings it)."""
+    if row is None or row.address is None:
+        return
+    from app.services.escrow.sweep import on_funding
+
+    async with ctx.db.session() as session:
+        waiting = await session.scalar(
+            select(DealReceipt.id)
+            .where(DealReceipt.invoice_id == row.id, DealReceipt.purpose.is_(None))
+            .limit(1)
+        )
+    fundings = []
+    if waiting is not None:
+        try:
+            fundings, _strangers = await scan_receipts(ctx, row.created_at - SLACK)
+        except PROVIDER_ERRORS as exc:
+            log.warning("escrow history for a refund: %s", describe(exc))
+    fundings.append(await deals.take_payments(ctx.db, row.id))
+    for funding in fundings:
+        if funding.payouts:
+            await on_funding(ctx, funding)
 
 
 async def cancel(ctx: AppContext, deal_id: int, by_user: int | None, *, staff: bool = False) -> Deal:
-    """Call off an unpaid deal: its invoice goes first; one paid meanwhile funds the deal instead.
-
-    Who may call it off is checked before anything is touched: a stranger's button (a forged one included)
-    must not delete somebody else's invoice."""
+    """Call off an unpaid deal. Who may do it is checked before anything is asked of Apirone; the invoice is
+    read first (paid meanwhile: the deal goes on), and money it got goes back to the buyer."""
     async with ctx.db.session() as session:
         deal = await session.get(Deal, deal_id)
         if deal is None:
@@ -235,17 +250,17 @@ async def cancel(ctx: AppContext, deal_id: int, by_user: int | None, *, staff: b
         if deal.status not in deals.UNPAID:
             raise DealError("state")
         row = await _active(session, deal_id)
-    if row is not None:
-        dropped = await drop_invoice(ctx, row.id)
-        if dropped.outcome == "paid":
-            raise DealError("already_paid")
-        if dropped.outcome == "error":
-            raise DealError("provider")
-    return await deals.cancel_unpaid(ctx.db, deal_id, by_user, staff=staff)
+    remote_status = None
+    if row is not None and row.address is not None:
+        remote_status = await _read_before_closing(ctx, row)
+    deal = await deals.cancel_unpaid(ctx.db, deal_id, by_user, staff=staff, remote_status=remote_status)
+    await _refund_after(ctx, row)
+    return deal
 
 
 async def expire_due(ctx: AppContext, *, now: datetime | None = None) -> list[Deal]:
-    """Unpaid deals whose invitation or payment time ran out (their invoices are dropped first)."""
+    """Unpaid deals whose invitation or payment time ran out. One whose invoice is paid (even unconfirmed)
+    waits for its money instead; a deal of Crypto Pay with a live invoice waits for staff."""
     now = now or utcnow()
     async with ctx.db.session() as session:
         due = list(
@@ -262,9 +277,64 @@ async def expire_due(ctx: AppContext, *, now: datetime | None = None) -> list[De
     for deal_id in due:
         async with ctx.db.session() as session:
             row = await _active(session, deal_id)
-        if row is not None and (await drop_invoice(ctx, row.id)).outcome != "gone":
-            continue  # paid after all, or Crypto Pay did not answer: the next sweep looks again
-        deal = await deals.expire_unpaid(ctx.db, deal_id, now=now)
+        remote_status = None
+        if row is not None and row.address is None:
+            continue  # a Crypto Pay invoice the bot no longer watches: staff call the deal off
+        if row is not None:
+            try:
+                remote_status = await _read_before_closing(ctx, row)
+            except DealError:
+                continue  # paid after all (the sides are told), or Apirone did not answer: the next sweep
+            if remote_status not in UNPAID_REMOTE:
+                continue  # paid, the network is confirming it
+        deal = await deals.expire_unpaid(ctx.db, deal_id, remote_status=remote_status, now=now)
         if deal is not None:
             expired.append(deal)
+            await _refund_after(ctx, row)
     return expired
+
+
+async def scan_receipts(ctx: AppContext, since: datetime) -> tuple[list[Funding], list[str]]:
+    """Money the account's history shows arriving since ``since``: each payment to an invoice's address is
+    taken to its deal (a late one goes back to the buyer); a payment to an address that is no invoice's is
+    a problem for the owner. Raises what Apirone raises."""
+    pay = provider(ctx)
+    items = await movements(pay, "receipt", since)
+    if not items:
+        return [], []
+    txids = {deals.txid_key(t) for item in items for t in item.txids}
+    async with ctx.db.session() as session:
+        known = {
+            (row.txid, row.confirmed)
+            for row in (
+                await session.execute(select(DealReceipt).where(DealReceipt.txid.in_(txids)))
+            ).scalars()
+        }
+    known_txids = {txid for txid, _ in known}
+    results: list[Funding] = []
+    problems: list[str] = []
+    cache: dict[str, set[str]] = {}
+    for item in items:
+        keys = [deals.txid_key(t) for t in item.txids]
+        if not keys or item.amount is None:
+            continue
+        confirmed = bool(item.confirmed)
+        if keys[0] in known_txids and ((keys[0], True) in known or not confirmed):
+            continue  # written down already, with nothing new to add
+        addresses = await addresses_of(pay, item, cache)
+        async with ctx.db.session() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(DealInvoice).where(DealInvoice.address.in_(addresses or {"-"}))
+                    )
+                ).scalars()
+            )
+        if len(rows) != 1:  # nobody's, or the item names the addresses of several invoices
+            where = ", ".join(short(a) for a in sorted(addresses)) or "?"
+            whose = "это не адрес счёта сделки" if not rows else "неясно, какой из сделок оно"
+            problems.append(f"поступление {money.show_minor(item.amount)} на {where} — {whose}")
+            continue
+        seen = Seen(keys[0], item.amount, confirmed, "history", item.raw)
+        results.append(await deals.take_payments(ctx.db, rows[0].id, seen=[seen]))
+    return results, problems

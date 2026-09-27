@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from aiogram.types import InlineKeyboardMarkup, Message
+from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot.i18n import Translator, h
@@ -16,11 +16,21 @@ from app.services.notify import claim_notification, notify_staff, notify_user, r
 from app.services.timefmt import fmt_dt
 
 log = logging.getLogger(__name__)
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
 def deal_button(t: Translator, deal_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text=t("g.open_deal", n=deal_id), callback_data=f"g:d:{deal_id}")
+    return builder.as_markup()
+
+
+def address_buttons(t: Translator, deal_id: int) -> InlineKeyboardMarkup:
+    """Under a request for a payout address: give it, or open the deal."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text=t("g.btn.address"), callback_data=f"g:addr:{deal_id}", style="primary")
+    builder.button(text=t("g.open_deal", n=deal_id), callback_data=f"g:d:{deal_id}")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -47,13 +57,17 @@ async def translator_for(ctx: AppContext, user_id: int) -> Translator:
     return Translator(user.lang if user else None)
 
 
-async def tell(ctx: AppContext, user_id: int | None, deal: Deal, key: str, **extra: Any) -> bool:
-    """One side gets ``g.ev.<key>`` with the deal's details and a button to its card."""
+async def tell(
+    ctx: AppContext, user_id: int | None, deal: Deal, key: str, *, ask_address: bool = False, **extra: Any
+) -> bool:
+    """One side gets ``g.ev.<key>`` with the deal's details and a button to its card (``ask_address``: and
+    one to give the address its money goes to)."""
     if not user_id:
         return False
     t = await translator_for(ctx, user_id)
-    text = t(f"g.ev.{key}", **params(ctx, deal), **extra)
-    return await notify_user(ctx, user_id, text, reply_markup=deal_button(t, deal.id))
+    text = t(f"g.ev.{key}", **{**params(ctx, deal), **extra})  # what the event says wins over the deal's
+    markup = address_buttons(t, deal.id) if ask_address else deal_button(t, deal.id)
+    return await notify_user(ctx, user_id, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
 
 
 async def tell_both(ctx: AppContext, deal: Deal, key: str, **extra: Any) -> None:
@@ -71,10 +85,16 @@ async def tell_once(
     return first and await tell(ctx, user_id, deal, key, **extra)
 
 
-async def alert_owner(ctx: AppContext, text: str) -> None:
-    """Money problems go straight to the owners' private chats."""
+async def alert_owner(ctx: AppContext, text: str, *, once: str | None = None) -> None:
+    """Money problems go straight to the owners' private chats (``once``: a key that is told only once)."""
+    if once is not None:
+        async with ctx.db.session() as session:
+            first = await claim_notification(session, once)
+            await session.commit()
+        if not first:
+            return
     for owner_id in ctx.config.owner_ids:
-        await notify_user(ctx, owner_id, "🛡 <b>Гарант</b>\n" + text)
+        await notify_user(ctx, owner_id, "🛡 <b>Гарант</b>\n" + text, link_preview_options=NO_PREVIEW)
 
 
 async def to_staff(ctx: AppContext, text: str, reply_markup: Any = None) -> list[Message]:

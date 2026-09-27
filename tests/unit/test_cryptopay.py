@@ -118,36 +118,6 @@ async def test_client_requests(fake_api):
     await bad.close()
 
 
-async def test_escrow_requests(fake_api):
-    from app.services.cryptopay import outcome_unknown
-
-    base, seen = fake_api
-    client = CryptoPayClient("good")
-    client.base = base
-    invoice = await client.create_crypto_invoice(
-        asset="USDT",
-        amount="105.00",
-        description="Сделка #1",
-        payload="esc:abc:1",
-        expires_in=3600,
-        paid_btn_url=None,
-    )
-    assert invoice.invoice_id == 77
-    params = seen[-1]["params"]
-    assert params["currency_type"] == "crypto" and params["asset"] == "USDT" and params["amount"] == "105.00"
-    assert "fiat" not in params and "accepted_assets" not in params
-    transfer = await client.transfer(user_id=5, asset="USDT", amount="95.00", spend_id="esc-abc-seller")
-    assert transfer.transfer_id == 9 and seen[-1]["params"]["spend_id"] == "esc-abc-seller"
-    found = await client.get_transfers(spend_id="esc-abc-seller")
-    assert found[0].amount == "95.00" and found[0].user_id == 5
-    assert await client.get_balance() == {"USDT": ("120.5", "0")}
-    with pytest.raises(CryptoPayError) as err:  # a proxy's error page: maybe sent, check before retrying
-        await client.transfer(user_id=5, asset="USDT", amount="1.00", spend_id="proxy-page")
-    assert outcome_unknown(err.value)
-    assert outcome_unknown(TimeoutError()) and not outcome_unknown(CryptoPayError("USER_NOT_FOUND"))
-    await client.close()
-
-
 @pytest.fixture
 async def garbled_api(unused_tcp_port):
     """An API endpoint that answers whatever the test puts in ``replies[method]``: (HTTP status, body)."""
@@ -170,16 +140,15 @@ async def garbled_api(unused_tcp_port):
 @pytest.mark.parametrize(
     ("method", "status", "body"),
     [
-        ("getTransfers", 200, ""),  # an empty body
-        ("getTransfers", 502, "<html>Bad Gateway</html>"),  # a proxy's page
-        ("getTransfers", 200, "[]"),  # JSON of another shape
-        ("getTransfers", 200, '{"ok": true}'),  # no result
-        ("getTransfers", 200, '{"ok": false, "error": "METHOD_DISABLED"}'),  # an error without a name
-        ("getTransfers", 200, '{"ok": true, "result": {"items": [{"spend_id": "esc-x"}]}}'),  # no transfer_id
-        ("getTransfers", 200, '{"ok": true, "result": {"items": null}}'),
-        ("getBalance", 200, '{"ok": true, "result": [{"available": "1"}]}'),  # no currency
-        ("getInvoices", 200, '{"ok": true, "result": "paid"}'),
-        ("transfer", 200, '{"ok": true, "result": {"status": "completed"}}'),  # sent? nobody knows
+        ("getInvoices", 200, ""),  # an empty body
+        ("getInvoices", 502, "<html>Bad Gateway</html>"),  # a proxy's page
+        ("getInvoices", 200, "[]"),  # JSON of another shape
+        ("getInvoices", 200, '{"ok": true}'),  # no result
+        ("getInvoices", 200, '{"ok": false, "error": "METHOD_DISABLED"}'),  # an error without a name
+        ("getInvoices", 200, '{"ok": true, "result": {"items": [{"status": "paid"}]}}'),  # no invoice_id
+        ("getInvoices", 200, '{"ok": true, "result": {"items": null}}'),
+        ("createInvoice", 200, '{"ok": true, "result": {"status": "active"}}'),  # made? nobody knows
+        ("createInvoice", 200, '{"ok": true, "result": "paid"}'),
     ],
 )
 async def test_a_reply_that_is_not_the_api_s_is_bad_response(garbled_api, method, status, body):
@@ -190,24 +159,29 @@ async def test_a_reply_that_is_not_the_api_s_is_bad_response(garbled_api, method
     client = CryptoPayClient("good")
     client.base = base
     calls = {
-        "getTransfers": lambda: client.get_transfers(),
-        "getBalance": lambda: client.get_balance(),
-        "getInvoices": lambda: client.paid_invoices(),
-        "transfer": lambda: client.transfer(user_id=5, asset="USDT", amount="1.00", spend_id="esc-x-seller"),
+        "getInvoices": lambda: client.get_invoices([1]),
+        "createInvoice": lambda: client.create_invoice(
+            amount_cents=1000,
+            description="t",
+            payload="order:1",
+            expires_in=60,
+            accepted_assets=["USDT"],
+            paid_btn_url=None,
+        ),
     }
     with pytest.raises(CryptoPayError) as err:
         await calls[method]()
     assert (err.value.name, err.value.code) == ("BAD_RESPONSE", status)
-    assert outcome_unknown(err.value)  # a transfer is looked up by its spend_id before anything else
+    assert outcome_unknown(err.value)
     await client.close()
 
 
 async def test_an_api_error_keeps_its_name(garbled_api):
     base, replies = garbled_api
-    replies["getTransfers"] = (200, '{"ok": false, "error": {"code": 403, "name": "METHOD_DISABLED"}}')
+    replies["getInvoices"] = (200, '{"ok": false, "error": {"code": 403, "name": "METHOD_DISABLED"}}')
     client = CryptoPayClient("good")
     client.base = base
     with pytest.raises(CryptoPayError) as err:
-        await client.get_transfers()
+        await client.get_invoices([1])
     assert (err.value.name, err.value.code) == ("METHOD_DISABLED", 403)
     await client.close()
