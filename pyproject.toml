@@ -18,6 +18,10 @@ dependencies = [
   "PyYAML==6.0.3",
   "cryptography>=43",
   "tzdata",
+  # glowing names: frames drawn with Pillow/numpy, encoded to VP9 WEBM with alpha by PyAV (libvpx inside)
+  "pillow>=11",
+  "numpy>=2",
+  "av>=14",
 ]
 
 [project.optional-dependencies]

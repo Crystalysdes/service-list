@@ -44,7 +44,7 @@ def option_title(t: Translator, order: Order) -> str:
     if order.kind == "emoji":
         return t("opt.title_emoji", months=order.months)
     if order.kind == "font":
-        return t("opt.title_font", months=order.months)
+        return t("opt.title_glow" if order.params.get("glow") else "opt.title_font", months=order.months)
     return t("opt.title_listing")
 
 

@@ -815,6 +815,38 @@ class FakeTelegram:
             "stickers": [self._sticker(i, self.custom_emoji[i]) for i in self.sticker_sets[name]],
         }
 
+    def m_createNewStickerSet(self, params: dict, files: dict) -> bool:
+        """A bot's own emoji pack: every sticker gets a custom emoji id the posts can use."""
+        name = params["name"]
+        bot = self.bot_user["username"].lower()
+        if not name.lower().endswith(f"_by_{bot}") or "__" in name or len(name) > 64:
+            raise FakeError(400, "Bad Request: invalid sticker set name is specified")
+        if name in self.sticker_sets:
+            raise FakeError(400, "Bad Request: sticker set name is already occupied")
+        if int(params["user_id"]) not in self.users:
+            raise FakeError(400, "Bad Request: USER_ID_INVALID")
+        stickers = params["stickers"]
+        if not 1 <= len(stickers) <= 50:
+            raise FakeError(400, "Bad Request: wrong number of stickers")
+        self.sticker_sets[name] = []
+        self.sticker_uploads = getattr(self, "sticker_uploads", {})
+        for item in stickers:
+            if item.get("format") != "video" or params.get("sticker_type") != "custom_emoji":
+                raise FakeError(400, "Bad Request: STICKER_VIDEO_EXPECTED")
+            data = getattr(files.get(str(item["sticker"]).removeprefix("attach://")), "data", b"")
+            emoji_id = str(5_000_000_000_000_000_000 + next(self._ids))
+            self.sticker_uploads[emoji_id] = data
+            self.add_custom_emoji(emoji_id, item["emoji_list"][0], name)
+        return True
+
+    def m_deleteStickerSet(self, params: dict, files: dict) -> bool:
+        name = params["name"]
+        if name not in self.sticker_sets:
+            raise FakeError(400, "Bad Request: STICKERSET_INVALID")
+        for emoji_id in self.sticker_sets.pop(name):
+            self.custom_emoji.pop(emoji_id, None)
+        return True
+
     def _upload(self, files: dict[str, InputFile], value: Any, kind: str) -> str:
         if isinstance(value, str) and value.startswith("attach://"):
             key = value[len("attach://") :]

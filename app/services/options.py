@@ -186,6 +186,15 @@ async def set_font_now(session: AsyncSession, service: Service, font: Font, glyp
         feature.params = {"glyphs": glyphs_to_json(glyphs), "plain": service.name, "font_id": font.id}
 
 
+async def set_glow_now(session: AsyncSession, service: Service, palette: str) -> None:
+    """The emoji-name option switches to a glowing name (or other colours); the job draws it."""
+    from app.services.glownick import glow_params
+
+    feature = render_db.active_feature(service, "font")
+    if feature is not None:
+        feature.params = glow_params(feature.params, palette, service.name)
+
+
 async def apply_custom_emoji(
     session: AsyncSession, service: Service, payload: dict[str, Any]
 ) -> dict[str, Any]:

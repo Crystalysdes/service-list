@@ -172,6 +172,8 @@ def order_title(order: Order, service_name: str) -> str:
         return f"Топ-{order.params.get('position')} для «{service_name}», {order.months} мес."
     if order.kind == "emoji":
         return f"Премиум-эмодзи для «{service_name}», {order.months} мес."
+    if order.params.get("glow"):
+        return f"Светящийся ник для «{service_name}», {order.months} мес."
     return f"Название из эмодзи для «{service_name}», {order.months} мес."
 
 
@@ -401,6 +403,10 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
         feature.top_position = int(order.params["position"])
     elif order.kind == "emoji":
         feature.params = {"emoji_id": order.params["emoji_id"], "alt": order.params.get("alt", "⭐")}
+    elif order.kind == "font" and order.params.get("glow"):  # a glowing name: the bot draws it (glownick)
+        from app.services.glownick import glow_params
+
+        feature.params = glow_params(feature.params, str(order.params["glow"]), service.name)
     elif order.kind == "font":
         feature.params = {
             "glyphs": order.params["glyphs"],

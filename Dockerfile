@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DATA_DIR=/data
 
-# pg_dump of the same major version as the database (16) for the second copy inside backups
+# pg_dump of the same major version as the database (16) for the second copy inside backups;
+# DejaVu fonts to draw glowing names (the VP9 encoder comes inside the PyAV wheel)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
  && install -d /usr/share/postgresql-common/pgdg \
@@ -15,7 +16,7 @@ RUN apt-get update \
  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
       > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends postgresql-client-16 \
+ && apt-get install -y --no-install-recommends postgresql-client-16 fonts-dejavu-core \
  && apt-get purge -y curl gnupg \
  && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*

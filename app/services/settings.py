@@ -190,6 +190,15 @@ class Escrow(SettingsGroup):
         return self.fee_bps / 100
 
 
+class GlowPacks(SettingsGroup):
+    """The emoji packs the bot made for glowing names: {pack name: {"created": iso, "retired": iso|None}}.
+    A pack no active option uses any more is deleted a little later (see app/services/glownick.py)."""
+
+    KEY: ClassVar[str] = "glow_packs"
+
+    packs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
 class EscrowRuntime(SettingsGroup):
     """The garant's state kept by the bot: the payout pause and the last check of the Crypto Pay balance."""
 

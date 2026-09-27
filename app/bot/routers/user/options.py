@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, LinkPreviewOptions, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,8 +19,9 @@ from app.db.models import Category, CustomEmoji, Font, Service
 from app.domain.fonts import glyphs_to_json
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
-from app.services import billing, moderation, options, render_db
+from app.services import billing, glow, moderation, options, render_db
 from app.services.catalog import request_sync
+from app.services.glownick import placeholder_glyphs
 from app.services.settings import Limits, Prices, Templates, get_settings
 from app.services.timefmt import fmt_date
 
@@ -380,6 +382,8 @@ async def on_font(call: CallbackQuery, session: AsyncSession, **data: Any) -> No
     marker = Fragment.from_json(templates.emoji_name_marker).text or "[тык.]"
     fonts = await options.enabled_fonts(session)
     builder = InlineKeyboardBuilder()
+    if glow.available():  # drawn by the bot itself: no emoji font needed
+        builder.button(text=t("opt.glow_button"), callback_data=f"opt:{service.id}:glow", style="primary")
     for font in fonts:
         builder.button(text=font.name[:40], callback_data=f"opt:{service.id}:f:{font.id}")
     builder.adjust(1)
@@ -458,6 +462,94 @@ async def on_font_set(call: CallbackQuery, session: AsyncSession, **data: Any) -
     await call.answer(t("opt.font_changed"), show_alert=True)
 
 
+# ----------------------------------------------------------------------------------------- glowing name
+@router.callback_query(F.data.regexp(r"^opt:\d+:glow$"))
+async def on_glow(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    t: Translator = data["t"]
+    service = await _service(session, call, data["user"].id)
+    if service is None:
+        return
+    if service.status != "active" or not glow.available():
+        key = "opt.not_active" if service.status != "active" else "opt.glow_off"
+        await call.answer(t(key), show_alert=True)
+        return
+    category = await session.get(Category, service.category_id)
+    base = await billing.base_price(session, category, "font")  # type: ignore[arg-type]
+    builder = InlineKeyboardBuilder()
+    for palette in glow.PALETTES:
+        builder.button(text=t(f"opt.glow_{palette}"), callback_data=f"opt:{service.id}:gl:{palette}")
+    builder.adjust(2)
+    await call.answer()
+    assert call.message is not None
+    await call.message.edit_text(
+        t("opt.glow_title", name=h(service.name), price=billing.money(base)),
+        reply_markup=_back(t, service.id, builder),
+    )
+
+
+async def _glow_problem(session: AsyncSession, service: Service, t: Translator) -> str | None:
+    """Why this name cannot be a glowing name now (nothing to draw, no room in the post), or None."""
+    if not glow.available():
+        return t("opt.glow_off")
+    if service.status != "active":
+        return t("opt.not_active")
+    if not glow.drawable(service.name):
+        return t("opt.glow_nothing")
+    if not await options.trial_fits(session, service, glyphs=placeholder_glyphs(service.name)):
+        return t("opt.no_room")
+    return None
+
+
+@router.callback_query(F.data.regexp(r"^opt:\d+:gl:[a-z]+$"))
+async def on_glow_pick(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    t: Translator = data["t"]
+    service = await _service(session, call, data["user"].id)
+    palette = (call.data or "").rsplit(":", 1)[1]
+    if service is None or palette not in glow.PALETTES:
+        return
+    problem = await _glow_problem(session, service, t)
+    if problem:
+        await call.answer(problem, show_alert=True)
+        return
+    await call.answer()
+    text = glow.drawable(service.name)
+    animation = await asyncio.to_thread(glow.preview_gif, text, palette)  # a second or so of drawing
+    builder = InlineKeyboardBuilder()
+    if render_db.active_feature(service, "font") is not None:  # switch for free, or extend (periods below)
+        builder.button(text=t("opt.font_set_free"), callback_data=f"opt:{service.id}:glset:{palette}")
+    category = await session.get(Category, service.category_id)
+    base = await billing.base_price(session, category, "font")  # type: ignore[arg-type]
+    markup = await _periods_keyboard(session, t, service.id, "font", f"glow_{palette}", base, builder)
+    templates = await get_settings(session, Templates)
+    marker = Fragment.from_json(templates.emoji_name_marker).text or "[тык.]"
+    assert call.message is not None
+    await call.message.answer_animation(
+        BufferedInputFile(animation, filename="glow.gif"),
+        caption=t(
+            "opt.glow_preview", name=h(service.name), segments=glow.layout(text).segments, marker=h(marker)
+        ),
+        reply_markup=markup,
+    )
+
+
+@router.callback_query(F.data.regexp(r"^opt:\d+:glset:[a-z]+$"))
+async def on_glow_set(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    t: Translator = data["t"]
+    service = await _service(session, call, data["user"].id)
+    palette = (call.data or "").rsplit(":", 1)[1]
+    if service is None or palette not in glow.PALETTES or render_db.active_feature(service, "font") is None:
+        await call.answer()
+        return
+    problem = await _glow_problem(session, service, t)
+    if problem:
+        await call.answer(problem, show_alert=True)
+        return
+    await options.set_glow_now(session, service, palette)
+    await session.flush()
+    request_sync(data["ctx"])
+    await call.answer(t("opt.glow_switched"), show_alert=True)
+
+
 # ----------------------------------------------------------------------------------------- buy
 @router.callback_query(F.data.regexp(r"^opt:\d+:buy:(top|emoji|font):\w+:\d+$"))
 async def on_buy(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
@@ -496,6 +588,13 @@ async def on_buy(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
             await call.answer(t("opt.no_room"), show_alert=True)
             return
         params = {"emoji_id": emoji.id, "alt": emoji.alt}
+    elif arg.startswith("glow_"):  # a glowing name: drawn by the bot after the payment
+        palette = arg.removeprefix("glow_")
+        problem = await _glow_problem(session, service, t) if palette in glow.PALETTES else "—"
+        if problem:
+            await call.answer(problem, show_alert=True)
+            return
+        params = {"glyphs": [], "plain": service.name, "font_id": None, "glow": palette}
     else:
         font = await session.get(Font, int(arg))
         if font is None or not font.is_enabled:
