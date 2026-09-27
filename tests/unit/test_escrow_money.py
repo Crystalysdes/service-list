@@ -82,3 +82,24 @@ def test_the_garant_takes_one_percent_by_default():
     settings = Escrow()
     assert settings.fee_bps == 100 and settings.fee_percent == 1
     assert amounts(10_000, settings.fee_bps, "buyer").buyer_pays == 10_100  # 100 USDT + 1 USDT
+
+
+def test_minor_units_of_the_gateway():
+    from decimal import Decimal
+
+    from app.services.escrow.money import from_minor, parse_minor, show_minor, to_minor
+
+    assert to_minor(1) == 10**16 and to_minor(10_050) == 10_050 * 10**16  # 100.50 USDT
+    assert to_minor(99_999_99) > 2**63  # a deal of 99 999.99 USDT is far beyond 64 bits
+    assert from_minor(to_minor(12_345)) == 12_345
+    assert from_minor(to_minor(12_345) + 10**16 - 1) == 12_345  # below a cent: rounded down
+    assert from_minor(0) == 0
+    big = 123_456_789_012_345_678_901
+    assert parse_minor(big) == big and parse_minor(str(big)) == big and parse_minor(f" {big} ") == big
+    assert parse_minor("1.05e+20") == 105 * 10**18 and parse_minor(1.5e20) == 150 * 10**18
+    assert parse_minor(Decimal("7")) == 7
+    for bad in (None, True, -1, "-1", "1.5", "abc", "", "NaN", "Infinity", 1.5):
+        assert parse_minor(bad) is None, bad
+    assert show_minor(to_minor(1250)) == "12.5 USDT"
+    assert show_minor(123_456_789_000_000) == "0.000123 USDT"
+    assert show_minor(0) == "0 USDT" and show_minor(10**11) == "0 USDT"

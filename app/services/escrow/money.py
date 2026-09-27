@@ -1,4 +1,5 @@
-"""Money of a deal, in cents of USDT (integers only: the backups keep every column as JSON)."""
+"""Money of a deal, in cents of USDT (integers only: the backups keep every column as JSON). The payment
+gateway counts in minor units of 10**-18 USDT: those are converted at its edge and never stored as numbers."""
 
 from __future__ import annotations
 
@@ -10,9 +11,15 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 ASSET = "USDT"
+CURRENCY = "usdt@bnb"  # Apirone's name for USDT on BNB Smart Chain
+NETWORK = "BEP20"
+DECIMALS = 18  # minor units of usdt@bnb: 1 USDT = 10**18 (checked against Apirone's service info)
+UNITS_FACTOR = Decimal(1).scaleb(-DECIMALS)
+_PER_CENT = 10 ** (DECIMALS - 2)
 FEE_PAYERS = ("buyer", "seller", "split")
-MIN_PAYOUT_CENTS = 100  # Crypto Pay does not transfer tiny amounts; a split part is 0 or at least this
+MIN_PAYOUT_CENTS = 100  # a payout pays network fees out of itself; a split part is 0 or at least this
 _AMOUNT_RE = re.compile(r"^\d{1,9}([.,]\d{1,2})?$")
+_DIGITS_RE = re.compile(r"^\d{1,40}$")
 
 
 class AmountError(ValueError):
@@ -113,6 +120,42 @@ def from_api(value: str | None) -> int | None:
     if number != number.quantize(Decimal("0.01")):  # more precision than cents: not ours
         return int((number * 100).to_integral_value(rounding="ROUND_FLOOR"))
     return int(number * 100)
+
+
+def to_minor(cents: int) -> int:
+    """Cents → minor units of the gateway (10**16 per cent): integers far beyond 64 bits."""
+    return cents * _PER_CENT
+
+
+def from_minor(minor: int) -> int:
+    """Minor units → whole cents, rounded down (what is kept in the database)."""
+    return minor // _PER_CENT
+
+
+def parse_minor(value: Any) -> int | None:
+    """An amount in minor units as the API gives it (an integer, a string of digits, a float such as
+    1.05e+20) → int, or None if it is not a whole non-negative amount."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    text = str(value).strip()
+    if _DIGITS_RE.match(text):
+        return int(text)
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return None
+    if not number.is_finite() or number < 0 or number != number.to_integral_value():
+        return None
+    return int(number)
+
+
+def show_minor(minor: int) -> str:
+    """Minor units → "0.012345 USDT" (fees are often less than a cent: up to 6 decimals, trimmed)."""
+    value = (Decimal(minor) * UNITS_FACTOR).quantize(Decimal("0.000001"), rounding="ROUND_HALF_UP")
+    text = format(value, "f").rstrip("0").rstrip(".")
+    return f"{text or '0'} {ASSET}"
 
 
 def terms_hash(fields: dict[str, Any]) -> str:
