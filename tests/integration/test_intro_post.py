@@ -93,13 +93,16 @@ async def test_own_text_and_button_toggles(h, tg, db, ctx):
     assert _buttons(post) == [("💬 Чат", "https://t.me/+Nh-HD70XwLRjYjFi")]
 
 
-async def test_menu_has_the_chat_next_to_service_list(h, tg, db, ctx):
+async def test_menu_has_the_chat_next_to_the_garant(h, tg, db, ctx):
     await _setup(tg, db, ctx)
     await h.say(USER, "/menu")
-    first_row = h.last(USER)["reply_markup"]["inline_keyboard"][0]
-    assert [(b["text"], b.get("url")) for b in first_row] == [
-        ("📋 Service List", "https://t.me/servicelist"),
-        ("💬 Chat", "https://t.me/+Nh-HD70XwLRjYjFi"),  # taken from the "Chat:" line of the main post
+    rows = h.last(USER)["reply_markup"]["inline_keyboard"]
+    assert [[(b["text"], b.get("url")) for b in row] for row in rows[:2]] == [
+        [("📋 Service List", "https://t.me/servicelist")],  # across the whole width
+        [
+            ("🛡 Auto-garant", None),
+            ("💬 Chat", "https://t.me/+Nh-HD70XwLRjYjFi"),  # taken from the "Chat:" line of the main post
+        ],
     ]
     async with db.session() as s:
         await update_settings(s, Chats, community_url="@servicelist_chat")
@@ -108,8 +111,7 @@ async def test_menu_has_the_chat_next_to_service_list(h, tg, db, ctx):
     await h.say(USER, "/menu")
     menu = h.last(USER)
     rows = menu["reply_markup"]["inline_keyboard"]
-    assert rows[0][1]["url"] == "https://t.me/servicelist_chat"
-    assert [b["text"] for b in rows[1]] == ["🛡 Auto-garant"] and "Auto-garant" in menu["text"]
+    assert rows[1][1]["url"] == "https://t.me/servicelist_chat" and "Auto-garant" in menu["text"]
 
 
 async def test_category_posts_link_to_the_garant_while_it_takes_deals(h, tg, db, ctx):

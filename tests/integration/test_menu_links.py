@@ -45,8 +45,12 @@ async def _main_channel(tg, db, *, username: str | None = None, invite_link: str
         await s.commit()
 
 
-def _top(message: dict) -> list[dict]:
-    return message["reply_markup"]["inline_keyboard"][0]
+def _rows(message: dict) -> list[list[str]]:
+    return [[b["text"] for b in row] for row in message["reply_markup"]["inline_keyboard"]]
+
+
+def _url(h, message: dict, text: str) -> str | None:
+    return h.button(message, text).get("url")
 
 
 def _later(ctx, seconds: float = 10) -> None:
@@ -66,9 +70,11 @@ async def test_a_private_channel_gives_each_person_a_link_of_their_own(h, tg, db
     await h.say(ANN, "/menu")
     await h.say(BOB, "/menu")
     ann, bob = h.last(ANN), h.last(BOB)
-    assert [b["text"] for b in _top(ann)] == ["📋 Service List", "🔄"]
-    assert _top(ann)[0]["url"].startswith("https://t.me/+inv") and _top(ann)[1]["callback_data"] == "m:links"
-    assert _top(ann)[0]["url"] != _top(bob)[0]["url"]
+    rows = _rows(ann)  # Service List across the width; 🔄 next to Language and Help
+    assert rows[0] == ["📋 Service List"] and rows[-1] == ["🌐 Язык", "ℹ️ Помощь", "🔄"]
+    assert h.button(ann, "🔄")["callback_data"] == "m:links"
+    assert _url(h, ann, "Service List").startswith("https://t.me/+inv")
+    assert _url(h, ann, "Service List") != _url(h, bob, "Service List")
     assert "личные и действуют 1 мин" in ann["text"]
     made = tg.called("createChatInviteLink")
     assert [p["name"] for p in made] == [f"u{ANN}", f"u{BOB}"]
@@ -81,7 +87,7 @@ async def test_refresh_puts_new_links_into_the_same_menu(h, tg, db, ctx):
     await _main_channel(tg, db)
     await h.say(ANN, "/menu")
     menu = h.last(ANN)
-    first = _top(menu)[0]["url"]
+    first = _url(h, menu, "Service List")
 
     await h.press(ANN, menu, "🔄")  # a double tap: the link a moment old is given again
     assert len(tg.called("createChatInviteLink")) == 1
@@ -91,7 +97,7 @@ async def test_refresh_puts_new_links_into_the_same_menu(h, tg, db, ctx):
     await h.press(ANN, menu, "🔄")
     assert len(tg.called("createChatInviteLink")) == 2
     assert h.last(ANN)["message_id"] == menu["message_id"]  # the keyboard changed, no new message
-    fresh = _top(tg.messages[ANN][menu["message_id"]])[0]["url"]
+    fresh = _url(h, tg.messages[ANN][menu["message_id"]], "Service List")
     assert fresh.startswith("https://t.me/+inv") and fresh != first
 
 
@@ -102,9 +108,10 @@ async def test_the_community_chat_connected_in_channels_gets_personal_links(h, t
         await update_settings(s, Chats, community_url=STATIC_CHAT)
         await s.commit()
     await h.say(ANN, "/menu")
-    top = _top(h.last(ANN))
-    assert [b["text"] for b in top] == ["📋 Service List", "💬 Chat", "🔄"]
-    assert top[1]["url"] == STATIC_CHAT  # a chat the bot does not manage keeps the link from the settings
+    menu = h.last(ANN)
+    assert _rows(menu)[:2] == [["📋 Service List"], ["🛡 Auto-garant", "💬 Chat"]]
+    assert _url(h, menu, "Chat") == STATIC_CHAT  # a chat the bot does not manage keeps the settings' link
+    assert h.button(menu, "Chat")["style"] == "primary" and "style" not in h.button(menu, "🔄")
 
     tg.add_user(OWNER_ID, "Owner", "owner")
     tg.add_chat(COMMUNITY, "supergroup", "Community", bot_status="left")
@@ -122,8 +129,7 @@ async def test_the_community_chat_connected_in_channels_gets_personal_links(h, t
         assert (await get_settings(s, Chats)).community_chat_id == COMMUNITY
 
     await h.say(ANN, "/menu")
-    top = _top(h.last(ANN))
-    assert top[1]["url"].startswith(f"https://t.me/+inv{abs(COMMUNITY)}x")
+    assert _url(h, h.last(ANN), "Chat").startswith(f"https://t.me/+inv{abs(COMMUNITY)}x")
     assert tg.called("createChatInviteLink")[-1]["member_limit"] == 1
 
 
@@ -134,7 +140,7 @@ async def test_a_refused_link_asks_to_try_again_instead_of_the_permanent_one(h, 
     tg.inject("createChatInviteLink", 400, "Bad Request: not enough rights", times=2)
     await h.say(ANN, "/menu")
     menu = h.last(ANN)
-    button = _top(menu)[0]
+    button = h.button(menu, "Service List")
     assert "url" not in button and button["callback_data"] == "m:links"
     assert "+permanent" not in str(menu["reply_markup"])
 
@@ -144,7 +150,7 @@ async def test_a_refused_link_asks_to_try_again_instead_of_the_permanent_one(h, 
     assert len(notices) == 1  # staff hear about it once an hour, not on every tap
 
     await h.press(ANN, menu, "Service List")  # Telegram gives links again
-    assert _top(tg.messages[ANN][menu["message_id"]])[0]["url"].startswith("https://t.me/+inv")
+    assert _url(h, tg.messages[ANN][menu["message_id"]], "Service List").startswith("https://t.me/+inv")
     assert _last_alert(tg)["text"] == "🔄 Новые ссылки — действуют 1 мин"
 
 
@@ -153,9 +159,8 @@ async def test_a_public_channel_keeps_its_public_link(h, tg, db):
     await _main_channel(tg, db, username="servicelist")
     await h.say(ANN, "/menu")
     menu = h.last(ANN)
-    assert [(b["text"], b.get("url")) for b in _top(menu)] == [
-        ("📋 Service List", "https://t.me/servicelist")
-    ]
+    assert _url(h, menu, "Service List") == "https://t.me/servicelist"
+    assert "🔄" not in [text for row in _rows(menu) for text in row]
     assert not tg.called("createChatInviteLink") and "личные" not in menu["text"]
 
 

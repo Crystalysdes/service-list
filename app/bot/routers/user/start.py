@@ -49,7 +49,8 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
         captcha.pop("payload", None)
     user.captcha = captcha or None
     data["state"] = state
-    if not data.get("role") and user.captcha_passed_at is None and await captcha_required(data["session"]):
+    # everyone meets the captcha on their first /start, staff too (they are never stopped by it elsewhere)
+    if user.captcha_passed_at is None and await captcha_required(data["session"]):
         await send_captcha(message.chat.id, data)
         return
     await continue_after_gate(message.chat.id, data)

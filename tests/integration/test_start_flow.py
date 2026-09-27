@@ -46,7 +46,9 @@ async def test_new_user_captcha_language_menu(h, tg, db):
         "🚫 Scam list",
         "⚠️ Report service",
     ]
-    assert h.button(menu, "Add service")["style"] == "success"
+    colours = {b["text"]: b.get("style") for b in h.buttons(menu)}
+    assert colours["📋 Service List"] == colours["🛡 Auto-garant"] == "primary"  # the top ones are blue
+    assert colours["➕ Add service"] is None and colours["⚠️ Report service"] is None  # the rest are plain
     async with db.session() as s:
         user = await s.get(User, USER)
         assert user.captcha_passed_at is not None and user.lang == "ru"
@@ -69,6 +71,19 @@ async def test_gate_blocks_other_actions_until_captcha(h, tg, db):
     tg.add_user(USER, "Eve")
     await h.say(USER, "hello")
     assert "tap" in h.last(USER)["text"]
+
+
+async def test_staff_meet_the_captcha_on_their_first_start_too(h, tg, db):
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    await h.say(OWNER_ID, "/admin")  # admin work never waits for the captcha
+    assert "Подтвердите, что вы не бот" not in h.last(OWNER_ID)["text"]
+    await h.say(OWNER_ID, "/start")
+    assert "Подтвердите, что вы не бот" in h.last(OWNER_ID)["text"]
+    await _pass_captcha(h, OWNER_ID)
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Русский")
+    assert h.button(h.last(OWNER_ID), "Service List")
+    await h.say(OWNER_ID, "/start")  # once is enough
+    assert h.button(h.last(OWNER_ID), "Service List")
 
 
 async def test_source_tag_and_deep_link_survive_captcha(h, tg, db):

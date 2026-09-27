@@ -141,7 +141,8 @@ async def channel_links(session: AsyncSession) -> tuple[str | None, str | None]:
 
 
 def menu_keyboard(t: Translator, links: MenuLinks, scam_url: str | None) -> InlineKeyboardMarkup:
-    """Service List, the community chat and 🔄 on top, Auto-garant on its own row, the rest two per row.
+    """Service List across the whole width, Auto-garant and the community chat under it (the three in blue),
+    the rest two per row without colours; 🔄 sits next to Language and Help, so the top rows keep their width.
 
     Personal links open straight away; one Telegram refused just now becomes "try again" (never a permanent
     link in its place); 🔄 makes new ones.
@@ -156,28 +157,29 @@ def menu_keyboard(t: Translator, links: MenuLinks, scam_url: str | None) -> Inli
         return button(key, callback_data="m:links", **kwargs)
 
     builder = InlineKeyboardBuilder()
-    first = [
+    builder.row(
         link_button("menu.service_list", links.main, style="primary")
         if links.main is not None
         else button("menu.service_list", callback_data="m:nochan", style="primary")
-    ]
+    )
+    second = [button("menu.garant", callback_data="g:home", style="primary")]
     if links.chat is not None:
-        first.append(link_button("menu.chat", links.chat))
-    if links.personal:
-        first.append(button("menu.refresh", callback_data="m:links"))
-    builder.row(*first)
-    builder.row(button("menu.garant", callback_data="g:home", style="primary"))
+        second.append(link_button("menu.chat", links.chat, style="primary"))
+    builder.row(*second)
     builder.row(
-        button("menu.add_service", callback_data="add:start", style="success"),
+        button("menu.add_service", callback_data="add:start"),
         button("menu.my_services", callback_data="my:list"),
     )
     builder.row(
         button("menu.scam_list", url=scam_url)
         if scam_url
         else button("menu.scam_list", callback_data="m:nochan"),
-        button("menu.report", callback_data="rep:start", style="danger"),
+        button("menu.report", callback_data="rep:start"),
     )
-    builder.row(button("menu.language", callback_data="m:lang"), button("menu.help", callback_data="m:help"))
+    last = [button("menu.language", callback_data="m:lang"), button("menu.help", callback_data="m:help")]
+    if links.personal:
+        last.append(button("menu.refresh", callback_data="m:links"))
+    builder.row(*last)
     return builder.as_markup()
 
 
