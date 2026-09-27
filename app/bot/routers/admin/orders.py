@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -73,9 +74,13 @@ async def on_orders(call: CallbackQuery, state: FSMContext, session: AsyncSessio
 
 @router.callback_query(F.data.regexp(r"^a:ord:\d+$"))
 async def on_order(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    order = await session.get(Order, int((call.data or "").split(":")[2]))
+    await call.answer()
+    await _show_order(call, session, int((call.data or "").split(":")[2]))
+
+
+async def _show_order(call: CallbackQuery, session: AsyncSession, order_id: int) -> None:
+    order = await session.get(Order, order_id)
     if order is None:
-        await call.answer()
         return
     service = await session.get(Service, order.service_id)
     t = Translator("ru")
@@ -96,19 +101,49 @@ async def on_order(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
     if order.status in ("created", "invoiced"):
         builder.button(text="✖️ Отменить", callback_data=f"a:ord:{order.id}:cancel")
     builder.adjust(1)
-    await call.answer()
     assert call.message is not None
-    await call.message.edit_text("\n".join(lines), reply_markup=back_home(builder, target="a:orders"))
+    try:
+        await call.message.edit_text("\n".join(lines), reply_markup=back_home(builder, target="a:orders"))
+    except TelegramBadRequest as exc:  # the card already shows this
+        if "not modified" not in exc.message:
+            raise
 
 
-@router.callback_query(F.data.regexp(r"^a:ord:\d+:(paid|refund|cancel)$"))
+# the statuses an action is allowed from: the card may be old, the poller may have settled the order meanwhile
+ACTION_FROM = {
+    "paid": ("created", "invoiced", "needs_attention", "expired"),
+    "refund": ("fulfilled", "paid", "needs_attention"),
+    "refundyes": ("fulfilled", "paid", "needs_attention"),
+    "cancel": ("created", "invoiced"),
+}
+
+
+@router.callback_query(F.data.regexp(r"^a:ord:\d+:(paid|refund|refundyes|cancel)$"))
 async def on_order_action(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     parts = (call.data or "").split(":")
-    order = await session.get(Order, int(parts[2]))
+    action = parts[3]
+    order = (
+        await session.execute(select(Order).where(Order.id == int(parts[2])).with_for_update())
+    ).scalar_one_or_none()
     if order is None:
         await call.answer()
         return
-    action = parts[3]
+    if order.status not in ACTION_FROM[action]:
+        await call.answer("Статус заказа уже изменился — карточка обновлена.", show_alert=True)
+        await _show_order(call, session, order.id)
+        return
+    if action == "refund":
+        builder = InlineKeyboardBuilder()
+        builder.button(text="↩️ Да, возврат сделан", callback_data=f"a:ord:{order.id}:refundyes")
+        builder.button(text="✖️ Нет", callback_data=f"a:ord:{order.id}")
+        builder.adjust(2)
+        await call.answer()
+        assert call.message is not None
+        await call.message.edit_text(
+            f"Отметить заказ #{order.id} как возвращённый? Оплаченное им время опции будет снято.",
+            reply_markup=builder.as_markup(),
+        )
+        return
     now = utcnow()
     result = None
     if action == "paid":
@@ -123,16 +158,16 @@ async def on_order_action(call: CallbackQuery, session: AsyncSession, **data: An
         except billing.FulfilError as exc:
             order.status = "needs_attention"
             order.note = str(exc)
+            await session.commit()
             await call.answer(f"Не выполнено: {exc}", show_alert=True)
             return
-    elif action == "refund":
+    elif action == "refundyes":
+        fulfilled = order.status in ("fulfilled", "paid")
         order.status = "refunded"
-        if order.kind != "listing":
-            feature = await billing.feature_row(session, order.service_id, order.kind)
-            if feature is not None:
-                feature.status = "revoked"
+        if fulfilled and order.kind != "listing":  # only the time this order paid for is taken back
+            await billing.take_back(session, order, now)
     elif action == "cancel":
-        order.status = "cancelled"
+        order.status = "cancelled"  # the poller withdraws its invoice at Crypto Pay
     await audit(session, data["user"].id, f"order.{action}", "order", order.id)
     await session.commit()
     if result is not None:
@@ -142,4 +177,4 @@ async def on_order_action(call: CallbackQuery, session: AsyncSession, **data: An
 
         request_sync(data["ctx"])
     await call.answer("Готово")
-    await on_order(call, session, **data)
+    await _show_order(call, session, order.id)

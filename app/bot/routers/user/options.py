@@ -169,6 +169,8 @@ async def on_top_move(call: CallbackQuery, session: AsyncSession, **data: Any) -
     if service is None:
         return
     position = int((call.data or "").split(":")[3])
+    # the same per-branch lock as a purchase: a move and a purchase cannot both take the last free slot
+    await session.execute(select(func.pg_advisory_xact_lock(service.category_id)))
     ok, reason = await options.can_take_top(session, service, position)
     if not ok:
         await call.answer(
@@ -293,7 +295,7 @@ async def on_emoji_set(call: CallbackQuery, session: AsyncSession, **data: Any) 
     if service is None:
         return
     emoji = await session.get(CustomEmoji, (call.data or "").split(":")[3])
-    if emoji is None or render_db.active_feature(service, "emoji") is None:
+    if emoji is None or not emoji.in_catalog or render_db.active_feature(service, "emoji") is None:
         await call.answer()
         return
     await options.set_emoji_now(session, service, emoji.id, emoji.alt)
@@ -302,11 +304,26 @@ async def on_emoji_set(call: CallbackQuery, session: AsyncSession, **data: Any) 
     await call.answer(t("opt.emoji_changed"), show_alert=True)
 
 
+async def _own_emoji_problem(
+    session: AsyncSession, service: Service, user_id: int, t: Translator
+) -> str | None:
+    """Own emoji only where the admins allow it, for a live service, one request at a time."""
+    if not (await get_settings(session, Limits)).allow_own_emoji or service.status != "active":
+        return t("opt.not_active")
+    if await moderation.open_request(session, service.id, "emoji"):
+        return t("my.edit_pending")
+    return await moderation.gate_problem(session, user_id, t, cooldown=False)
+
+
 @router.callback_query(F.data.regexp(r"^opt:\d+:own$"))
 async def on_own_emoji(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     t: Translator = data["t"]
     service = await _service(session, call, data["user"].id)
     if service is None:
+        return
+    problem = await _own_emoji_problem(session, service, data["user"].id, t)
+    if problem:
+        await call.answer(problem, show_alert=True)
         return
     await state.set_state(OwnEmoji.waiting)
     await state.update_data(service_id=service.id)
@@ -329,6 +346,11 @@ async def on_own_emoji_message(
         return
     if entity is None:
         await message.answer(t("opt.emoji_own_bad"))
+        return
+    problem = await _own_emoji_problem(session, service, data["user"].id, t)
+    if problem:
+        await state.clear()
+        await message.answer(problem)
         return
     request = await moderation.submit_emoji(
         session, data["user"], service, entity.custom_emoji_id or "", fragment.entity_text(entity)
@@ -423,7 +445,7 @@ async def on_font_set(call: CallbackQuery, session: AsyncSession, **data: Any) -
     if service is None:
         return
     font = await session.get(Font, int((call.data or "").split(":")[3]))
-    if font is None or render_db.active_feature(service, "font") is None:
+    if font is None or not font.is_enabled or render_db.active_feature(service, "font") is None:
         await call.answer()
         return
     glyphs, missing, fits = await options.spell(session, font, service.name)
@@ -476,7 +498,7 @@ async def on_buy(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
         params = {"emoji_id": emoji.id, "alt": emoji.alt}
     else:
         font = await session.get(Font, int(arg))
-        if font is None:
+        if font is None or not font.is_enabled:
             await call.answer()
             return
         glyphs, missing, fits = await options.spell(session, font, service.name)
@@ -495,7 +517,10 @@ async def on_buy(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
 @router.callback_query(F.data.regexp(r"^my:\d+:renew$"))
 async def on_renew_listing(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     service = await _service(session, call, data["user"].id)
-    if service is None or service.status not in ("active", "hidden"):
+    if service is None:
+        return
+    if not billing.listing_payable(service) or service.status == "approved":  # hidden by staff: not for money
+        await call.answer(data["t"]("opt.not_active"), show_alert=True)
         return
     order = await billing.create_order(session, user_id=data["user"].id, service=service, kind="listing")
     await call.answer()

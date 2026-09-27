@@ -37,16 +37,7 @@ def _cancel_kb(t: Translator) -> Any:
 
 
 async def _gate(session: AsyncSession, user: Any, t: Translator) -> str | None:
-    limits = await get_settings(session, Limits)
-    if await moderation.blacklist_hit(session, "", user.id):
-        return t("add.banned")
-    pending = await moderation.pending_count(session, user.id)
-    if pending >= limits.max_pending_per_user:
-        return t("add.too_many", count=pending)
-    since = await moderation.seconds_since_last(session, user.id)
-    if since is not None and since < limits.submission_cooldown_sec:
-        return t("add.cooldown")
-    return None
+    return await moderation.gate_problem(session, user.id, t)
 
 
 async def _open_categories(session: AsyncSession) -> list[Category]:
@@ -146,7 +137,7 @@ async def on_category(call: CallbackQuery, state: FSMContext, session: AsyncSess
     await call.answer()
     assert call.message is not None
     t: Translator = data["t"]
-    if category is None or not category.is_open:
+    if category is None or not category.is_open or not category.is_visible:
         await call.message.answer(t("add.closed"))
         return
     await _ask_name(call.message.chat.id, {**data, "session": session, "state": state}, category)
@@ -261,7 +252,7 @@ async def on_submit(call: CallbackQuery, state: FSMContext, session: AsyncSessio
     assert call.message is not None
     problem = await _gate(session, data["user"], t)
     category = await session.get(Category, info.get("category_id", 0))
-    if problem or category is None or not category.is_open:
+    if problem or category is None or not category.is_open or not category.is_visible:
         await state.clear()
         await call.answer()
         await call.message.answer(problem or t("add.closed"))

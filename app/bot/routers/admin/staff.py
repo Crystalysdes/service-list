@@ -17,12 +17,18 @@ from app.bot.routers.admin.panel import back_home
 from app.bot.states import StaffAdd
 from app.db.models import Staff, User
 from app.services.audit import audit
+from app.services.users import STAFF_ROLES, has_role
 
 router = Router(name="admin_staff")
 router.message.filter(RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
 ROLE_RU = {"owner": "владелец", "admin": "админ", "moderator": "модератор"}
+
+
+def _may_manage(my_role: str | None, role: str | None) -> bool:
+    """An owner manages everyone in the database; an admin only moderators (never another admin)."""
+    return my_role == "owner" or (has_role(my_role, "admin") and role in (None, "moderator"))
 
 
 async def _render(session: AsyncSession, owner_ids: list[int]) -> tuple[str, Any]:
@@ -61,7 +67,10 @@ async def on_staff(call: CallbackQuery, state: FSMContext, session: AsyncSession
 @router.callback_query(F.data.startswith("a:staff:add:"))
 async def on_staff_add(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
     role = (call.data or "").rsplit(":", 1)[1]
-    if role == "admin" and data.get("role") != "owner":
+    if role not in STAFF_ROLES:
+        await call.answer()
+        return
+    if not _may_manage(data.get("role"), role):
         await call.answer("Добавлять админов может только владелец.", show_alert=True)
         return
     await state.set_state(StaffAdd.waiting_user)
@@ -78,6 +87,12 @@ async def on_staff_add(call: CallbackQuery, state: FSMContext, **data: Any) -> N
 @router.message(StaffAdd.waiting_user, F.chat.type == "private")
 async def on_staff_user(message: Message, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     role = (await state.get_data()).get("role", "moderator")
+    if role not in STAFF_ROLES or not _may_manage(data.get("role"), role):  # checked again: roles change
+        await state.clear()
+        await message.answer(
+            "Назначать эту роль может только владелец.", reply_markup=back_home(target="a:staff")
+        )
+        return
     raw = (message.text or "").strip()
     target: User | None = None
     if raw.lstrip("-").isdigit():
@@ -89,7 +104,16 @@ async def on_staff_user(message: Message, state: FSMContext, session: AsyncSessi
     if target is None:
         await message.answer("Не нашёл такого пользователя среди тех, кто запускал бота. Попробуйте ещё раз.")
         return
+    if target.id in data["ctx"].config.owner_ids:
+        await message.answer("Это владелец бота: его роль задаётся в настройках сервера.")
+        return
     staff = await session.get(Staff, target.id)
+    if staff is not None and not _may_manage(data.get("role"), staff.role):
+        await message.answer(
+            "Менять роль админа может только владелец.", reply_markup=back_home(target="a:staff")
+        )
+        await state.clear()
+        return
     if staff is None:
         session.add(Staff(user_id=target.id, role=role, added_by=data["user"].id))
     else:
@@ -109,7 +133,7 @@ async def on_staff_del(call: CallbackQuery, session: AsyncSession, **data: Any) 
     if staff is None:
         await call.answer()
         return
-    if staff.role == "admin" and data.get("role") != "owner":
+    if not _may_manage(data.get("role"), staff.role):
         await call.answer("Снимать админов может только владелец.", show_alert=True)
         return
     await session.execute(delete(Staff).where(Staff.user_id == uid))

@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
 
+import aiohttp
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramBadRequest,
@@ -24,6 +25,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.bot.i18n import h
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import (
@@ -46,6 +48,7 @@ from app.domain.links import try_normalize
 from app.domain.parse import ChannelInfo, Snapshot, snapshot_raw
 from app.domain.richtext import Fragment
 from app.services.audit import audit
+from app.services.redact import describe
 from app.services.settings import Chats, Templates, get_settings, save_settings
 
 log = logging.getLogger(__name__)
@@ -217,8 +220,8 @@ class Importer:
             target = directory / f"{media.get('file_unique_id') or media['file_id']}.{suffix}"
             await bot.download_file(file.file_path or "", destination=target)
             data = target.read_bytes()
-        except (TelegramAPIError, OSError):
-            log.warning("cannot download intro media", exc_info=True)
+        except (TelegramAPIError, OSError, aiohttp.ClientError) as exc:
+            log.warning("cannot download intro media: %s", describe(exc))
             return None
         record = MediaFile(
             kind=media.get("kind", "photo"),
@@ -293,8 +296,8 @@ class Importer:
             await bot.send_message(admin_chat_id, f"⚠️ Импорт остановлен: {exc}")
         except Exception as exc:  # pragma: no cover - unexpected
             log.exception("import failed")
-            await self._fail(run_id, repr(exc))
-            await bot.send_message(admin_chat_id, f"⚠️ Импорт завершился с ошибкой: {exc!r}")
+            await self._fail(run_id, describe(exc))  # never the request: a file URL holds the token
+            await bot.send_message(admin_chat_id, f"⚠️ Импорт завершился с ошибкой: {h(describe(exc))}")
 
     async def _fail(self, run_id: int, reason: str) -> None:
         async with self.ctx.db.session() as session:

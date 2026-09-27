@@ -454,6 +454,10 @@ async def on_add_publish(call: CallbackQuery, state: FSMContext, session: AsyncS
         if chats.appeal_contact:
             text += "\n\n" + t("rep.appeal", contact=h(chats.appeal_contact))
         await notify_user(ctx, service.owner_id, text)
+    if service is not None and service.owner_id:  # their Auto-garant deals stop too
+        from app.services.escrow.staff import after_ban
+
+        await after_ban(ctx, service.owner_id, actor)
     await _show_entry(call.message, ctx, session, entry, edit=False)
 
 

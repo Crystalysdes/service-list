@@ -20,10 +20,11 @@ from app.db.models import Category, ModerationRequest, Service, User
 from app.domain.links import LinkError, clean_text, normalize
 from app.services import billing, moderation
 from app.services.catalog import request_sync
+from app.services.escrow.deals import open_deal_count
 from app.services.notify import notify_user
 from app.services.purchases import category_post_url
 from app.services.settings import Limits, get_settings
-from app.services.users import has_role
+from app.services.users import get_role, has_role
 
 router = Router(name="admin_moderation")
 router.message.filter(RoleFilter("moderator"))
@@ -39,12 +40,40 @@ def _who(data: dict[str, Any]) -> str:
     return f"@{user.username}" if user.username else str(user.id)
 
 
-async def _load(session: AsyncSession, call: CallbackQuery, index: int = 2) -> ModerationRequest | None:
-    request = await session.get(ModerationRequest, int((call.data or "").split(":")[index]))
+async def _load(
+    session: AsyncSession, call: CallbackQuery, data: dict[str, Any], *, decide: bool = True
+) -> ModerationRequest | None:
+    """The pending request of the button, locked until the decision is saved (two moderators, or ✅ and 🎁
+    pressed together, cannot both act on it). Nobody but the owner decides their own request."""
+    request_id = int((call.data or "").split(":")[2])
+    query = select(ModerationRequest).where(ModerationRequest.id == request_id)
+    request = (await session.execute(query.with_for_update() if decide else query)).scalar_one_or_none()
     if request is None or request.status != "pending":
         await call.answer("Заявка уже рассмотрена", show_alert=True)
         return None
+    if decide and request.user_id == data["user"].id and data.get("role") != "owner":
+        await call.answer("Это ваша заявка: её рассматривает другой модератор.", show_alert=True)
+        return None
     return request
+
+
+async def _approve(
+    call: CallbackQuery, session: AsyncSession, request: ModerationRequest, data: dict[str, Any], free: bool
+) -> dict[str, Any] | None:
+    ctx: AppContext = data["ctx"]
+    try:
+        return await moderation.approve(ctx, session, request, data["user"].id, free=free)
+    except moderation.StaleRequest as exc:
+        await moderation.close_stale(ctx, session, request, str(exc))
+        await call.answer(f"Заявка закрыта: {exc}", show_alert=True)
+        return None
+    except moderation.NoRoom:
+        await call.answer(
+            "В этой ветке нет места: пост превысит лимиты Telegram. Перенесите заявку в другую ветку "
+            "(✏️ Исправить → Ветку) или отклоните.",
+            show_alert=True,
+        )
+        return None
 
 
 async def _notify_decision(
@@ -110,11 +139,13 @@ async def _notify_decision(
 
 @router.callback_query(F.data.startswith("mod:ok:"))
 async def on_approve(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     ctx: AppContext = data["ctx"]
-    follow = await moderation.approve(ctx, session, request, data["user"].id)
+    follow = await _approve(call, session, request, data, free=False)
+    if follow is None:
+        return
     await session.commit()
     await call.answer("Одобрено")
     await moderation.close_cards(ctx, "request", request.id, f"✅ Одобрено: {_who(data)}")
@@ -127,14 +158,16 @@ async def on_approve_free(call: CallbackQuery, session: AsyncSession, **data: An
     if not has_role(data.get("role"), "admin"):
         await call.answer("Бесплатно одобряет только администратор.", show_alert=True)
         return
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     if request.kind != "new":
         await call.answer()
         return
     ctx: AppContext = data["ctx"]
-    follow = await moderation.approve(ctx, session, request, data["user"].id, free=True)
+    follow = await _approve(call, session, request, data, free=True)
+    if follow is None:
+        return
     await session.commit()
     await call.answer("Одобрено бесплатно")
     await moderation.close_cards(ctx, "request", request.id, f"🎁 Одобрено бесплатно: {_who(data)}")
@@ -144,7 +177,7 @@ async def on_approve_free(call: CallbackQuery, session: AsyncSession, **data: An
 
 @router.callback_query(F.data.startswith("mod:no:"))
 async def on_reject_menu(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     builder = InlineKeyboardBuilder()
@@ -168,7 +201,7 @@ async def _do_reject(
 
 @router.callback_query(F.data.startswith("mod:nr:"))
 async def on_reject_reason(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     code = (call.data or "").split(":")[3]
@@ -184,7 +217,7 @@ async def on_reject_reason(call: CallbackQuery, session: AsyncSession, **data: A
 async def on_reject_custom(
     call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any
 ) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     await state.set_state(ModInput.value)
@@ -196,7 +229,7 @@ async def on_reject_custom(
 
 @router.callback_query(F.data.startswith("mod:ed:"))
 async def on_edit_menu(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     builder = InlineKeyboardBuilder()
@@ -212,7 +245,7 @@ async def on_edit_menu(call: CallbackQuery, session: AsyncSession, **data: Any) 
 
 @router.callback_query(F.data.startswith("mod:ef:"))
 async def on_edit_field(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     field = (call.data or "").split(":")[3]
@@ -225,7 +258,7 @@ async def on_edit_field(call: CallbackQuery, state: FSMContext, session: AsyncSe
 
 @router.callback_query(F.data.startswith("mod:ecat:"))
 async def on_edit_category(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     builder = InlineKeyboardBuilder()
@@ -239,13 +272,23 @@ async def on_edit_category(call: CallbackQuery, session: AsyncSession, **data: A
 
 @router.callback_query(F.data.startswith("mod:setcat:"))
 async def on_set_category(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     service = await session.get(Service, request.service_id)
-    category_id = int((call.data or "").split(":")[3])
-    if service is not None:
-        service.category_id = category_id
+    target = await session.get(Category, int((call.data or "").split(":")[3]))
+    if request.kind != "new" or service is None or service.status != "pending" or target is None:
+        await call.answer("Ветку меняют только в новой заявке.", show_alert=True)  # a live one: /admin
+        return
+    current = await session.get(Category, service.category_id)
+    cheaper = current is not None and (
+        await billing.base_price(session, target, "listing")
+        < await billing.base_price(session, current, "listing")
+    )
+    if cheaper and not has_role(data.get("role"), "admin"):
+        await call.answer("Размещение в этой ветке дешевле — перенос делает администратор.", show_alert=True)
+        return
+    service.category_id = target.id
     await session.commit()
     await call.answer("Ветка изменена")
     if call.message is not None:
@@ -333,7 +376,7 @@ async def on_mod_input(message: Message, state: FSMContext, session: AsyncSessio
 
 @router.callback_query(F.data.startswith("mod:ban:"))
 async def on_ban(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     builder = InlineKeyboardBuilder()
@@ -348,10 +391,19 @@ async def on_ban(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
 
 @router.callback_query(F.data.startswith("mod:banyes:"))
 async def on_ban_yes(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data)
     if request is None:
         return
     ctx: AppContext = data["ctx"]
+    if await get_role(session, request.user_id, ctx.config.owner_ids) is not None:
+        await call.answer("Сотрудника так не забанить: сначала его снимают в 👥 Персонал.", show_alert=True)
+        return
+    if not has_role(data.get("role"), "admin") and await open_deal_count(session, request.user_id):
+        await call.answer(
+            "У пользователя открытые сделки Авто-Гаранта: бан с остановкой сделок — за администратором.",
+            show_alert=True,
+        )
+        return
     rejected = await moderation.ban_user(session, request.user_id, data["user"].id, "бан модератором")
     await session.commit()
     from app.services.escrow.staff import after_ban
@@ -396,7 +448,7 @@ async def on_queue(call: CallbackQuery, state: FSMContext, session: AsyncSession
 
 @router.callback_query(F.data.regexp(r"^a:mod:\d+$"))
 async def on_queue_item(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    request = await _load(session, call)
+    request = await _load(session, call, data, decide=False)
     if request is None:
         return
     ctx: AppContext = data["ctx"]

@@ -49,11 +49,14 @@ NOT_MODIFIED = (
 
 
 class FakeError(Exception):
-    def __init__(self, code: int, description: str, retry_after: int | None = None) -> None:
+    def __init__(
+        self, code: int, description: str, retry_after: int | None = None, chat_id: int | None = None
+    ) -> None:
         super().__init__(description)
         self.code = code
         self.description = description
         self.retry_after = retry_after
+        self.chat_id = chat_id  # only calls to this chat fail (None: any call of the method)
 
 
 def _strip_html(text: str) -> str:
@@ -243,10 +246,16 @@ class FakeTelegram:
         return msgs[-1]
 
     def inject(
-        self, method: str, code: int, description: str, retry_after: int | None = None, times: int = 1
+        self,
+        method: str,
+        code: int,
+        description: str,
+        retry_after: int | None = None,
+        times: int = 1,
+        chat_id: int | None = None,
     ) -> None:
         self.injected.setdefault(method, []).extend(
-            FakeError(code, description, retry_after) for _ in range(times)
+            FakeError(code, description, retry_after, chat_id) for _ in range(times)
         )
 
     def called(self, method: str) -> list[dict[str, Any]]:
@@ -260,9 +269,10 @@ class FakeTelegram:
     # ------------------------------------------------------------------ dispatch
     def dispatch(self, method: str, params: dict[str, Any], files: dict[str, InputFile]) -> Any:
         self.calls.append((method, params))
-        queue = self.injected.get(method)
-        if queue:
-            raise queue.pop(0)
+        queue = self.injected.get(method) or []
+        for index, error in enumerate(queue):
+            if error.chat_id is None or str(error.chat_id) == str(params.get("chat_id")):
+                raise queue.pop(index)
         handler = getattr(self, f"m_{method}", None)
         if handler is None:
             raise FakeError(400, f"Bad Request: method {method} is not implemented in FakeTelegram")

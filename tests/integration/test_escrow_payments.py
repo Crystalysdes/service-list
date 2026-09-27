@@ -313,3 +313,61 @@ async def test_the_owner_marks_a_failed_payout_paid_by_hand(ctx, pay):
     async with ctx.db.session() as s:
         stored = (await s.execute(select(DealPayout))).scalar_one()
     assert stored.manual_ref == "чек CQ123" and stored.decided_by == OWNER_ID and not pay.transfers
+
+
+async def test_a_stranger_cannot_delete_a_deals_invoice(ctx, pay):
+    deal = await _accepted(ctx)
+    row = await invoices.invoice_for(ctx, deal.id, BUYER)
+    with pytest.raises(DealError) as err:  # a forged "✖️ cancel" of somebody else's deal
+        await invoices.cancel(ctx, deal.id, STRANGER)
+    assert err.value.key == "not_party"
+    assert row.provider_invoice_id in pay.invoices  # untouched: the buyer can still pay it
+    assert (await _fresh(ctx, deal.id)).status == "awaiting_payment"
+
+
+async def test_a_retried_payout_is_stopped_before_it_is_paid_by_hand(ctx, pay):
+    deal = await _funded(ctx, pay)
+    await deals.release(ctx.db, deal.id, BUYER)
+    pay.known_users = {BUYER}  # the seller has not opened @CryptoBot yet: the payout waits and is retried
+    await sweep(ctx)
+    [payout] = await _payouts(ctx, deal.id)
+    assert payout.status == "retry"
+    with pytest.raises(DealError):  # the worker could still send it while the owner pays by hand
+        await payouts.mark_manual(ctx, payout.id, OWNER_ID, "чек CQ1")
+    await payouts.hold(ctx, payout.id, OWNER_ID)
+    pay.known_users = None
+    await sweep(ctx)  # stopped: the worker leaves it alone
+    assert not pay.transfers
+    sent = await payouts.mark_manual(ctx, payout.id, OWNER_ID, "чек CQ1")
+    assert sent.payout.status == "manual" and not pay.transfers
+
+
+async def test_a_banned_seller_is_not_paid_by_the_timer(ctx, pay, tg):
+    from app.services.moderation import ban_user
+
+    deal = await _funded(ctx, pay)
+    await deals.mark_delivered(ctx.db, deal.id, SELLER)
+    async with ctx.db.session() as s:
+        await ban_user(s, SELLER, OWNER_ID, "скам")  # banned in the bot after the payment
+        await s.commit()
+    await sweep(ctx, now=utcnow() + timedelta(days=30))
+    deal = await _fresh(ctx, deal.id)
+    assert deal.status == "disputed" and not pay.transfers  # staff decide, the money stays
+
+    other = await deals.create_deal(
+        ctx.db,
+        BUYER,
+        "buyer_b",
+        Draft(
+            role="buyer",
+            title="Сайт",
+            terms="Лендинг",
+            amount_cents=5_000,
+            fee_payer="buyer",
+            delivery_days=3,
+            counterparty="seller_s",
+        ),
+    )
+    with pytest.raises(DealError) as err:  # the banned seller cannot join a new deal either
+        await deals.accept_deal(ctx.db, other.code, SELLER, "seller_s", other.terms_hash)
+    assert err.value.key == "banned"

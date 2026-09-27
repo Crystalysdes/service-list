@@ -95,6 +95,7 @@ async def send_captcha(
             await bot.send_message(chat_id, text)
         return
     challenge = new_challenge(now, settings.options)
+    challenge["attempts"] = int(state.get("attempts") or 0)  # a new picture does not give new tries
     if state.get("payload"):
         challenge["payload"] = state["payload"]
     user.captcha = challenge
@@ -254,8 +255,13 @@ async def send_menu(chat_id: int, data: dict[str, Any], *, edit: Message | None 
 
 
 async def continue_after_gate(chat_id: int, data: dict[str, Any], *, edit: Message | None = None) -> None:
-    """After captcha / language: ask language if unknown, else run the pending deep link or show the menu."""
+    """After captcha / language: ask language if unknown, else run the pending deep link or show the menu.
+
+    Whoever has not passed the captcha (while it is on) gets it here, whatever button brought them."""
     user = data["user"]
+    if user.captcha_passed_at is None and await captcha_required(data["session"]):
+        await send_captcha(chat_id, data, edit=edit)
+        return
     if not user.lang:
         await send_language_choice(chat_id, data, edit=edit)
         return

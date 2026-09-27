@@ -6,6 +6,7 @@ import hashlib
 import logging
 from typing import Any
 
+import aiohttp
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import (
     BufferedInputFile,
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext
 from app.db.models import MediaFile
+from app.services.redact import describe
 
 log = logging.getLogger(__name__)
 
@@ -100,8 +102,8 @@ async def store_file(
             record.local_path = str(target)
             record.sha256 = hashlib.sha256(data).hexdigest()
             record.size = len(data)
-        except (TelegramAPIError, OSError):
-            log.warning("cannot download %s", file_id, exc_info=True)
+        except (TelegramAPIError, OSError, aiohttp.ClientError) as exc:  # the file URL holds the token
+            log.warning("cannot download %s: %s", file_id, describe(exc))
     session.add(record)
     await session.flush()
     return record

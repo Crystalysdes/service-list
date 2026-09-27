@@ -25,6 +25,7 @@ from app.services.cryptopay import CryptoPayError, outcome_unknown
 from app.services.escrow import deals, money
 from app.services.escrow.deals import HELD, DealError
 from app.services.escrow.invoices import PROVIDER_ERRORS, provider, take_payment
+from app.services.redact import describe
 from app.services.settings import EscrowRuntime, get_settings, update_settings
 
 log = logging.getLogger(__name__)
@@ -214,8 +215,8 @@ async def _transfer(ctx: AppContext, pay: Any, payout: DealPayout, now: datetime
         )
     except Exception as exc:
         if outcome_unknown(exc):
-            log.warning("escrow transfer %s: no answer (%r)", payout.spend_id, exc)
-            row = await _move(ctx, payout.id, ("sending",), status="unknown", last_error=repr(exc)[:256])
+            log.warning("escrow transfer %s: no answer (%s)", payout.spend_id, describe(exc))
+            row = await _move(ctx, payout.id, ("sending",), status="unknown", last_error=describe(exc)[:256])
             return Sent(row or payout, "unknown")
         if not isinstance(exc, CryptoPayError):
             raise
@@ -358,6 +359,19 @@ async def retry_now(ctx: AppContext, payout_id: int, staff_id: int) -> DealPayou
     return row
 
 
+async def hold(ctx: AppContext, payout_id: int, owner_id: int) -> DealPayout:
+    """The owner stops the automatic retries of a payout before paying it another way: from then on only
+    they decide (retry again, or mark it paid by hand). A payout being sent right now cannot be stopped."""
+    stopped = "повторы остановлены владельцем"
+    row = await _move(ctx, payout_id, ("retry",), status="failed", last_error=stopped)
+    if row is None:
+        raise DealError("state")
+    async with ctx.db.session() as session:
+        await audit(session, owner_id, "escrow.payout_hold", "deal_payout", payout_id)
+        await session.commit()
+    return row
+
+
 async def mark_manual(
     ctx: AppContext, payout_id: int, owner_id: int, ref: str, *, now: datetime | None = None
 ) -> Sent:
@@ -371,7 +385,7 @@ async def mark_manual(
         payout = await session.get(DealPayout, payout_id)
     if payout is None:
         raise DealError("not_found")
-    if payout.status not in ("failed", "retry"):
+    if payout.status != "failed":  # a payout still retried must be stopped first (hold): no double payment
         raise DealError("state")
     pay = provider(ctx)
     if pay is not None:  # the last attempt may have gone through after all
@@ -381,10 +395,10 @@ async def mark_manual(
             raise DealError("provider") from exc
         match = next((t for t in found if t.spend_id == payout.spend_id), None)
         if match is not None:
-            await _done(ctx, payout, ("failed", "retry"), match, now)
+            await _done(ctx, payout, ("failed",), match, now)
             raise DealError("already_sent")
     row = await _move(
-        ctx, payout_id, ("failed", "retry"), status="manual", manual_ref=ref, decided_by=owner_id, done_at=now
+        ctx, payout_id, ("failed",), status="manual", manual_ref=ref, decided_by=owner_id, done_at=now
     )
     if row is None:
         raise DealError("state")

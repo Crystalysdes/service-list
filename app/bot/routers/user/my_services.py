@@ -217,6 +217,9 @@ async def on_edit_field(call: CallbackQuery, state: FSMContext, session: AsyncSe
         await call.answer()
         return
     field = parts[3]
+    if await moderation.open_request(session, service.id, "edit"):  # the field buttons may still be shown
+        await call.answer(t("my.edit_pending"), show_alert=True)
+        return
     limits = await get_settings(session, Limits)
     await state.set_state(EditService.value)
     await state.update_data(service_id=service.id, field=field)
@@ -265,6 +268,16 @@ async def on_edit_value(message: Message, state: FSMContext, session: AsyncSessi
         }.get(exc.code) or t("add.bad_link", reason=t(f"link.{exc.code}"))
         await message.answer(key)
         return
+    # checked again when sending: one edit of a service waits at a time, and every request counts
+    problem = (
+        t("my.edit_pending")
+        if await moderation.open_request(session, service.id, "edit")
+        else await moderation.gate_problem(session, data["user"].id, t, cooldown=False)
+    )
+    if problem:
+        await state.clear()
+        await message.answer(problem)
+        return
     request = await moderation.submit_edit(session, data["user"], service, {field: value})
     await session.commit()
     await state.clear()
@@ -302,6 +315,7 @@ async def on_delete_yes(call: CallbackQuery, session: AsyncSession, **data: Any)
     for feature in service.features:
         if feature.status == "active":
             feature.status = "revoked"
+    await billing.cancel_open_orders(session, service.id, "сервис удалён владельцем")
     for request in (
         await session.execute(
             select(ModerationRequest).where(

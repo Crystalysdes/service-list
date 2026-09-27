@@ -714,8 +714,15 @@ class SyncEngine:
             await limiter.acquire()
             try:
                 if block.media is not None:
-                    return await self._send_media(
-                        out.chat_id, block.media, block.media_kind, fragment, buttons_markup(block.buttons)
+                    return await self._call(
+                        self._send_media(
+                            out.chat_id,
+                            block.media,
+                            block.media_kind,
+                            fragment,
+                            buttons_markup(block.buttons),
+                        ),
+                        channel_id,
                     )
                 return await self._call(
                     bot.send_message(
@@ -745,7 +752,29 @@ class SyncEngine:
             row.state = "sending"
             row.snapshot = out.fragment.to_json()  # a crash before the id is saved: matched against this
             await session.commit()
-        message = await self._deliver(channel_id, out, limiter)
+            report = measure(out.fragment, await render_db.limits(session))
+            channel = await session.get(Channel, channel_id)
+            chat_title = channel.title if channel is not None and channel.title else str(out.chat_id)
+        try:
+            message = await self._deliver(channel_id, out, limiter)
+        except TelegramBadRequest as exc:
+            # Telegram refused this one post (too long, a missing file...): nothing was sent, so the row is
+            # simply new again; the rest of the channel goes on, and staff hear about it once
+            async with self.ctx.db.session() as session:
+                row = await self._row(session, channel_id, kind, block_id)
+                if row is not None and not row.message_id:
+                    row.state = "new"
+                    row.last_error = exc.message[:500]
+                    await session.commit()
+            result.errors.append(f"{kind}:{block_id}: {exc.message}")
+            size = "" if report.ok else f" Пост больше лимитов Telegram: {report.describe()}."
+            await self._alert_once(
+                f"senderr:{channel_id}:{kind}:{block_id}:{exc.message[:40]}",
+                f"⚠️ Не удалось опубликовать пост {kind} #{block_id} в канале «{h(chat_title)}»: "
+                f"{h(exc.message)}.{size} Остальные посты канала обновляются как обычно, этот бот попробует "
+                "снова при следующей синхронизации.",
+            )
+            return
         async with self.ctx.db.session() as session:
             row = await self._row(session, channel_id, kind, block_id)
             if row is None:

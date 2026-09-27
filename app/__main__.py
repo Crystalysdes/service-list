@@ -30,11 +30,25 @@ def run_migrations(database_url: str) -> None:
 
 def main(argv: list[str]) -> int:
     config = get_config()
-    logging.basicConfig(
-        level=getattr(logging, config.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO), format=log_format)
+    from app.services.redact import install
+
+    install(  # no token ever reaches the logs, not even inside an error's URL
+        log_format,
+        [
+            secret.get_secret_value()
+            for secret in (
+                config.bot_token,
+                config.cryptopay_token,
+                config.escrow_cryptopay_token,
+                config.backup_passphrase,
+            )
+            if secret is not None
+        ],
     )
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)  # two lines per job run otherwise
     command = argv[0] if argv else "run"
     if command == "migrate":
         run_migrations(config.database_url)

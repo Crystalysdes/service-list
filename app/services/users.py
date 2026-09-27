@@ -10,6 +10,7 @@ from app.db.base import utcnow
 from app.db.models import Staff, User
 
 ROLE_RANK = {"moderator": 1, "admin": 2, "owner": 3}
+STAFF_ROLES = ("moderator", "admin")  # what a staff row may hold; owners come from OWNER_IDS only
 
 
 async def upsert_user(session: AsyncSession, tg_user: Any) -> User:
@@ -35,7 +36,7 @@ async def get_role(session: AsyncSession, user_id: int, owner_ids: list[int]) ->
     if user_id in owner_ids:
         return "owner"
     staff = await session.get(Staff, user_id)
-    return staff.role if staff else None
+    return staff.role if staff is not None and staff.role in STAFF_ROLES else None
 
 
 def has_role(role: str | None, required: str) -> bool:

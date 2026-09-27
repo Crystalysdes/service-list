@@ -55,6 +55,10 @@ async def run_bot(config: Config) -> int:
     except Exception:  # pragma: no cover - non critical
         log.exception("set_my_commands failed")
     allowed = sorted(set(dp.resolve_used_update_types()) | set(ALWAYS_UPDATES))
+    try:  # a webhook left by another program would take every update away from polling
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:  # pragma: no cover - polling reports a real conflict itself
+        log.exception("delete_webhook failed")
     log.info("Bot @%s started", me.username)
     try:
         await dp.start_polling(bot, allowed_updates=allowed, handle_signals=True)

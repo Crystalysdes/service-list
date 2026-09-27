@@ -146,15 +146,28 @@ async def _lock_user(session: AsyncSession, user_id: int) -> None:
     )
 
 
-async def _refuse_banned(session: AsyncSession, user_id: int) -> None:
+async def is_barred(session: AsyncSession, user_id: int) -> bool:
+    """Banned in the bot or on the blacklist (a scam report on their service puts them there)."""
     user = await session.get(User, user_id)
     listed = await session.scalar(
         select(func.count())
         .select_from(BlacklistEntry)
         .where(BlacklistEntry.kind == "user_id", BlacklistEntry.value == str(user_id))
     )
-    if (user is not None and user.is_banned) or listed:
+    return bool((user is not None and user.is_banned) or listed)
+
+
+async def _refuse_banned(session: AsyncSession, user_id: int) -> None:
+    if await is_barred(session, user_id):
         raise DealError("banned")
+
+
+async def refuse_barred_parties(session: AsyncSession, deal: Deal, by_user: int) -> None:
+    """Every step towards the money checks both sides again: whoever got banned or blacklisted since the
+    invitation stops the deal here ("banned" for the one acting, "other_banned" for the other side)."""
+    for user_id in {deal.creator_id, deal.buyer_id, deal.seller_id} - {None}:
+        if await is_barred(session, user_id):
+            raise DealError("banned" if user_id == by_user else "other_banned")
 
 
 async def _open_count(session: AsyncSession, user_id: int) -> int:
@@ -383,6 +396,7 @@ async def accept_deal(
         matched = deal.counterparty_username is not None
         _need(not matched or (username or "").lower() == deal.counterparty_username, "not_for_you")
         await _refuse_banned(session, user_id)
+        await refuse_barred_parties(session, deal, user_id)  # the creator may have been banned since
         settings = await get_settings(session, Escrow)
         _need(await _open_count(session, user_id) < settings.max_open_per_user, "too_many_open")
         setattr(deal, f"{side}_id", user_id)
@@ -406,6 +420,7 @@ async def confirm_counterparty(
         other = getattr(deal, f"{side}_id")
         _need(other is not None, "state")
         if approve:
+            await refuse_barred_parties(session, deal, by_user)
             deal.counterparty_confirmed_at = now
             deal.status = "awaiting_payment"
             deal.pay_due_at = now + timedelta(hours=deal.pay_hours)
@@ -556,6 +571,7 @@ async def auto_release(db: Database, deal_id: int, *, now: datetime | None = Non
             due = deal.release_due_at
             _need(deal.status == "delivered" and not deal.release_paused, "state")
             _need(due is not None and due <= now, "state")
+            _need(deal.seller_id is None or not await is_barred(session, deal.seller_id), "other_banned")
             await _settle(
                 session, deal, seller_share=deal.seller_gets_cents, buyer_share=0, resolution="auto", now=now
             )
@@ -648,7 +664,7 @@ def can_judge(deal: Deal, staff_id: int, role: str | None) -> str | None:
     """None when this staff member may decide the deal, otherwise the reason key."""
     if role not in ("moderator", "admin", "owner"):
         return "not_staff"
-    if staff_id in (deal.buyer_id, deal.seller_id, deal.creator_id):
+    if is_party(deal, staff_id):
         return "judge_party"
     if role == "moderator":
         if deal.status != "disputed":
@@ -694,9 +710,14 @@ async def verdict(
         )
 
 
+def is_party(deal: Deal, user_id: int) -> bool:
+    return user_id in (deal.buyer_id, deal.seller_id, deal.creator_id)
+
+
 async def pause_release(db: Database, deal_id: int, staff_id: int, paused: bool) -> Deal:
-    """Staff hold (or let go) the automatic release while they look into a deal."""
+    """Staff hold (or let go) the automatic release while they look into a deal (never their own deal)."""
     async with _change(db, Deal.id == deal_id) as (session, deal):
+        _need(not is_party(deal, staff_id), "judge_party")
         _need(deal.status in HELD, "state")
         deal.release_paused = paused
         return await _done(session, deal, staff_id, "release_paused" if paused else "release_resumed")
@@ -751,3 +772,18 @@ async def dispute_deals_of(db: Database, user_id: int, *, now: datetime | None =
         except DealError:
             continue  # decided meanwhile
     return result
+
+
+async def open_deal_count(session: AsyncSession, user_id: int) -> int:
+    """How many deals of the user are not finished yet (unpaid, with the garant, or being paid out)."""
+    return int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Deal)
+            .where(
+                Deal.status.in_(OPEN),
+                or_(Deal.buyer_id == user_id, Deal.seller_id == user_id, Deal.creator_id == user_id),
+            )
+        )
+        or 0
+    )

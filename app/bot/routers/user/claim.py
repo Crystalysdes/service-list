@@ -18,7 +18,6 @@ from app.bot.i18n import Translator, h
 from app.bot.routers.user.report import clean_report_text
 from app.bot.states import ClaimFlow
 from app.context import AppContext
-from app.db.base import utcnow
 from app.db.models import Category, ModerationRequest, Service
 from app.domain.links import try_normalize
 from app.services import claims, moderation, reports
@@ -226,19 +225,13 @@ async def on_check(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
     if not await claims.find_code(ctx, service.url, code):
         await call.answer(t("claim.not_yet"), show_alert=True)
         return
-    pending = await _pending(session, service.id, user.id)
-    if pending is not None:  # proven after asking for a manual review: the request is no longer needed
-        pending.status = "cancelled"
-        pending.reason = "подтверждено кодом"
-        pending.decided_at = utcnow()
+    # a manual request of this user, if any, is closed with every other claim of the service
     await claims.assign_owner(ctx, session, service, user, f"код {code} найден в описании")
     await call.answer()
     assert call.message is not None
     await call.message.edit_text(
         t("claim.approved", name=h(service.name)), reply_markup=_manage_kb(t, service.id)
     )
-    if pending is not None:
-        await moderation.close_cards(ctx, "request", pending.id, "✅ Подтверждено кодом автоматически")
 
 
 @router.callback_query(F.data.regexp(r"^claim:manual:\d+$"))
@@ -251,6 +244,11 @@ async def on_manual(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
         return
     if await _pending(session, service.id, user.id):
         await call.answer(t("claim.pending"), show_alert=True)
+        return
+    # claims count against the same cap as any other request
+    problem = await moderation.gate_problem(session, user.id, t, cooldown=False)
+    if problem:
+        await call.answer(problem, show_alert=True)
         return
     code = claims.code_for(ctx, user.id, service.id)
     request = ModerationRequest(

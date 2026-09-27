@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -21,6 +22,15 @@ log = logging.getLogger(__name__)
 
 MONTH = timedelta(days=30)
 KINDS = ("listing", "top", "emoji", "font")
+OPEN_ORDER = ("created", "invoiced")  # an invoice of an order in any other state must not be paid any more
+CLOSED_SERVICE = ("banned", "removed", "rejected")
+SERVICE_STATE_RU = {
+    "pending": "ещё на модерации",
+    "banned": "заблокирован",
+    "removed": "удалён",
+    "rejected": "отклонён",
+    "hidden": "скрыт",
+}
 
 
 class BillingError(Exception):
@@ -29,6 +39,34 @@ class BillingError(Exception):
 
 class FulfilError(Exception):
     pass
+
+
+def listing_payable(service: Service) -> bool:
+    """A listing is published or extended for money only as a new approved submission, a live listing or
+    one hidden because its term ran out: paying never undoes a ban, a removal or a hide by staff or the
+    link checker."""
+    return service.status in ("approved", "active") or (
+        service.status == "hidden" and service.hidden_reason == "expired"
+    )
+
+
+def service_state(service: Service) -> str:
+    words = SERVICE_STATE_RU.get(service.status, service.status)
+    if service.status == "hidden" and service.hidden_reason:
+        words += f" ({service.hidden_reason})"
+    return words
+
+
+async def cancel_open_orders(session: AsyncSession, service_id: int, note: str) -> int:
+    """The service was banned, removed or hidden: its unpaid orders are closed (the poller withdraws their
+    invoices at Crypto Pay; one paid after all goes to staff instead of being fulfilled)."""
+    rows = await session.execute(
+        update(Order)
+        .where(Order.service_id == service_id, Order.status.in_(OPEN_ORDER))
+        .values(status="cancelled", note=note[:250])
+        .returning(Order.id)
+    )
+    return len(rows.all())
 
 
 def period_price(base_cents: int, months: int, discounts: dict[str, int]) -> int:
@@ -89,6 +127,8 @@ async def create_order(
         amount_cents = await price_for(
             session, category, kind, months or 1, (params or {}).get("position") if params else None
         )
+    if kind == "listing" and "days" not in (params or {}):  # the term is the one shown when the bill was made
+        params = {**(params or {}), "days": (await get_settings(session, Prices)).listing_days}
     # only one open order per service + kind
     await session.execute(
         update(Order)
@@ -148,11 +188,10 @@ async def ensure_invoice(ctx: AppContext, session: AsyncSession, order: Order) -
         await session.execute(select(Invoice).where(Invoice.order_id == order.id, Invoice.status == "active"))
     ).scalars()
     for invoice in stale:
-        invoice.status = "deleted"
-        try:
-            await provider.delete_invoice(invoice.provider_invoice_id)
-        except Exception:  # pragma: no cover - best effort
-            log.warning("delete invoice failed", exc_info=True)
+        # only an invoice Crypto Pay really deleted is forgotten: one it refused may have just been paid, and
+        # the poller must still see that payment
+        if await _withdraw(provider, invoice.provider_invoice_id):
+            invoice.status = "deleted"
     limits = await get_settings(session, Limits)
     payments = await get_settings(session, Payments)
     service = await session.get(Service, order.service_id)
@@ -234,8 +273,15 @@ async def handle_paid(ctx: AppContext, invoice: CryptoInvoice) -> PaidResult:
             order.status = "needs_attention"
             order.note = f"payload/amount mismatch: {invoice.payload} {invoice.amount}"
             result.status = "mismatch"
-        elif order.status in ("paid", "fulfilled"):
-            result.status = "duplicate"
+        elif order.status not in OPEN_ORDER:
+            # settled already (another invoice, by hand) or closed (superseded, cancelled, the service
+            # banned): this money is not spent automatically, staff decide
+            why = f"оплачен счёт заказа в статусе «{order.status}» — верните оплату или выполните вручную"
+            if order.status not in ("paid", "fulfilled", "refunded"):
+                order.status = "needs_attention"
+            order.note = why
+            result.status = "attention"
+            result.notes = [why]
         else:
             order.status = "paid"
             order.paid_at = now
@@ -292,6 +338,10 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
     if service is None:
         raise FulfilError("сервис удалён")
     notes: list[str] = []
+    if order.kind == "listing" and not listing_payable(service):
+        raise FulfilError(f"сервис {service_state(service)}: размещение не выполнено")
+    if order.kind != "listing" and service.status in CLOSED_SERVICE:
+        raise FulfilError(f"сервис {service_state(service)}: опция не выполнена")
     if order.kind == "listing":
         prices = await get_settings(session, Prices)
         was_active = service.status == "active"
@@ -315,6 +365,8 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
                 else now
             )
             service.listing_expires_at = base + timedelta(days=days)
+        else:  # listings without a term: paid once, shown until removed
+            service.listing_expires_at = None
         return notes
     duration = MONTH * max(1, order.months)
     feature = await feature_row(session, service.id, order.kind)
@@ -359,33 +411,82 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
     return notes
 
 
-async def poll_invoices(ctx: AppContext) -> list[PaidResult]:
-    """Check all active invoices at the provider; fulfil paid ones, expire old ones."""
+async def take_back(session: AsyncSession, order: Order, now: datetime) -> None:
+    """A refunded option order: the months it paid for come off the option (all of it, if nothing is left)."""
+    feature = await feature_row(session, order.service_id, order.kind)
+    if feature is None or feature.status != "active":
+        return
+    if feature.expires_at is not None and order.months:
+        feature.expires_at = feature.expires_at - MONTH * order.months
+        if feature.expires_at > now:
+            return
+    feature.status = "revoked"
+
+
+async def _withdraw(provider: Any, provider_invoice_id: int) -> bool:
+    """Delete an invoice at Crypto Pay; False when it refused (a paid one cannot be deleted) or is silent."""
+    try:
+        return bool(await provider.delete_invoice(provider_invoice_id))
+    except (CryptoPayError, OSError, TimeoutError):
+        log.warning("deleteInvoice %s failed", provider_invoice_id, exc_info=True)
+        return False
+
+
+async def poll_invoices(
+    ctx: AppContext, on_paid: Callable[[AppContext, PaidResult], Awaitable[None]] | None = None
+) -> list[PaidResult]:
+    """Check all active invoices at the provider: fulfil paid ones (``on_paid`` tells the payer and staff
+    right after each one), expire old ones, withdraw those whose order is closed."""
     provider = ctx.get("cryptopay")
     if provider is None:
         return []
     now = utcnow()
     async with ctx.db.session() as session:
-        invoices = list((await session.execute(select(Invoice).where(Invoice.status == "active"))).scalars())
+        invoices = list(
+            (
+                await session.execute(
+                    select(Invoice, Order.status)
+                    .join(Order, Order.id == Invoice.order_id)
+                    .where(Invoice.status == "active")
+                )
+            ).all()
+        )
     if not invoices:
         return []
     try:
         remote = {
-            i.invoice_id: i for i in await provider.get_invoices([i.provider_invoice_id for i in invoices])
+            i.invoice_id: i
+            for i in await provider.get_invoices([invoice.provider_invoice_id for invoice, _ in invoices])
         }
     except (CryptoPayError, OSError, TimeoutError):
         log.warning("getInvoices failed", exc_info=True)
         return []
     results = []
-    for invoice in invoices:
+    for invoice, order_status in invoices:
         data = remote.get(invoice.provider_invoice_id)
-        if data is not None and data.status == "paid":
-            results.append(await handle_paid(ctx, data))
-        elif (data is not None and data.status == "expired") or (
-            invoice.expires_at is not None and invoice.expires_at < now - timedelta(minutes=5)
-        ):
-            await expire_invoice(ctx, invoice.id)
+        try:  # one broken invoice must not hold back the others (nor their messages)
+            if data is not None and data.status == "paid":
+                result = await handle_paid(ctx, data)
+                results.append(result)
+                if on_paid is not None:
+                    await on_paid(ctx, result)
+            elif (data is not None and data.status == "expired") or (
+                invoice.expires_at is not None and invoice.expires_at < now - timedelta(minutes=5)
+            ):
+                await expire_invoice(ctx, invoice.id)
+            elif order_status not in OPEN_ORDER and await _withdraw(provider, invoice.provider_invoice_id):
+                await _mark_invoice(ctx, invoice.id, "deleted")
+        except Exception:
+            log.exception("invoice %s could not be processed", invoice.id)
     return results
+
+
+async def _mark_invoice(ctx: AppContext, invoice_id: int, status: str) -> None:
+    async with ctx.db.session() as session:
+        invoice = await session.get(Invoice, invoice_id)
+        if invoice is not None and invoice.status == "active":
+            invoice.status = status
+            await session.commit()
 
 
 async def expire_invoice(ctx: AppContext, invoice_id: int) -> None:
@@ -406,17 +507,21 @@ async def check_order_now(ctx: AppContext, order_id: int) -> PaidResult | None:
     if provider is None:
         return None
     async with ctx.db.session() as session:
-        invoice = (
-            await session.execute(
-                select(Invoice).where(Invoice.order_id == order_id).order_by(Invoice.id.desc()).limit(1)
-            )
-        ).scalar_one_or_none()
-    if invoice is None:
-        return None
-    if invoice.status == "paid":
+        invoices = list(
+            (
+                await session.execute(
+                    select(Invoice)
+                    .where(Invoice.order_id == order_id, Invoice.status.in_(("active", "paid")))
+                    .order_by(Invoice.id.desc())
+                )
+            ).scalars()
+        )
+    if any(invoice.status == "paid" for invoice in invoices):
         return PaidResult("duplicate", order_id)
-    try:
-        remote = await provider.get_invoices([invoice.provider_invoice_id])
+    if not invoices:
+        return None
+    try:  # every invoice still open for the order: the payer may have used an earlier one
+        remote = await provider.get_invoices([invoice.provider_invoice_id for invoice in invoices])
     except (CryptoPayError, OSError, TimeoutError):
         return None
     for item in remote:

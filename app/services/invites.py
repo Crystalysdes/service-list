@@ -25,6 +25,7 @@ from app.services.settings import Chats, Limits, get_settings
 log = logging.getLogger(__name__)
 
 REUSE_SEC = 5.0  # a link this fresh is given again: a double tap or a menu drawn twice makes no new one
+HOURLY_MAX = 15  # new links one person gets into one chat per hour; then only the last one while it lives
 CACHE_MAX = 20_000
 
 
@@ -50,6 +51,11 @@ def _cache(ctx: AppContext) -> dict[tuple[int, int], tuple[str, float]]:
     return ctx.services.setdefault("invites", {})
 
 
+def _made(ctx: AppContext) -> dict[tuple[int, int], list[float]]:
+    """When each person's links into each chat were made (the last hour)."""
+    return ctx.services.setdefault("invites_made", {})
+
+
 async def personal_link(ctx: AppContext, chat_id: int, user_id: int, ttl: int) -> str | None:
     """A link into ``chat_id`` for this user only: one join, ``ttl`` seconds. None when Telegram refuses."""
     cache = _cache(ctx)
@@ -57,6 +63,10 @@ async def personal_link(ctx: AppContext, chat_id: int, user_id: int, ttl: int) -
     cached = cache.get((user_id, chat_id))
     if cached is not None and now - cached[1] < REUSE_SEC:
         return cached[0]
+    # one account cannot farm links for others: a few new ones an hour, then the last one until it expires
+    made = [moment for moment in _made(ctx).get((user_id, chat_id), []) if now - moment < 3600]
+    if len(made) >= HOURLY_MAX:
+        return cached[0] if cached is not None and now - cached[1] < ttl - 5 else None
     if ctx.bot is None:
         return None
     try:
@@ -71,9 +81,13 @@ async def personal_link(ctx: AppContext, chat_id: int, user_id: int, ttl: int) -
         await _alert(ctx, chat_id, exc.message)
         return None
     if len(cache) > CACHE_MAX:
-        for key in [k for k, (_url, made) in cache.items() if now - made >= REUSE_SEC]:
+        for key in [k for k, (_url, moment) in cache.items() if now - moment >= ttl]:
             del cache[key]
+        history = _made(ctx)
+        for key in [k for k, moments in history.items() if not moments or now - moments[-1] >= 3600]:
+            del history[key]
     cache[(user_id, chat_id)] = (link.invite_link, now)
+    _made(ctx)[(user_id, chat_id)] = [*made, now]
     return link.invite_link
 
 

@@ -40,9 +40,7 @@ async def job_poll_invoices(ctx: AppContext) -> None:
     from app.services.billing import poll_invoices
     from app.services.purchases import after_paid
 
-    for result in await poll_invoices(ctx):
-        if result.status in ("ok", "attention", "mismatch"):
-            await after_paid(ctx, result)
+    await poll_invoices(ctx, on_paid=after_paid)  # the payer and staff hear right after each payment
 
 
 async def job_expire_unpaid(ctx: AppContext) -> None:

@@ -419,7 +419,7 @@ async def staff_card(
         builder.button(
             text="⚖️ Вынести решение", callback_data=f"a:g:v:{deal.id}:{deal.version}", style="primary"
         )
-    if has_role(role, "admin"):
+    if has_role(role, "admin") and not deals.is_party(deal, staff_id):  # never on one's own deal
         if deal.status in ("funded", "delivered"):
             builder.button(text="⚠️ Остановить сделку (спор)", callback_data=f"a:g:ds:{deal.id}")
         if deal.status in HELD:
@@ -434,7 +434,9 @@ async def staff_card(
             if payout.status in ("failed", "retry"):
                 label = f"{PURPOSE.get(payout.purpose, '')} {money.show(payout.amount_cents)}"
                 builder.button(text=f"🔁 Повторить: {label}", callback_data=f"a:g:pr:{payout.id}")
-                if role == "owner":
+                if role == "owner" and payout.status == "retry":  # stopped first: never paid twice
+                    builder.button(text=f"⏸ Остановить повторы: {label}", callback_data=f"a:g:ph:{payout.id}")
+                elif role == "owner":
                     builder.button(text=f"✍️ Выплачено вручную: {label}", callback_data=f"a:g:pm:{payout.id}")
         for side, user_id in (("buyer", deal.buyer_id), ("seller", deal.seller_id)):
             if user_id and not (users.get(user_id) and users[user_id].is_banned):
@@ -740,11 +742,30 @@ async def on_retry(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
     )
 
 
+@router.callback_query(F.data.regexp(r"^a:g:ph:\d+$"), RoleFilter("owner"))
+async def on_hold(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    payout = await session.get(DealPayout, int(_parts(call)[3]))
+    if payout is None:
+        await call.answer()
+        return
+    try:
+        await payouts.hold(data["ctx"], payout.id, data["user"].id)
+    except DealError:
+        await call.answer("Выплата сейчас отправляется или уже решена — обновите карточку.", show_alert=True)
+        return
+    await _open_card(
+        call,
+        {**data, "session": session},
+        payout.deal_id,
+        "Повторы остановлены. Теперь её можно выплатить другим способом и отметить «✍️ Выплачено вручную».",
+    )
+
+
 @router.callback_query(F.data.regexp(r"^a:g:pm:\d+$"), RoleFilter("owner"))
 async def on_manual(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     payout = await session.get(DealPayout, int(_parts(call)[3]))
-    if payout is None or payout.status not in ("failed", "retry"):
-        await call.answer("Эту выплату нельзя отметить вручную", show_alert=True)
+    if payout is None or payout.status != "failed":
+        await call.answer("Сначала остановите повторы этой выплаты", show_alert=True)
         return
     await ask(
         call,
@@ -811,6 +832,9 @@ async def on_ban(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
     user_id = (deal.buyer_id if side == "buyer" else deal.seller_id) if deal else None
     if deal is None or not user_id:
         await call.answer()
+        return
+    if deals.is_party(deal, data["user"].id):
+        await call.answer(_problem("judge_party"), show_alert=True)
         return
     if user_id in data["ctx"].config.owner_ids:
         await call.answer("Владельца забанить нельзя", show_alert=True)

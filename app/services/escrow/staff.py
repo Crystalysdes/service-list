@@ -55,8 +55,19 @@ async def after_verdict(ctx: AppContext, deal: Deal, judge_id: int, role: str | 
         )
 
 
+async def _refuse_own(ctx: AppContext, deal_id: int, staff_id: int) -> None:
+    """Staff act on other people's deals only: a party of the deal is refused as a judge would be."""
+    async with ctx.db.session() as session:
+        deal = await session.get(Deal, deal_id)
+    if deal is None:
+        raise DealError("not_found")
+    if deals.is_party(deal, staff_id):
+        raise DealError("judge_party")
+
+
 async def staff_dispute(ctx: AppContext, deal_id: int, staff_id: int) -> Deal:
     """Staff stop a paid deal where it is: it becomes a dispute."""
+    await _refuse_own(ctx, deal_id, staff_id)
     deal = await deals.open_dispute(ctx.db, deal_id, None, reason="staff")
     await tell_both(ctx, deal, "staff_dispute")
     await dispute_alert(ctx, deal)
@@ -65,6 +76,7 @@ async def staff_dispute(ctx: AppContext, deal_id: int, staff_id: int) -> Deal:
 
 async def staff_cancel(ctx: AppContext, deal_id: int, staff_id: int) -> Deal:
     """An unpaid deal called off by staff (its invoice goes first)."""
+    await _refuse_own(ctx, deal_id, staff_id)
     deal = await invoices.cancel(ctx, deal_id, staff_id, staff=True)
     await tell_both(ctx, deal, "staff_cancelled")
     if staff_id not in ctx.config.owner_ids:
@@ -73,11 +85,8 @@ async def staff_cancel(ctx: AppContext, deal_id: int, staff_id: int) -> Deal:
 
 
 async def after_ban(ctx: AppContext, user_id: int, staff_id: int) -> tuple[list[Deal], list[Deal]]:
-    """A banned user's paid deals stop in a dispute; their unpaid deals are called off."""
-    disputed = await deals.dispute_deals_of(ctx.db, user_id)
-    for deal in disputed:
-        await tell_both(ctx, deal, "staff_dispute")
-        await dispute_alert(ctx, deal)
+    """A banned (or blacklisted) user's unpaid deals are called off, then their paid deals stop in a dispute:
+    in this order, a deal paid while it was being called off is paid by now and so goes to the dispute."""
     async with ctx.db.session() as session:
         unpaid = list(
             (
@@ -99,4 +108,8 @@ async def after_ban(ctx: AppContext, user_id: int, staff_id: int) -> tuple[list[
         cancelled.append(deal)
         for other in {deal.buyer_id, deal.seller_id, deal.creator_id} - {user_id, None}:
             await tell(ctx, other, deal, "staff_cancelled")
+    disputed = await deals.dispute_deals_of(ctx.db, user_id)
+    for deal in disputed:
+        await tell_both(ctx, deal, "staff_dispute")
+        await dispute_alert(ctx, deal)
     return disputed, cancelled

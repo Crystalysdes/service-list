@@ -93,6 +93,22 @@ async def seconds_since_last(session: AsyncSession, user_id: int) -> float | Non
     return (utcnow() - last).total_seconds()
 
 
+async def gate_problem(session: AsyncSession, user_id: int, t: Any, *, cooldown: bool = True) -> str | None:
+    """Why this person may not send the moderators another request right now (a ban, too many waiting, too
+    soon after the last new submission), as the text to show; None when they may. Every kind of request
+    passes here; the pause between requests is for new submissions only."""
+    limits = await get_settings(session, Limits)
+    if await blacklist_hit(session, "", user_id):
+        return t("add.banned")
+    pending = await pending_count(session, user_id)
+    if pending >= limits.max_pending_per_user:
+        return t("add.too_many", count=pending)
+    since = await seconds_since_last(session, user_id) if cooldown else None
+    if since is not None and since < limits.submission_cooldown_sec:
+        return t("add.cooldown")
+    return None
+
+
 # ------------------------------------------------------------------------------------------ submit
 async def submit_new(
     session: AsyncSession, user: User, category: Category, name: str, description: str, url: str
@@ -319,6 +335,39 @@ async def close_cards(ctx: AppContext, ref_type: str, ref_id: int, line: str) ->
 
 
 # ------------------------------------------------------------------------------------------ decisions
+class StaleRequest(Exception):
+    """The request no longer fits its service (banned, removed, taken by its owner...): nothing is changed."""
+
+
+class NoRoom(Exception):
+    """The branch's post would exceed Telegram's limits with one more service: move the request or refuse."""
+
+
+async def check_still_valid(session: AsyncSession, request: ModerationRequest, service: Service) -> None:
+    """A card can wait for hours: what happened to the service since then decides if it may be approved."""
+    if request.kind == "new":
+        if service.status != "pending":
+            raise StaleRequest(f"сервис уже не на модерации: {billing.service_state(service)}")
+        if await blacklist_hit(session, service.url, request.user_id) is not None:
+            raise StaleRequest("ссылка или автор в чёрном списке")
+        return
+    if service.status in billing.CLOSED_SERVICE:
+        raise StaleRequest(f"сервис {billing.service_state(service)}")
+    if request.kind == "claim" and service.owner_id is not None:
+        raise StaleRequest("у сервиса уже есть владелец")
+    if request.kind in ("edit", "emoji") and service.owner_id != request.user_id:
+        raise StaleRequest("автор заявки больше не владелец сервиса")
+
+
+async def close_stale(ctx: AppContext, session: AsyncSession, request: ModerationRequest, why: str) -> None:
+    """Close a request that can no longer be approved, with the reason on its cards."""
+    request.status = "cancelled"
+    request.reason = why[:250]
+    request.decided_at = utcnow()
+    await session.commit()
+    await close_cards(ctx, "request", request.id, f"⚠️ Заявка закрыта: {why}")
+
+
 async def approve(
     ctx: AppContext,
     session: AsyncSession,
@@ -332,11 +381,18 @@ async def approve(
     ``free`` publishes a new listing without payment: a $0 order goes through the usual fulfilment.
     """
     now = utcnow()
+    service = await session.get(Service, request.service_id)
+    if service is None:
+        raise StaleRequest("сервис удалён")
+    await check_still_valid(session, request, service)
+    if request.kind == "new":
+        from app.services.options import trial_fits
+
+        if not await trial_fits(session, service):  # a post over the limits could not be updated at all
+            raise NoRoom()
     request.status = "approved"
     request.moderator_id = moderator_id
     request.decided_at = now
-    service = await session.get(Service, request.service_id)
-    assert service is not None
     follow: dict[str, Any] = {"kind": request.kind, "service_id": service.id, "user_id": request.user_id}
     if request.kind == "new":
         service.status = "approved"

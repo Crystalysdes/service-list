@@ -20,7 +20,7 @@ from app.db.base import utcnow
 from app.db.models import Category, Service, User
 from app.domain.links import LinkError, clean_text, normalize
 from app.domain.richtext import Fragment
-from app.services import catalog
+from app.services import billing, catalog
 from app.services.audit import audit
 from app.services.render_db import category_services
 from app.services.sync import own_links
@@ -549,6 +549,7 @@ async def on_service_action(
         category_id = service.category_id
         service.status = "removed"
         service.hidden_reason = "admin"
+        await billing.cancel_open_orders(session, service.id, "сервис удалён администратором")
         await audit(session, data["user"].id, "service.remove", "service", service.id)
         catalog.request_sync(data["ctx"])
         await call.answer("Удалено")
@@ -562,6 +563,7 @@ async def on_service_action(
     elif action == "hide":
         service.status = "hidden"
         service.hidden_reason = "admin"
+        await billing.cancel_open_orders(session, service.id, "сервис скрыт администратором")
     elif action == "show":
         service.status = "active"
         service.hidden_reason = None

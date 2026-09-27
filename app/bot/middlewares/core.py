@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
@@ -67,6 +68,17 @@ def _is_private(event: TelegramObject) -> bool:
     return False
 
 
+START_RE = re.compile(r"^/start(?:@(\w+))?(?:\s|$)", re.IGNORECASE)
+
+
+def is_start(text: str | None, bot_username: str | None) -> bool:
+    """Exactly the /start command (as /start@this_bot too): "/startx" or "/start@other_bot" is not it."""
+    match = START_RE.match(text or "")
+    if match is None:
+        return False
+    return match.group(1) is None or (bot_username or "").lower() == match.group(1).lower()
+
+
 class AccessMiddleware(BaseMiddleware):
     """Bans and the captcha gate for private chats (staff is never gated)."""
 
@@ -87,7 +99,7 @@ class AccessMiddleware(BaseMiddleware):
             from app.bot.flows.start import captcha_required, send_captcha
 
             if await captcha_required(data["session"]):
-                allowed = (isinstance(event, Message) and (event.text or "").startswith("/start")) or (
+                allowed = (isinstance(event, Message) and is_start(event.text, data["ctx"].bot_username)) or (
                     isinstance(event, CallbackQuery)
                     and (event.data or "").startswith(self.GATE_CALLBACK_PREFIXES)
                 )

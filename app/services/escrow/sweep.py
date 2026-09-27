@@ -16,7 +16,7 @@ from app.db.base import utcnow
 from app.db.models import Deal
 from app.services.escrow import deals, invoices, payouts
 from app.services.escrow.deals import DealError, Funding
-from app.services.escrow.notify import alert_owner, tell, tell_both, tell_once, to_staff
+from app.services.escrow.notify import alert_owner, dispute_alert, tell, tell_both, tell_once, to_staff
 from app.services.escrow.payouts import Sent
 
 log = logging.getLogger(__name__)
@@ -96,6 +96,16 @@ async def sweep(ctx: AppContext, *, now: datetime | None = None) -> None:
     for deal in delivered:
         assert deal.release_due_at is not None
         if deal.release_due_at <= now and not deal.release_paused:
+            async with ctx.db.session() as session:
+                barred = deal.seller_id is not None and await deals.is_barred(session, deal.seller_id)
+            if barred:  # banned or blacklisted since: the money waits for staff, not for the timer
+                try:
+                    disputed = await deals.open_dispute(ctx.db, deal.id, None, reason="ban", now=now)
+                except DealError:
+                    continue
+                await tell_both(ctx, disputed, "staff_dispute")
+                await dispute_alert(ctx, disputed)
+                continue
             released = await deals.auto_release(ctx.db, deal.id, now=now)
             if released is not None:
                 await tell_both(ctx, released, "auto_released")

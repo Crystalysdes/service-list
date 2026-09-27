@@ -438,6 +438,7 @@ g:
     bad_username: "An @username is needed, for example @durov."
     self_username: "That is your own @username — give the other side's."
     banned: "Deals are not available for your account."
+    other_banned: "The deal is not available: the other side is banned. Do not send money."
     own: "This is your deal — send the link to the other side."
     state: "This cannot be done now — the deal has changed."
     taken: "Someone else has already accepted the invitation."

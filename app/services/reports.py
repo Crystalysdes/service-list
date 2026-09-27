@@ -27,6 +27,7 @@ from app.db.models import (
 )
 from app.domain.links import blacklist_keys, same_target, try_normalize
 from app.domain.richtext import u16_trim
+from app.services import billing
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.media import send_album
@@ -459,6 +460,7 @@ async def create_scam_entry(
         for feature in service.features:
             if feature.status == "active":
                 feature.status = "revoked"
+        await billing.cancel_open_orders(session, service.id, "сервис заблокирован")
         keys |= url_keys(service.url)
         if service.owner_id:
             keys.add(("user_id", str(service.owner_id)))

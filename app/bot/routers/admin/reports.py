@@ -287,8 +287,14 @@ async def on_draft_publish(
         url=draft["url"],
         media_ids=media,
     )
+    banned = await session.get(Service, case.service_id) if case.service_id else None
+    owner = banned.owner_id if banned is not None else None
     await session.commit()
     await state.update_data(scam_draft=None)
+    if owner:  # the owner's deals in the Auto-garant stop too: unpaid ones off, paid ones to a dispute
+        from app.services.escrow.staff import after_ban
+
+        await after_ban(ctx, owner, data["user"].id)
     await call.answer("Внесено в скам-лист")
     assert call.message is not None
     with contextlib.suppress(TelegramAPIError):

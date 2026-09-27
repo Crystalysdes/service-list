@@ -12,11 +12,13 @@ import hmac
 import logging
 
 from aiogram.exceptions import TelegramAPIError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.i18n import h
 from app.context import AppContext
-from app.db.models import Category, Service, User
+from app.db.base import utcnow
+from app.db.models import Category, ModerationRequest, Service, User
 from app.domain.linkcheck import tme_description
 from app.domain.links import Link, try_normalize
 from app.services.audit import audit
@@ -89,9 +91,30 @@ async def _page_description(ctx: AppContext, url: str) -> str:
 async def assign_owner(
     ctx: AppContext, session: AsyncSession, service: Service, user: User, method: str
 ) -> None:
+    from app.services.moderation import close_cards
+
     service.owner_id = user.id
+    # the service has its owner now: every other claim waiting for a moderator is closed with it, so an old
+    # card cannot hand the service to someone else later
+    others = list(
+        (
+            await session.execute(
+                select(ModerationRequest).where(
+                    ModerationRequest.service_id == service.id,
+                    ModerationRequest.kind == "claim",
+                    ModerationRequest.status == "pending",
+                )
+            )
+        ).scalars()
+    )
+    for request in others:
+        request.status = "cancelled"
+        request.reason = "владелец уже подтверждён"
+        request.decided_at = utcnow()
     await audit(session, user.id, "service.claim", "service", service.id, {"method": method})
     await session.commit()
+    for request in others:
+        await close_cards(ctx, "request", request.id, "✖️ Закрыта: владелец сервиса уже подтверждён")
     category = await session.get(Category, service.category_id)
     who = f"@{user.username}" if user.username else str(user.id)
     await notify_staff(

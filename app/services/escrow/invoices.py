@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+import aiohttp
 from sqlalchemy import func, select
 
 from app.context import AppContext
@@ -24,7 +25,7 @@ from app.services.escrow.deals import DealError, Funding
 
 log = logging.getLogger(__name__)
 
-PROVIDER_ERRORS = (CryptoPayError, OSError, TimeoutError)
+PROVIDER_ERRORS = (CryptoPayError, OSError, TimeoutError, aiohttp.ClientError)  # all "no answer"
 MIN_TTL = 300  # seconds an invoice lives at least
 FRESH = timedelta(minutes=2)  # an invoice this close to expiry is replaced instead of shown
 
@@ -120,6 +121,7 @@ async def invoice_for(
             raise DealError("not_buyer")
         if deal.status != "awaiting_payment" or deal.pay_due_at is None or deal.pay_due_at <= now:
             raise DealError("state")
+        await deals.refuse_barred_parties(session, deal, by_user)  # nobody pays a banned seller
         current = await _active(session, deal.id)
         buyer = await session.get(User, deal.buyer_id)
         count = await session.scalar(
@@ -222,8 +224,18 @@ async def check_now(ctx: AppContext, deal_id: int) -> Funding | None:
 
 
 async def cancel(ctx: AppContext, deal_id: int, by_user: int | None, *, staff: bool = False) -> Deal:
-    """Call off an unpaid deal: its invoice goes first; one paid meanwhile funds the deal instead."""
+    """Call off an unpaid deal: its invoice goes first; one paid meanwhile funds the deal instead.
+
+    Who may call it off is checked before anything is touched: a stranger's button (a forged one included)
+    must not delete somebody else's invoice."""
     async with ctx.db.session() as session:
+        deal = await session.get(Deal, deal_id)
+        if deal is None:
+            raise DealError("state")
+        if not (staff or by_user == deal.creator_id or deals.role_of(deal, by_user) is not None):
+            raise DealError("not_party")
+        if deal.status not in deals.UNPAID:
+            raise DealError("state")
         row = await _active(session, deal_id)
     if row is not None:
         dropped = await drop_invoice(ctx, row.id)

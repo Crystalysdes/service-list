@@ -89,6 +89,7 @@ async def after_paid(ctx: AppContext, result: PaidResult) -> None:
             f"«{h(service.name)}» ({h(category.title if category else '')}) от {h(username)}"
         )
         if result.status != "ok":
-            staff_text += f"\n⚠️ Требует внимания: {h(order.note or result.status)} (заказ #{order.id})"
+            why = "; ".join(result.notes or []) or order.note or result.status
+            staff_text += f"\n⚠️ Требует внимания: {h(why)} (заказ #{order.id})"
     await notify_user(ctx, order.user_id, text, reply_markup=builder.as_markup())
     await notify_staff(ctx, staff_text)

@@ -108,6 +108,35 @@ async def test_deleted_post_is_restored(tg, db, ctx):
     assert tg.pins[MAIN] == [last]
 
 
+async def test_a_post_telegram_refuses_does_not_stop_the_channel(tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    del tg.messages[MAIN][ids["vpn"]]
+    async with db.session() as s:
+        row = (await s.execute(select(ChannelPost).where(ChannelPost.message_id == ids["vpn"]))).scalar_one()
+        row.message_id, row.state, row.sent_hash = None, "missing", None  # has to be published anew
+        travel = (await s.execute(select(Category).where(Category.slug == "travel"))).scalar_one()
+        await catalog.add_service(s, travel.id, "New Trip", "@new_trip_bot")
+        await s.commit()
+    # both the navigation making room and the post itself are refused
+    tg.inject("sendMessage", 400, "Bad Request: message is too long", times=2, chat_id=MAIN)
+    result = await engine.run_once(ids["channel_id"])
+
+    assert "New Trip" in _posts(tg)[ids["travel"]]["text"]  # the rest of the channel was still updated
+    assert any("message is too long" in error for error in result.errors)
+    async with db.session() as s:
+        row = (await s.execute(select(ChannelPost).where(ChannelPost.id == row.id))).scalar_one()
+    assert (row.message_id, row.state, row.last_error) == (None, "new", "Bad Request: message is too long")
+    assert _posts(tg)[ids["nav"]]["text"].startswith("Навигационная панель") and tg.pins[MAIN] == [ids["nav"]]
+    notes = [m["text"] for m in tg.bot_messages(1001) if "Не удалось опубликовать пост" in m.get("text", "")]
+    assert len(notes) == 1 and "message is too long" in notes[0]
+
+    await engine.run_once(ids["channel_id"])  # accepted now: published in the navigation's place
+    assert _posts(tg)[ids["nav"]]["text"].startswith("✏️VPN")
+    assert _posts(tg)[max(_posts(tg))]["text"].startswith("Навигационная панель")
+
+
 async def test_emoji_gate_and_lost_emoji_safe_mode(tg, db, ctx):
     ids = await imported_channel(tg, db, ctx, emoji_ok=False)
     engine = engine_for(ctx)
