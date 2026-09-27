@@ -49,6 +49,8 @@ async def _approve(h, tg, button: str = "Одобрить") -> None:
         tg.add_user(OWNER_ID, "Owner", "owner")
     card = h.last(GROUP)
     await h.click(OWNER_ID, card, h.button(card, button)["callback_data"])
+    if "бесплатно" in button:  # then for how long: a month
+        await h.press(OWNER_ID, h.last(GROUP), "1 мес.")
 
 
 def _texts(tg, user_id: int) -> list[str]:

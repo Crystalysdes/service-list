@@ -47,6 +47,7 @@ async def _publish_for_free(
     if OWNER_ID not in tg.users:
         tg.add_user(OWNER_ID, "Owner", "owner")
     await h.press(OWNER_ID, h.last(GROUP), "бесплатно")
+    await h.press(OWNER_ID, h.last(GROUP), "1 мес.")
     if shown:
         async with ctx.db.session() as s:
             main = (await s.execute(select(Channel).where(Channel.role == "main"))).scalar_one()

@@ -15,7 +15,7 @@ from app.db.models import (
 )
 from app.jobs import job_poll_invoices
 from app.services import billing
-from app.services.settings import Chats, get_settings, save_settings
+from app.services.settings import Chats, Limits, get_settings, save_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.fakepay import FakeCryptoPay
 from tests.helpers import MAIN, engine_for, imported_channel
@@ -140,10 +140,24 @@ async def test_approve_for_free_publishes_without_payment(h, tg, db, ctx):
 
     tg.add_user(OWNER_ID, "Owner", "owner")
     await h.press(OWNER_ID, card, "бесплатно")
+    terms = h.last(GROUP)  # the admin chooses for how long
+    assert [b["text"] for b in h.buttons(terms)] == [
+        "1 мес. (30 дн.)",
+        "3 мес. (90 дн.)",
+        "6 мес. (180 дн.)",
+        "♾ Бессрочно",
+        "✍️ Своё число дней",
+    ]
+    async with db.session() as s:
+        assert (await s.execute(select(Service).where(Service.name == "Fly Cheap"))).scalar_one().status == (
+            "pending"
+        )
+    await h.press(OWNER_ID, terms, "3 мес.")
+    assert terms["message_id"] not in tg.messages[GROUP]  # the choice is gone with the decision
     closed = tg.messages[GROUP][card["message_id"]]
-    assert "🎁 Одобрено бесплатно: @owner" in closed["text"] and "reply_markup" not in closed
+    assert "🎁 Одобрено бесплатно на 3 мес.: @owner" in closed["text"] and "reply_markup" not in closed
     note = h.last(USER)
-    assert "одобрена — размещение на 1 мес. бесплатно" in note["text"]
+    assert "одобрена — размещение на 3 мес. бесплатно" in note["text"]
     assert [b["text"] for b in h.buttons(note)] == ["🗂 Управлять сервисом"]
     assert pay.created == []  # no invoice at all
     async with db.session() as s:
@@ -151,7 +165,7 @@ async def test_approve_for_free_publishes_without_payment(h, tg, db, ctx):
         order = (await s.execute(select(Order).where(Order.service_id == service.id))).scalar_one()
         assert service.status == "active" and service.published_at is not None
         days = (service.listing_expires_at - utcnow()).total_seconds() / 86400
-        assert 29.9 < days <= 30  # the first month is the gift, then $10 a month
+        assert 89.9 < days <= 90  # three months are the gift, then $10 a month
         assert (order.status, order.amount_cents, order.provider) == ("fulfilled", 0, "free")
 
     await engine.run_once(ids["channel_id"])
@@ -310,7 +324,6 @@ async def test_handle_paid_is_idempotent(tg, db, ctx):
 async def test_a_moderation_card_is_never_lost(h, tg, db, ctx):
     """A group that refuses the bot (its topic gone, the bot removed) must not swallow requests: the card goes
     to the group itself, then to the staff in private, and the owner learns why."""
-    from app.services.settings import Limits, update_settings
 
     await _setup(tg, db, ctx)
     tg.add_user(OWNER_ID, "Owner", "owner")
@@ -401,3 +414,33 @@ async def test_a_card_with_formatting_telegram_refuses_goes_as_plain_text(h, tg,
     await _submit(h, tg, name="Plain", url="@plain_service")
     card = h.last(GROUP)
     assert "Plain" in card["text"] and not card.get("entities") and h.button(card, "Одобрить")
+
+
+async def test_approve_for_free_for_any_number_of_days_or_for_good(h, tg, db, ctx):
+    await _setup(tg, db, ctx)
+    async with db.session() as s:
+        await update_settings(s, Limits, submission_cooldown_sec=0)
+        await s.commit()
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    await _submit(h, tg)
+    await h.press(OWNER_ID, h.last(GROUP), "бесплатно")
+    await h.press(OWNER_ID, h.last(GROUP), "Своё число дней")
+    question = h.last(GROUP)
+    assert "числом дней" in question["text"]
+    for wrong in ("0", "много"):
+        await h.group_send(GROUP, OWNER_ID, text=wrong, reply_to_message=tg._export(dict(question)))
+        assert "от 1 до 3650" in h.last(GROUP)["text"]
+    await h.group_send(GROUP, OWNER_ID, text="45", reply_to_message=tg._export(dict(question)))
+    assert "Одобрено бесплатно на 45 дн." in h.last(GROUP)["text"]
+    assert "размещение на 45 дн. бесплатно" in h.last(USER)["text"]
+    async with db.session() as s:
+        service = (await s.execute(select(Service).where(Service.name == "Fly Cheap"))).scalar_one()
+        assert 44.9 < (service.listing_expires_at - utcnow()).total_seconds() / 86400 <= 45
+
+    await _submit(h, tg, name="Forever Fly", url="@foreverfly_bot")
+    await h.press(OWNER_ID, h.last(GROUP), "бесплатно")
+    await h.press(OWNER_ID, h.last(GROUP), "Бессрочно")
+    assert "размещение бесплатно" in h.last(USER)["text"]
+    async with db.session() as s:
+        service = (await s.execute(select(Service).where(Service.name == "Forever Fly"))).scalar_one()
+        assert service.status == "active" and service.listing_expires_at is None

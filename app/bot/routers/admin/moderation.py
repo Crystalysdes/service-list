@@ -24,7 +24,7 @@ from app.services.catalog import request_sync
 from app.services.escrow.deals import open_deal_count
 from app.services.notify import notify_user
 from app.services.purchases import listing_choice, listing_offer, listing_term
-from app.services.settings import Limits, get_settings
+from app.services.settings import Limits, Prices, get_settings
 from app.services.users import get_role, has_role
 
 router = Router(name="admin_moderation")
@@ -59,14 +59,26 @@ async def _load(
 
 
 async def _approve(
-    call: CallbackQuery, session: AsyncSession, request: ModerationRequest, data: dict[str, Any], free: bool
+    target: CallbackQuery | Message,
+    session: AsyncSession,
+    request: ModerationRequest,
+    data: dict[str, Any],
+    free: bool,
+    days: int | None = None,
 ) -> dict[str, Any] | None:
     ctx: AppContext = data["ctx"]
+
+    async def tell(text: str) -> None:
+        if isinstance(target, CallbackQuery):
+            await target.answer(text, show_alert=True)
+        else:
+            await target.reply(text)
+
     try:
-        return await moderation.approve(ctx, session, request, data["user"].id, free=free)
+        return await moderation.approve(ctx, session, request, data["user"].id, free=free, days=days)
     except moderation.StaleRequest as exc:
         await moderation.close_stale(ctx, session, request, str(exc))
-        await call.answer(f"Заявка закрыта: {exc}", show_alert=True)
+        await tell(f"Заявка закрыта: {exc}")
         return None
     except moderation.NoRoom as exc:
         why = (
@@ -74,9 +86,7 @@ async def _approve(
             if exc.hidden
             else "В этой ветке нет места: пост превысит лимиты Telegram."
         )
-        await call.answer(
-            f"{why} Перенесите заявку в другую ветку (✏️ Исправить → Ветку) или отклоните.", show_alert=True
-        )
+        await tell(f"{why} Перенесите заявку в другую ветку (✏️ Исправить → Ветку) или отклоните.")
         return None
 
 
@@ -161,26 +171,88 @@ async def on_approve(call: CallbackQuery, session: AsyncSession, **data: Any) ->
     request_sync(ctx)
 
 
-@router.callback_query(F.data.startswith("mod:free:"))
-async def on_approve_free(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+MAX_FREE_DAYS = 3650
+
+
+async def _free_request(
+    call: CallbackQuery, session: AsyncSession, data: dict[str, Any]
+) -> ModerationRequest | None:
+    """The new-service request of a 🎁 button, for an admin only."""
     if not has_role(data.get("role"), "admin"):
         await call.answer("Бесплатно одобряет только администратор.", show_alert=True)
-        return
+        return None
     request = await _load(session, call, data)
+    if request is not None and request.kind != "new":
+        await call.answer()
+        return None
+    return request
+
+
+@router.callback_query(F.data.startswith("mod:free:"))
+async def on_approve_free(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """For how long the service is placed without payment: the terms owners pay for, no term, or any
+    number of days."""
+    request = await _free_request(call, session, data)
     if request is None:
         return
-    if request.kind != "new":
-        await call.answer()
+    prices = await get_settings(session, Prices)
+    builder = InlineKeyboardBuilder()
+    months = sorted({m for m in prices.periods if m >= 1}) if prices.listing_days else []
+    for count in months:
+        days = prices.listing_days * count
+        builder.button(text=f"{count} мес. ({days} дн.)", callback_data=f"mod:fd:{request.id}:{days}")
+    builder.button(text="♾ Бессрочно", callback_data=f"mod:fd:{request.id}:0")
+    builder.button(text="✍️ Своё число дней", callback_data=f"mod:fc:{request.id}")
+    builder.adjust(*([2] * (len(months) // 2) + [1] * (len(months) % 2)), 1, 1)
+    await call.answer()
+    assert call.message is not None
+    await call.message.reply(
+        f"🎁 На какой срок разместить бесплатно (заявка #{request.id})?", reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data.regexp(r"^mod:fd:\d+:\d{1,4}$"))
+async def on_approve_free_days(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    request = await _free_request(call, session, data)
+    days = int((call.data or "").split(":")[3])
+    if request is None or days > MAX_FREE_DAYS:
         return
-    ctx: AppContext = data["ctx"]
-    follow = await _approve(call, session, request, data, free=True)
+    follow = await _approve(call, session, request, data, free=True, days=days)
     if follow is None:
         return
-    await session.commit()
     await call.answer("Одобрено бесплатно")
-    await moderation.close_cards(ctx, "request", request.id, f"🎁 Одобрено бесплатно: {_who(data)}")
+    if call.message is not None:
+        await call.message.delete()
+    await _approved_free(data, session, request, follow, days)
+
+
+async def _approved_free(
+    data: dict[str, Any], session: AsyncSession, request: ModerationRequest, follow: dict[str, Any], days: int
+) -> None:
+    ctx: AppContext = data["ctx"]
+    await session.commit()
+    term = f"на {billing.term_ru(days)}" if days else "бессрочно"
+    await moderation.close_cards(ctx, "request", request.id, f"🎁 Одобрено бесплатно {term}: {_who(data)}")
     await _notify_decision(ctx, request, True, follow)
     request_sync(ctx)
+
+
+@router.callback_query(F.data.startswith("mod:fc:"))
+async def on_approve_free_custom(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any
+) -> None:
+    request = await _free_request(call, session, data)
+    if request is None:
+        return
+    await state.set_state(ModInput.value)
+    await state.set_data({"purpose": "free_days", "request_id": request.id})
+    await call.answer()
+    assert call.message is not None
+    prompt = await call.message.reply(
+        f"Ответьте на это сообщение числом дней бесплатного размещения по заявке #{request.id} "
+        f"(от 1 до {MAX_FREE_DAYS}):"
+    )
+    await state.update_data(prompt_id=prompt.message_id)
 
 
 @router.callback_query(F.data.startswith("mod:no:"))
@@ -355,6 +427,24 @@ async def on_mod_input(message: Message, state: FSMContext, session: AsyncSessio
         return
     purpose = info.get("purpose")
     text = (message.text or "").strip()
+    if purpose == "free_days":
+        if not has_role(data.get("role"), "admin"):
+            await state.clear()
+            return
+        if not text.isdigit() or not 1 <= int(text) <= MAX_FREE_DAYS:
+            await message.reply(f"Нужно число дней от 1 до {MAX_FREE_DAYS}.")
+            return
+        await state.clear()
+        locked = select(ModerationRequest).where(ModerationRequest.id == request.id).with_for_update()
+        request = (await session.execute(locked.execution_options(populate_existing=True))).scalar_one()
+        if request.status != "pending":
+            await message.reply("Заявка уже рассмотрена.")
+            return
+        follow = await _approve(message, session, request, data, free=True, days=int(text))
+        if follow is not None:
+            await message.reply(f"Одобрено бесплатно на {billing.term_ru(int(text))}.")
+            await _approved_free(data, session, request, follow, int(text))
+        return
     if purpose == "reason":
         if not text:
             return

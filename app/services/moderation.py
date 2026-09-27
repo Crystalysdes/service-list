@@ -478,10 +478,12 @@ async def approve(
     moderator_id: int,
     *,
     free: bool = False,
+    days: int | None = None,
 ) -> dict[str, Any]:
     """Apply the decision; returns follow-up info for notifications.
 
-    ``free`` publishes a new listing without payment: a $0 order goes through the usual fulfilment.
+    ``free`` publishes a new listing without payment for ``days`` (0: no term; None: one term): a $0 order
+    goes through the usual fulfilment.
     """
     now = utcnow()
     service = await session.get(Service, request.service_id)
@@ -512,7 +514,8 @@ async def approve(
             kind="listing",
             months=1,
             amount_cents=0 if free else None,
-            params={"days": prices.listing_days} if free else None,  # free: the first term is a gift
+            # free: the days staff chose are a gift (one term unless they said otherwise)
+            params={"days": prices.listing_days if days is None else days} if free else None,
         )
         if free:
             order.provider = "free"
@@ -553,7 +556,12 @@ async def approve(
 
         follow.update(await apply_custom_emoji(session, service, request.payload))
     await audit(
-        session, moderator_id, "request.approve", "request", request.id, {"free": True} if free else None
+        session,
+        moderator_id,
+        "request.approve",
+        "request",
+        request.id,
+        {"free": True, "days": follow.get("days")} if free else None,
     )
     await session.flush()
     return follow
