@@ -22,7 +22,9 @@ from app.domain.links import LinkError, clean_text, normalize
 from app.domain.richtext import Fragment
 from app.services import billing, catalog
 from app.services.audit import audit
+from app.services.purchases import listing_renewable
 from app.services.render_db import category_services
+from app.services.settings import Prices, get_settings
 from app.services.sync import own_links
 from app.services.timefmt import fmt_dt
 
@@ -408,6 +410,8 @@ async def _service_card(session: AsyncSession, service: Service, tz: str) -> tup
         f"Владелец: {h(owner_text)}",
         f"Источник: {service.source}, позиция: {service.position}",
     ]
+    grace = (await get_settings(session, Prices)).listing_grace_days
+    lines.append("Размещение: " + _term_line(service, tz, grace))
     if service.description:
         lines.append(f"Описание: {h(service.description[:300])}")
     features = [f for f in service.features]
@@ -428,8 +432,29 @@ async def _service_card(session: AsyncSession, service: Service, tz: str) -> tup
         builder.button(text="👁 Вернуть в канал", callback_data=f"a:svc:{sid}:show")
     builder.button(text="💎 Опции", callback_data=f"a:svc:{sid}:feat")
     builder.button(text="🗑 Удалить", callback_data=f"a:svc:{sid}:del")
-    builder.adjust(2, 2, 2, 2, 1)
+    termed = listing_renewable(service) and service.status != "approved"
+    if termed:  # a listing with a term: a month for free, or no term any more
+        builder.button(text="🎁 +30 дней", callback_data=f"a:svc:{sid}:lx:30")
+        builder.button(text="♾ Бессрочно", callback_data=f"a:svc:{sid}:lx:0")
+    builder.adjust(2, 2, 2, 2, 2 if termed else 1, 1)
     return "\n".join(lines), back_home(builder, target=f"a:svc:c:{service.category_id}:0")
+
+
+def _term_line(service: Service, tz: str, grace_days: int) -> str:
+    expires = service.listing_expires_at
+    if service.status == "hidden" and service.hidden_reason == "expired":
+        return f"срок закончился {fmt_dt(expires, tz) if expires else ''}, сервис скрыт"
+    if expires is None:
+        return "бессрочно" if service.status == "active" else "—"
+    if expires > utcnow():
+        return f"до {fmt_dt(expires, tz)}"
+    return f"срок закончился, в канале до {fmt_dt(expires + timedelta(days=grace_days), tz)}"
+
+
+def _lapsed(service: Service, grace_days: int) -> bool:
+    """Its listing term is over (grace too): shown again, it would be hidden at once as expired."""
+    expires = service.listing_expires_at
+    return expires is not None and expires + timedelta(days=grace_days) <= utcnow()
 
 
 async def _show_service(
@@ -565,12 +590,41 @@ async def on_service_action(
         service.hidden_reason = "admin"
         await billing.cancel_open_orders(session, service.id, "сервис скрыт администратором")
     elif action == "show":
+        if _lapsed(service, (await get_settings(session, Prices)).listing_grace_days):
+            await call.answer(
+                "Срок размещения закончился — сервис сразу скроется снова. Сначала продлите его: "
+                "«🎁 +30 дней» или «♾ Бессрочно».",
+                show_alert=True,
+            )
+            return
         service.status = "active"
         service.hidden_reason = None
     await audit(session, data["user"].id, f"service.{action}", "service", service.id)
     await session.flush()
     catalog.request_sync(data["ctx"])
     await call.answer("Сохранено")
+    await _show_service(call, session, service.id, _tz(data))
+
+
+@router.callback_query(F.data.regexp(r"^a:svc:\d+:lx:(30|0)$"))
+async def on_listing_gift(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """A month of listing for free, or no term any more; a service hidden because its term ran out comes
+    back (its owner hears "added" once the channel shows it)."""
+    parts = (call.data or "").split(":")
+    service = await session.get(Service, int(parts[2]))
+    if service is None:
+        await call.answer("Не найдено")
+        return
+    days = int(parts[4])
+    try:
+        async with session.begin_nested():  # a refusal leaves nothing behind
+            await billing.gift_listing(session, service, data["user"].id, days, utcnow())
+    except billing.FulfilError as exc:
+        await call.answer(f"Не получилось: {exc}", show_alert=True)
+        return
+    await session.commit()
+    catalog.request_sync(data["ctx"])
+    await call.answer("Добавлено 30 дней размещения" if days else "Размещение теперь бессрочное")
     await _show_service(call, session, service.id, _tz(data))
 
 

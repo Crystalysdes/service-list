@@ -52,7 +52,10 @@ async def _test_emoji(ctx: AppContext) -> tuple[str, str] | None:
         return (row.id, row.alt) if row else None
 
 
-async def _send_probe(ctx: AppContext, storage: int, fragment: Fragment) -> Fragment | None:
+async def _probe(
+    ctx: AppContext, storage: int, fragment: Fragment
+) -> tuple[Fragment | None, TelegramAPIError | None]:
+    """Send ``fragment`` to the storage channel and read back what Telegram kept of it (or why it refused)."""
     bot = ctx.bot
     assert bot is not None
     try:
@@ -63,12 +66,22 @@ async def _send_probe(ctx: AppContext, storage: int, fragment: Fragment) -> Frag
             parse_mode=None,
             disable_notification=True,
         )
-    except TelegramAPIError:
-        log.warning("probe failed", exc_info=True)
-        return None
+    except TelegramAPIError as exc:
+        log.warning("probe failed: %s", exc)
+        return None, exc
     with contextlib.suppress(TelegramAPIError):
         await bot.delete_message(storage, message.message_id)
-    return Fragment.from_message(message)
+    return Fragment.from_message(message), None
+
+
+async def _send_probe(ctx: AppContext, storage: int, fragment: Fragment) -> Fragment | None:
+    return (await _probe(ctx, storage, fragment))[0]
+
+
+def _about_emoji(error: TelegramAPIError | None) -> bool:
+    """Telegram refused the probe because of the emoji in it (not because of the channel or the network)."""
+    words = ("EMOJI", "ENTIT", "DOCUMENT")
+    return isinstance(error, TelegramBadRequest) and any(w in error.message.upper() for w in words)
 
 
 async def selftest(ctx: AppContext) -> Check:
@@ -84,7 +97,12 @@ async def selftest(ctx: AppContext) -> Check:
             "нет ни одного премиум-эмодзи — импортируйте канал или добавьте каталог",
         )
     probe = RichText().text("selftest ").emoji(*emoji).build()
-    got = await _send_probe(ctx, chats.storage_chat_id, probe)
+    got, error = await _probe(ctx, chats.storage_chat_id, probe)
+    if got is None and not _about_emoji(error):
+        # the probe did not go out (the storage channel, the network): nothing was learned about the emoji,
+        # so the last verdict stands; it runs out by itself if this goes on (engine.SELFTEST_MAX_AGE)
+        why = error.message if error is not None else "нет ответа"
+        return Check("Премиум-эмодзи в канале", None, f"не удалось проверить ({why}) — повторю позже")
     ok = got is not None and any(
         e.type == "custom_emoji" and e.custom_emoji_id == emoji[0] for e in got.entities
     )

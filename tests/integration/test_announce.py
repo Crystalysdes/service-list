@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import Broadcast, User
+from app.db.models import Broadcast, Channel, Service, User
 from app.services import announce
 from app.services.settings import Limits, update_settings
 from tests.conftest import OWNER_ID
@@ -39,11 +39,18 @@ async def _readers(tg, db, *ids: int) -> None:
         await s.commit()
 
 
-async def _publish_for_free(h, tg, name: str = "Fly Cheap", url: str = "@flycheap_bot") -> None:
+async def _publish_for_free(
+    h, tg, ctx, name: str = "Fly Cheap", url: str = "@flycheap_bot", *, shown: bool = True
+) -> None:
+    """Approved for free; ``shown``: the channel shows it too (the announcement waits for that)."""
     await _submit(h, tg, name=name, url=url)
     if OWNER_ID not in tg.users:
         tg.add_user(OWNER_ID, "Owner", "owner")
     await h.press(OWNER_ID, h.last(GROUP), "бесплатно")
+    if shown:
+        async with ctx.db.session() as s:
+            main = (await s.execute(select(Channel).where(Channel.role == "main"))).scalar_one()
+        await ctx.services["sync"].run_once(main.id)
 
 
 def _news(tg, user_id: int) -> list[dict]:
@@ -58,7 +65,7 @@ async def _broadcast(db) -> Broadcast:
 async def test_a_new_service_is_announced_once_to_everyone_who_wants_it(h, tg, db, ctx):
     await _setup(tg, db, ctx)
     await _readers(tg, db, BLOCKER, ANN, BOB, MUTED, BANNED, NEWBIE)
-    await _publish_for_free(h, tg)
+    await _publish_for_free(h, tg, ctx)
     row = await _broadcast(db)
     assert (row.kind, row.status) == ("new_service", "pending")  # queued with the publication itself
 
@@ -92,7 +99,7 @@ async def test_a_new_service_is_announced_once_to_everyone_who_wants_it(h, tg, d
 async def test_mute_under_the_message_and_back_on_in_help(h, tg, db, ctx):
     await _setup(tg, db, ctx)
     await _readers(tg, db, ANN)
-    await _publish_for_free(h, tg)
+    await _publish_for_free(h, tg, ctx)
     await announce.job(ctx)
     [news] = _news(tg, ANN)
     await h.press(ANN, news, "Не присылать")
@@ -115,7 +122,7 @@ async def test_goes_on_after_a_restart_and_the_owner_can_switch_it_off(h, tg, db
     async with db.session() as s:  # the seller sends three services one after another
         await update_settings(s, Limits, submission_cooldown_sec=0)
         await s.commit()
-    await _publish_for_free(h, tg)
+    await _publish_for_free(h, tg, ctx)
     monkeypatch.setattr(announce, "BATCH", 1)
     for _ in range(3):  # the seller (skipped), Ann, Bob: one per run, as if the bot restarted in between
         await announce.job(ctx)
@@ -124,7 +131,9 @@ async def test_goes_on_after_a_restart_and_the_owner_can_switch_it_off(h, tg, db
     assert (await _broadcast(db)).status == "done"
     assert len(_news(tg, ANN)) == len(_news(tg, BOB)) == 1
 
-    await _publish_for_free(h, tg, "Sky Deals", "@skydeals_bot")  # queued; then the owner switches it off
+    await _publish_for_free(
+        h, tg, ctx, "Sky Deals", "@skydeals_bot"
+    )  # queued; then the owner switches it off
     await h.say(OWNER_ID, "/admin")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Настройки")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Выключить рассылку о новых сервисах")
@@ -135,6 +144,20 @@ async def test_goes_on_after_a_restart_and_the_owner_can_switch_it_off(h, tg, db
     await announce.job(ctx)
     assert (await _broadcast(db)).status == "cancelled" and len(_news(tg, ANN)) == 1
 
-    await _publish_for_free(h, tg, "Cheap Hotels", "@cheaphotels_bot")  # while off, nothing is queued
+    await _publish_for_free(h, tg, ctx, "Cheap Hotels", "@cheaphotels_bot")  # while off, nothing is queued
     async with db.session() as s:
         assert len((await s.execute(select(Broadcast))).scalars().all()) == 2
+
+
+async def test_the_announcement_waits_until_the_channel_shows_the_service(h, tg, db, ctx):
+    await _setup(tg, db, ctx)
+    await _readers(tg, db, ANN)
+    await _publish_for_free(h, tg, ctx, shown=False)
+    await announce.job(ctx)
+    assert not _news(tg, ANN) and (await _broadcast(db)).status == "pending"  # not in the channel yet
+    async with db.session() as s:  # half an hour later it goes anyway (the channel may be paused)
+        service = (await s.execute(select(Service).where(Service.name == "Fly Cheap"))).scalar_one()
+        service.publish_notice_at = utcnow() - announce.SHOWN_WAIT
+        await s.commit()
+    await announce.job(ctx)
+    assert len(_news(tg, ANN)) == 1

@@ -99,6 +99,12 @@ async def job_glow(ctx: AppContext) -> None:
     await job(ctx)
 
 
+async def job_publish_watch(ctx: AppContext) -> None:
+    from app.services.published import watch
+
+    await watch(ctx)
+
+
 async def job_announce(ctx: AppContext) -> None:
     from app.services.announce import job
 
@@ -129,7 +135,8 @@ async def job_escrow_reconcile(ctx: AppContext) -> None:
 def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
     """(job, trigger) pairs."""
     return [
-        (job_selftest, IntervalTrigger(hours=6, jitter=120)),
+        # every 2 hours: one check that could not be made leaves the emoji verdict fresh (7 hours) meanwhile
+        (job_selftest, IntervalTrigger(hours=2, jitter=120)),
         (job_poll_invoices, IntervalTrigger(seconds=20)),
         (job_expire_unpaid, IntervalTrigger(hours=1, jitter=60)),
         (job_reminders, IntervalTrigger(minutes=10)),
@@ -138,6 +145,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_health, IntervalTrigger(minutes=15, jitter=60)),
         (job_backup, CronTrigger(hour=4, minute=0, timezone=ctx.config.timezone)),
         (job_announce, IntervalTrigger(seconds=10)),
+        (job_publish_watch, IntervalTrigger(minutes=2)),
         (job_glow, IntervalTrigger(seconds=15)),
         (job_escrow_poll, IntervalTrigger(seconds=20)),
         (job_escrow_sweep, IntervalTrigger(minutes=1)),

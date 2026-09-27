@@ -71,11 +71,17 @@ async def test_submit_approve_pay_publish(h, tg, db, ctx):
     await h.click(OWNER_ID, card, h.button(card, "Одобрить")["callback_data"])
     assert "Одобрено" in tg.messages[GROUP][card["message_id"]]["text"]
     approved = h.last(USER)
-    assert "одобрена" in approved["text"] and "$10" in approved["text"]
+    assert "одобрена" in approved["text"] and "$10 в месяц" in approved["text"]
+    assert [b["text"] for b in h.buttons(approved)] == [
+        "💳 1 мес. — $10",
+        "💳 3 мес. — $30",
+        "💳 6 мес. — $60",
+        "🗂 Управлять сервисом",
+    ]
 
-    await h.press(USER, approved, "Оплатить")
+    await h.press(USER, approved, "1 мес.")
     invoice_msg = h.last(USER)
-    assert "Счёт на $10" in invoice_msg["text"]
+    assert "Счёт на $10" in invoice_msg["text"] and "на 1 мес." in invoice_msg["text"]
     assert h.button(invoice_msg, "Оплатить")["url"].startswith("https://t.me/CryptoBot")
     await h.press(USER, invoice_msg, "Я оплатил")  # not paid yet -> alert, nothing changes
     async with db.session() as s:
@@ -84,25 +90,35 @@ async def test_submit_approve_pay_publish(h, tg, db, ctx):
 
     pay.pay()
     await job_poll_invoices(ctx)
-    done = h.last(USER)
-    assert "опубликован" in done["text"]
+    paid = h.last(USER)
+    assert "Оплата получена! Добавляю «Fly Cheap»" in paid["text"]  # not "added" before the channel shows it
     async with db.session() as s:  # published for the first time: everyone in the bot will hear about it
         [news] = (await s.execute(select(Broadcast))).scalars().all()
         assert (news.kind, news.status) == ("new_service", "pending")
+        service = (await s.execute(select(Service).where(Service.name == "Fly Cheap"))).scalar_one()
+        days = (service.listing_expires_at - utcnow()).total_seconds() / 86400
+        assert 29.9 < days <= 30 and service.publish_notice_at is not None
     await job_poll_invoices(ctx)  # idempotent: no second notification
-    assert h.last(USER)["message_id"] == done["message_id"]
+    assert h.last(USER)["message_id"] == paid["message_id"]
 
     await engine.run_once(ids["channel_id"])
     travel = tg.messages[MAIN][ids["travel"]]["text"]
     assert travel.index("Travel with Coco Jango") < travel.index("Fly Cheap") < travel.index("занять место")
+    done = h.last(USER)
+    assert "🎉 Готово! «Fly Cheap» добавлен в ветку" in done["text"] and "Размещение до" in done["text"]
+    assert h.button(done, "Открыть пост")["url"] == f"https://t.me/servicelist/{ids['travel']}"
+    await engine.run_once(ids["channel_id"])  # told once
+    assert h.last(USER)["message_id"] == done["message_id"]
 
     # My services card with stats
     await h.press(USER, done, "Управлять сервисом")
     card = h.last(USER)
     assert "Место в ветке: 8 из 8" in card["text"] and "Всего оплачено: $10" in card["text"]
+    assert "📅 Размещение до" in card["text"] and h.button(card, "Продлить размещение")
     async with db.session() as s:
         order = (await s.execute(select(Order))).scalar_one()
-        assert order.status == "fulfilled"
+        assert order.status == "fulfilled" and (order.months, order.params["days"]) == (1, 30)
+        assert (await s.get(Service, service.id)).publish_notice_at is None
 
 
 async def test_approve_for_free_publishes_without_payment(h, tg, db, ctx):
@@ -124,20 +140,23 @@ async def test_approve_for_free_publishes_without_payment(h, tg, db, ctx):
     closed = tg.messages[GROUP][card["message_id"]]
     assert "🎁 Одобрено бесплатно: @owner" in closed["text"] and "reply_markup" not in closed
     note = h.last(USER)
-    assert "одобрена и опубликована" in note["text"]
-    assert [b["text"] for b in h.buttons(note)] == ["🗂 Управлять сервисом", "📋 Открыть пост"]
-    assert h.button(note, "Открыть пост")["url"] == f"https://t.me/servicelist/{ids['travel']}"
+    assert "одобрена — размещение на 1 мес. бесплатно" in note["text"]
+    assert [b["text"] for b in h.buttons(note)] == ["🗂 Управлять сервисом"]
     assert pay.created == []  # no invoice at all
     async with db.session() as s:
         service = (await s.execute(select(Service).where(Service.name == "Fly Cheap"))).scalar_one()
         order = (await s.execute(select(Order).where(Order.service_id == service.id))).scalar_one()
         assert service.status == "active" and service.published_at is not None
-        assert service.listing_expires_at is None  # the listing term is "forever" by default
+        days = (service.listing_expires_at - utcnow()).total_seconds() / 86400
+        assert 29.9 < days <= 30  # the first month is the gift, then $10 a month
         assert (order.status, order.amount_cents, order.provider) == ("fulfilled", 0, "free")
 
     await engine.run_once(ids["channel_id"])
     travel = tg.messages[MAIN][ids["travel"]]["text"]
     assert travel.index("Travel with Coco Jango") < travel.index("Fly Cheap") < travel.index("занять место")
+    added = h.last(USER)
+    assert "🎉 Готово! «Fly Cheap» добавлен" in added["text"]
+    assert h.button(added, "Открыть пост")["url"] == f"https://t.me/servicelist/{ids['travel']}"
 
 
 async def test_take_a_place_link_starts_in_its_category(h, tg, db, ctx):

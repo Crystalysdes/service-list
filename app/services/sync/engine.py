@@ -291,6 +291,12 @@ class SyncEngine:
         await self._clear_leftovers(channel_id, limiter)
         await self._edit_all(channel_id, desired, limiter, result)
         await self._sync_pins(channel_id, limiter)
+        try:  # the owners of services the channel shows now hear "added" (only the main channel does it)
+            from app.services.published import tell_published
+
+            await tell_published(self.ctx, channel_id)
+        except Exception:
+            log.exception("telling owners about published services failed")
 
     # ------------------------------------------------------------------ structure
     async def _assign_new_blocks(

@@ -140,7 +140,8 @@ async def on_order_action(call: CallbackQuery, session: AsyncSession, **data: An
         await call.answer()
         assert call.message is not None
         await call.message.edit_text(
-            f"Отметить заказ #{order.id} как возвращённый? Оплаченное им время опции будет снято.",
+            f"Отметить заказ #{order.id} как возвращённый? "
+            "Оплаченное им время опции или размещения будет снято.",
             reply_markup=builder.as_markup(),
         )
         return
@@ -164,7 +165,7 @@ async def on_order_action(call: CallbackQuery, session: AsyncSession, **data: An
     elif action == "refundyes":
         fulfilled = order.status in ("fulfilled", "paid")
         order.status = "refunded"
-        if fulfilled and order.kind != "listing":  # only the time this order paid for is taken back
+        if fulfilled:  # only the time this order paid for is taken back
             await billing.take_back(session, order, now)
     elif action == "cancel":
         order.status = "cancelled"  # the poller withdraws its invoice at Crypto Pay

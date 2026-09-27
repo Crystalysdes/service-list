@@ -19,8 +19,9 @@ from app.db.models import Category, ModerationRequest, Service
 from app.domain.links import LinkError, clean_text, normalize
 from app.services import billing, moderation
 from app.services.catalog import request_sync
+from app.services.purchases import listing_renewable, listing_state
 from app.services.render_db import active_feature, category_services
-from app.services.settings import Limits, get_settings
+from app.services.settings import Limits, Prices, get_settings
 from app.services.timefmt import fmt_date
 
 router = Router(name="user_my_services")
@@ -91,6 +92,10 @@ async def card_text(session: AsyncSession, service: Service, t: Translator, tz: 
         ).scalar_one_or_none()
         if request is not None and request.reason:
             lines.append(t("my.reason", reason=h(request.reason)))
+    grace_days = (await get_settings(session, Prices)).listing_grace_days
+    term = listing_state(t, service, tz, grace_days)
+    if term:
+        lines.append(term)
     if service.status == "active":
         ordered = await category_services(session, service.category_id)
         position = next((i + 1 for i, s in enumerate(ordered) if s.id == service.id), None)
@@ -130,6 +135,8 @@ def card_keyboard(service: Service, t: Translator) -> Any:
     sid = service.id
     if service.status == "approved":
         builder.button(text=t("my.btn_pay"), callback_data=f"my:{sid}:pay", style="success")
+    elif listing_renewable(service):  # a listing with a term: running, in grace or over
+        builder.button(text=t("my.btn_renew"), callback_data=f"my:{sid}:renew", style="success")
     if service.status == "active":
         builder.button(text=t("my.btn_top"), callback_data=f"opt:{sid}:top", style="primary")
         builder.button(text=t("my.btn_emoji"), callback_data=f"opt:{sid}:emoji")
@@ -170,22 +177,6 @@ async def on_card(call: CallbackQuery, state: FSMContext, session: AsyncSession,
         await show_list(call, {**data, "session": session})
         return
     await show_card(call, {**data, "session": session}, service)
-
-
-@router.callback_query(F.data.regexp(r"^my:\d+:pay$"))
-async def on_pay_listing(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    service = await _owned(session, data["user"].id, int((call.data or "").split(":")[1]))
-    if service is None or service.status != "approved":
-        await call.answer()
-        return
-    order = await billing.open_listing_order(session, service.id)
-    if order is None:
-        order = await billing.create_order(session, user_id=data["user"].id, service=service, kind="listing")
-    from app.bot.routers.user.payments import send_invoice
-
-    await call.answer()
-    assert call.message is not None
-    await send_invoice(call.message, {**data, "session": session}, order)
 
 
 @router.callback_query(F.data.regexp(r"^my:\d+:edit$"))

@@ -306,3 +306,16 @@ async def test_stats_templates_and_settings(h, tg, db, ctx):
     assert "Жалоб в сутки от одного человека: 5" in h.last(OWNER_ID)["text"]
     async with db.session() as s:
         assert not (await get_settings(s, Captcha)).enabled
+
+
+async def test_an_archive_from_before_monthly_listings_gets_them_too(db):
+    from app.services.backup import _after_restore
+    from app.services.settings import Prices, save_settings
+
+    for revision, days in (("0007", 30), ("0008", 0), (None, 0)):
+        async with db.session() as s:
+            await save_settings(s, Prices(listing_days=0))
+            await _after_restore(s, {"alembic_revision": revision})
+            await s.commit()
+        async with db.session() as s:
+            assert (await get_settings(s, Prices)).listing_days == days, revision

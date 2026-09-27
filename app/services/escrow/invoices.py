@@ -13,19 +13,17 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-import aiohttp
 from sqlalchemy import func, select
 
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Deal, DealInvoice, User
-from app.services.cryptopay import CryptoInvoice, CryptoPayError
+from app.services.cryptopay import PROVIDER_ERRORS, CryptoInvoice
 from app.services.escrow import deals, money
 from app.services.escrow.deals import DealError, Funding
 
 log = logging.getLogger(__name__)
 
-PROVIDER_ERRORS = (CryptoPayError, OSError, TimeoutError, aiohttp.ClientError)  # all "no answer"
 MIN_TTL = 300  # seconds an invoice lives at least
 FRESH = timedelta(minutes=2)  # an invoice this close to expiry is replaced instead of shown
 

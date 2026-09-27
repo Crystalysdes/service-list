@@ -138,6 +138,8 @@ class Service(TimestampMixin, Base):
     hidden_reason: Mapped[str | None] = mapped_column(String(32))
     listing_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # paid (or approved for free) and not in the channel yet: the owner hears "added" once it shows there
+    publish_notice_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approved_by: Mapped[int | None] = mapped_column(BigInteger)
     # dead-link checker state

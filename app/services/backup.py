@@ -487,12 +487,25 @@ async def restore_archive(
                 # in the same transaction: jobs waiting on the emptied tables must not see the restored
                 # state before these are in place (a resent announcement, a payout from an old archive)
                 async with AsyncSession(bind=conn) as session:
-                    await _after_restore(session)
+                    await _after_restore(session, manifest)
                     await session.flush()
     return RestoreResult(tables=counts, media=len(extracted), created_at=manifest.get("created_at"))
 
 
-async def _after_restore(session: AsyncSession) -> None:
+# what migrations did to stored settings, done again to an archive made before them: {revision: SQL}
+SETTINGS_UPGRADES = {
+    8: (  # 0008: a listing "forever" became a listing for 30 days
+        "UPDATE settings SET value = jsonb_set(value, '{listing_days}', '30') "
+        "WHERE key = 'prices' AND jsonb_typeof(value) = 'object' AND value->>'listing_days' = '0'"
+    ),
+}
+
+
+async def _after_restore(session: AsyncSession, manifest: dict[str, Any] | None = None) -> None:
+    revision = str((manifest or {}).get("alembic_revision") or "")
+    for since, sql in SETTINGS_UPGRADES.items():
+        if revision.isdigit() and int(revision) < since:
+            await session.execute(text(sql))
     # the new server must prove premium emoji work again before posts with them are touched
     await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
     from app.services.announce import cancel_unfinished

@@ -22,7 +22,7 @@ from app.domain.richtext import Fragment, RichText
 from app.services import billing, render_db
 from app.services.audit import audit
 from app.services.notify import staff_targets
-from app.services.settings import Limits, get_settings
+from app.services.settings import Limits, Prices, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -340,7 +340,12 @@ class StaleRequest(Exception):
 
 
 class NoRoom(Exception):
-    """The branch's post would exceed Telegram's limits with one more service: move the request or refuse."""
+    """The branch cannot take one more service: its post would exceed Telegram's limits (``hidden``: the
+    branch is not shown in the channel). Move the request to another branch or refuse it."""
+
+    def __init__(self, hidden: bool = False) -> None:
+        super().__init__("hidden" if hidden else "full")
+        self.hidden = hidden
 
 
 async def check_still_valid(session: AsyncSession, request: ModerationRequest, service: Service) -> None:
@@ -388,6 +393,9 @@ async def approve(
     if request.kind == "new":
         from app.services.options import trial_fits
 
+        category = await session.get(Category, service.category_id)
+        if category is None or not category.is_visible:  # nobody would see it there
+            raise NoRoom(hidden=True)
         if not await trial_fits(session, service):  # a post over the limits could not be updated at all
             raise NoRoom()
     request.status = "approved"
@@ -398,18 +406,22 @@ async def approve(
         service.status = "approved"
         service.approved_at = now
         service.approved_by = moderator_id
-        order = await billing.create_order(
+        prices = await get_settings(session, Prices)
+        order = await billing.create_order(  # one term; the owner may choose a longer one when paying
             session,
             user_id=request.user_id,
             service=service,
             kind="listing",
+            months=1,
             amount_cents=0 if free else None,
+            params={"days": prices.listing_days} if free else None,  # free: the first term is a gift
         )
         if free:
             order.provider = "free"
             order.note = "одобрено бесплатно"
         follow["order_id"] = order.id
         follow["amount"] = order.amount_cents
+        follow["days"] = int(order.params.get("days") or 0)
         if order.amount_cents == 0:
             order.status = "paid"
             await billing.fulfil(session, order, now)
@@ -488,6 +500,18 @@ async def ban_user(session: AsyncSession, user_id: int, moderator_id: int, reaso
     )
     for request in pending:
         await reject(session, request, moderator_id, reason)
+    # nothing more is sold to them: unpaid orders close (an invoice paid after all goes to staff), and
+    # approved submissions waiting for payment are dropped
+    await session.execute(
+        update(Order)
+        .where(Order.user_id == user_id, Order.status.in_(billing.OPEN_ORDER))
+        .values(status="cancelled", note="пользователь заблокирован")
+    )
+    await session.execute(
+        update(Service)
+        .where(Service.owner_id == user_id, Service.status == "approved")
+        .values(status="removed", hidden_reason="banned")
+    )
     await audit(session, moderator_id, "user.ban", "user", user_id, {"reason": reason})
     return [r.id for r in pending]
 

@@ -58,7 +58,8 @@ class Prices(SettingsGroup):
     KEY: ClassVar[str] = "prices"
 
     listing_cents: int = 1000
-    listing_days: int = 0  # 0 = forever
+    listing_days: int = 30  # a listing's term, paid for 1/3/6 of them at once (``periods``); 0 = forever
+    listing_grace_days: int = 3  # after the term the service stays in the channel this long, then is hidden
     top_cents: dict[str, int] = Field(default_factory=lambda: {"1": 2500, "2": 2500, "3": 2500})
     emoji_cents: int = 1500
     font_cents: int = 2000
@@ -210,6 +211,7 @@ class EscrowRuntime(SettingsGroup):
     last_reconcile_at: datetime | None = None
     last_balance: dict[str, Any] = Field(default_factory=dict)  # cents: available, onhold, owed
     problems: list[str] = Field(default_factory=list)  # what the last check found
+    told: list[str] = Field(default_factory=list)  # of those, the passing ones already told to the owner
     # accounts the owner vouched for as creators of deal groups (a service account): a group's creator stays
     # in every deal held there, so only these, the owners and current admins may be one
     pool_creators: list[int] = Field(default_factory=list)

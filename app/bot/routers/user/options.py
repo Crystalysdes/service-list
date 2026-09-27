@@ -13,13 +13,15 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot.flows.start import show_screen
 from app.bot.i18n import Translator, h
 from app.bot.routers.user.payments import send_invoice
+from app.db.base import utcnow
 from app.db.models import Category, CustomEmoji, Font, Service
 from app.domain.fonts import glyphs_to_json
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
-from app.services import billing, glow, moderation, options, render_db
+from app.services import billing, glow, moderation, options, purchases, render_db
 from app.services.catalog import request_sync
 from app.services.glownick import placeholder_glyphs
 from app.services.settings import Limits, Prices, Templates, get_settings
@@ -613,15 +615,60 @@ async def on_buy(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
     await send_invoice(call.message, {**data, "session": session}, order)
 
 
-@router.callback_query(F.data.regexp(r"^my:\d+:renew$"))
-async def on_renew_listing(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+# ----------------------------------------------------------------------------------------- the listing
+@router.callback_query(F.data.regexp(r"^my:\d+:(renew|pay)$"))
+async def on_listing_choice(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """Pay for the listing (a new one, a renewal, one whose term ran out): first, for how long."""
+    t: Translator = data["t"]
     service = await _service(session, call, data["user"].id)
     if service is None:
         return
-    if not billing.listing_payable(service) or service.status == "approved":  # hidden by staff: not for money
-        await call.answer(data["t"]("opt.not_active"), show_alert=True)
+    if not purchases.listing_renewable(service):
+        await call.answer(_why_not_listing(t, service), show_alert=True)
         return
-    order = await billing.create_order(session, user_id=data["user"].id, service=service, kind="listing")
+    text, markup = await purchases.listing_choice(session, service, t, data["ctx"].config.timezone)
+    await call.answer()
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+
+def _why_not_listing(t: Translator, service: Service) -> str:
+    if service.status == "active":  # no term: nothing to renew
+        return t("lst.forever")
+    return t("lst.not_now")
+
+
+@router.callback_query(F.data.regexp(r"^my:\d+:lst:\d+$"))
+async def on_listing_period(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    t: Translator = data["t"]
+    service = await _service(session, call, data["user"].id)
+    if service is None:
+        return
+    months = int((call.data or "").split(":")[3])
+    prices = await get_settings(session, Prices)
+    if prices.listing_days and months not in prices.periods:  # a button of an older price list
+        await call.answer(t("lst.gone"), show_alert=True)
+        return
+    # one at a time per service: a double tap reuses the same order and invoice
+    await session.execute(select(func.pg_advisory_xact_lock(billing.LISTING_LOCK, service.id)))
+    await session.refresh(service)
+    if not purchases.listing_renewable(service):
+        await call.answer(_why_not_listing(t, service), show_alert=True)
+        return
+    order = await billing.listing_order(session, data["user"].id, service, months)
+    if not order.amount_cents:  # a branch where listing is free: nothing to pay
+        refusal = await billing.listing_refusal(session, service, days=0, payer_id=order.user_id)
+        if refusal:
+            order.status = "cancelled"
+            await call.answer(refusal, show_alert=True)
+            return
+        order.status, order.provider, order.paid_at = "paid", "free", utcnow()
+        await billing.fulfil(session, order, utcnow())
+        order.status, order.fulfilled_at = "fulfilled", utcnow()
+        await session.commit()
+        request_sync(data["ctx"])
+        await call.answer(t("lst.free_done"), show_alert=True)
+        return
     await call.answer()
     assert call.message is not None
     await send_invoice(call.message, {**data, "session": session}, order)

@@ -396,7 +396,18 @@ async def test_a_transfer_the_bot_does_not_know_holds_that_deals_other_payouts(c
     assert payout.purpose == "seller" and payout.status == "failed" and pay.paid_to(SELLER) == 0
     assert (await _fresh(ctx, deal.id)).needs_attention
 
-    pay.fail = True  # Crypto Pay silent: payouts stay stopped rather than go unchecked
-    await payouts.pause(ctx, "owner")
-    with pytest.raises(DealError):
+    pay.fail = True  # Crypto Pay silent after a restore: payouts stay stopped rather than go unchecked...
+    await payouts.pause(ctx, "restore")
+    with pytest.raises(DealError) as err:
         await payouts.resume(ctx, OWNER_ID)
+    assert err.value.params["why"].startswith("нет ответа")
+    async with ctx.db.session() as s:
+        assert (await get_settings(s, EscrowRuntime)).payouts_paused
+    # ...unless the owner checked the transfers in @CryptoBot and says so
+    assert (await payouts.resume(ctx, OWNER_ID, unchecked=True)).startswith("нет ответа")
+    # after any other pause the bot's own records are complete: payouts go, and the owner is told why
+    # the check was skipped
+    await payouts.pause(ctx, "owner")
+    assert (await payouts.resume(ctx, OWNER_ID)).startswith("нет ответа")
+    async with ctx.db.session() as s:
+        assert not (await get_settings(s, EscrowRuntime)).payouts_paused

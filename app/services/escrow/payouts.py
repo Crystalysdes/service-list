@@ -17,14 +17,15 @@ from typing import Any
 
 from sqlalchemy import func, select, update
 
+from app.bot.i18n import h
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Deal, DealInvoice, DealPayout
 from app.services.audit import audit
-from app.services.cryptopay import CryptoPayError, outcome_unknown
+from app.services.cryptopay import PROVIDER_ERRORS, CryptoPayError, outcome_unknown
 from app.services.escrow import deals, money
 from app.services.escrow.deals import HELD, DealError
-from app.services.escrow.invoices import PROVIDER_ERRORS, provider, take_payment
+from app.services.escrow.invoices import provider, take_payment
 from app.services.redact import describe
 from app.services.settings import EscrowRuntime, get_settings, update_settings
 
@@ -132,15 +133,32 @@ async def pause(ctx: AppContext, reason: str, *, now: datetime | None = None) ->
     return True
 
 
-async def resume(ctx: AppContext, owner_id: int) -> None:
-    """Payouts go again, but only after Crypto Pay's list of transfers is checked (after a restore the bot may
-    not know a transfer it made: that deal's other payouts are held, never paid a second time)."""
-    if provider(ctx) is not None and await hold_unknown_transfers(ctx) is None:
-        raise DealError("provider")
+async def resume(ctx: AppContext, owner_id: int, *, unchecked: bool = False) -> str | None:
+    """Payouts go again after Crypto Pay's list of transfers is checked: after a restore the bot may not know
+    a transfer it made, and that deal's other payouts are held, never paid a second time.
+
+    When Crypto Pay does not give the list: after a restore payouts stay paused (``DealError("provider")``
+    with ``why``) unless the owner says to go on without the check (``unchecked``); after any other pause
+    the bot's own records are complete, so they go. Returns why the check was skipped, if it was."""
+    skipped = None
+    pay = provider(ctx)
+    if pay is not None:
+        try:
+            transfers = await pay.get_transfers()
+        except PROVIDER_ERRORS as exc:
+            skipped = why(exc)
+        else:
+            await hold_unknown_transfers(ctx, transfers)
     async with ctx.db.session() as session:
+        runtime = await get_settings(session, EscrowRuntime)
+        if skipped is not None and runtime.pause_reason == "restore" and not unchecked:
+            raise DealError("provider", why=skipped)
         await update_settings(session, EscrowRuntime, payouts_paused=False, pause_reason=None, paused_at=None)
-        await audit(session, owner_id, "escrow.payouts_resumed")
+        await audit(
+            session, owner_id, "escrow.payouts_resumed", data={"unchecked": skipped} if skipped else None
+        )
         await session.commit()
+    return skipped
 
 
 def deal_code_of(spend_id: str) -> str | None:
@@ -189,9 +207,10 @@ async def hold_unknown_transfers(ctx: AppContext, transfers: list[Any] | None = 
 
 
 async def check_balance(
-    ctx: AppContext, *, now: datetime | None = None
+    ctx: AppContext, *, now: datetime | None = None, errors: list[BaseException] | None = None
 ) -> tuple[bool | None, dict[str, int]]:
-    """Does the app's USDT cover everything owed? None: Crypto Pay did not say. A shortfall pauses payouts."""
+    """Does the app's USDT cover everything owed? None: Crypto Pay did not say (why goes to ``errors``). A
+    shortfall pauses payouts."""
     now = now or utcnow()
     pay = provider(ctx)
     async with ctx.db.session() as session:
@@ -200,8 +219,10 @@ async def check_balance(
         return None, owe
     try:
         balance = await pay.get_balance()
-    except PROVIDER_ERRORS:
-        log.warning("escrow getBalance failed", exc_info=True)
+    except PROVIDER_ERRORS as exc:
+        log.warning("escrow getBalance failed: %s", describe(exc))
+        if errors is not None:
+            errors.append(exc)
         return None, owe
     available, onhold = balance.get(money.ASSET, ("0", "0"))
     numbers = {**owe, "available": money.from_api(available) or 0, "onhold": money.from_api(onhold) or 0}
@@ -308,7 +329,7 @@ async def _refused(ctx: AppContext, pay: Any, payout: DealPayout, name: str, now
                 else "Crypto Pay не даёт делать переводы (включите Transfers в настройках приложения)"
             )
             await alert_owner(
-                ctx, f"⛔️ Выплаты остановлены: {reason}. Ошибка Crypto Pay: <code>{name}</code>."
+                ctx, f"⛔️ Выплаты остановлены: {reason}. Ошибка Crypto Pay: <code>{h(name)}</code>."
             )
         return Sent(row or payout, "paused")
     if kind == "amount" or payout.attempts >= MAX_ATTEMPTS:
@@ -316,7 +337,7 @@ async def _refused(ctx: AppContext, pay: Any, payout: DealPayout, name: str, now
         await alert_owner(
             ctx,
             f"💸 Выплата по сделке #{payout.deal_id} ({money.show(payout.amount_cents)}) не прошла: "
-            f"<code>{name}</code>. Она ждёт решения в /admin → 🛡 Гарант → 💸 Выплаты с ошибкой.",
+            f"<code>{h(name)}</code>. Она ждёт решения в /admin → 🛡 Гарант → 💸 Выплаты с ошибкой.",
         )
         return Sent(row or payout, "failed")
     row = await _move(
@@ -467,6 +488,9 @@ TRANSFERS_HINT = (
 
 def why(exc: BaseException) -> str:
     """What Crypto Pay said, with the fix when it is a known one."""
+    if isinstance(exc, CryptoPayError) and exc.name == "BAD_RESPONSE":
+        status = f" (HTTP {exc.code})" if exc.code else ""
+        return f"Crypto Pay ответил не по API{status} — сбой у Crypto Pay или в сети"
     if not isinstance(exc, CryptoPayError) or outcome_unknown(exc):
         return "нет ответа (сеть или Crypto Pay недоступен)"
     kind = _kind(exc.name)
@@ -493,19 +517,40 @@ async def transfers_problem(ctx: AppContext) -> str | None:
     return None
 
 
+def _reconcile_lock(ctx: AppContext) -> asyncio.Lock:
+    return ctx.services.setdefault("escrow_reconcile_lock", asyncio.Lock())
+
+
 async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str]:
-    """Every few minutes: anything Crypto Pay knows that the bot does not (a paid invoice without a row, a
-    transfer with a garant spend_id the bot never made), then the balance against what is owed."""
-    now = now or utcnow()
-    pay = provider(ctx)
-    if pay is None:
+    """Every few minutes (and on the owner's button): anything Crypto Pay knows that the bot does not (a paid
+    invoice without a row, a transfer with a garant spend_id the bot never made), then the balance against
+    what is owed. One at a time: the job and the button never take the same payment in twice."""
+    if provider(ctx) is None:
         return []
+    async with _reconcile_lock(ctx):
+        return await _reconcile(ctx, now or utcnow())
+
+
+def transient(exc: BaseException) -> bool:
+    """No answer or a garbled one: it may be gone by the next try."""
+    return not isinstance(exc, CryptoPayError) or outcome_unknown(exc)
+
+
+async def _reconcile(ctx: AppContext, now: datetime) -> list[str]:
+    pay = provider(ctx)
     problems: list[str] = []
+    passing: set[str] = set()  # told to the owner only when the next check finds them again
+
+    def failed(what: str, exc: BaseException) -> None:
+        problems.append(f"Crypto Pay не отдаёт {what}: {why(exc)}")
+        if transient(exc):
+            passing.add(problems[-1])
+
     try:
         paid = await pay.paid_invoices()
     except PROVIDER_ERRORS as exc:
         paid = None
-        problems.append(f"Crypto Pay не отдаёт список оплаченных счетов: {why(exc)}")
+        failed("список оплаченных счетов", exc)
     if paid:
         async with ctx.db.session() as session:
             rows = {
@@ -532,7 +577,7 @@ async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str
         transfers = await pay.get_transfers()
     except PROVIDER_ERRORS as exc:
         transfers = None
-        problems.append(f"Crypto Pay не отдаёт список переводов: {why(exc)}")
+        failed("список переводов", exc)
     if transfers:
         await hold_unknown_transfers(ctx, transfers)  # their deals are not paid again meanwhile
         ours = [t for t in transfers if t.spend_id.startswith("esc-")]
@@ -555,11 +600,12 @@ async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str
             elif payout.status not in FINISHED:
                 await _done(ctx, payout, ("pending", "retry", "sending", "unknown", "failed"), transfer, now)
     # last, once payouts that did go out are marked: the balance against what is still owed
-    ok, numbers = await check_balance(ctx, now=now)
+    errors: list[BaseException] = []
+    ok, numbers = await check_balance(ctx, now=now, errors=errors)
     shortfall = None
-    if ok is None:
-        problems.append("Crypto Pay не отдаёт баланс приложения гаранта")
-    elif not ok:  # check_balance has paused payouts and told the owner
+    if ok is None and errors:
+        failed("баланс приложения гаранта", errors[0])
+    elif ok is False:  # check_balance has paused payouts and told the owner
         shortfall = (
             f"баланс {money.show(numbers['available'])} меньше обязательств "
             f"{money.show(numbers['held'] + numbers['owed'])}"
@@ -567,11 +613,18 @@ async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str
         problems.append(shortfall)
     async with ctx.db.session() as session:
         before = await get_settings(session, EscrowRuntime)
-        await update_settings(session, EscrowRuntime, last_reconcile_at=now, problems=problems)
+        # a new problem is told at once; a network hiccup once it is seen twice in a row (and then once only)
+        fresh = [
+            p
+            for p in problems
+            if p != shortfall
+            and (p in before.problems and p not in before.told if p in passing else p not in before.problems)
+        ]
+        told = [p for p in problems if p in passing and (p in fresh or p in before.told)]
+        await update_settings(session, EscrowRuntime, last_reconcile_at=now, problems=problems, told=told)
         await session.commit()
-    fresh = [p for p in problems if p not in before.problems and p != shortfall]
     if fresh:
         from app.services.escrow.notify import alert_owner
 
-        await alert_owner(ctx, "⚠️ Сверка нашла расхождения:\n" + "\n".join(f"• {p}" for p in fresh))
+        await alert_owner(ctx, "⚠️ Сверка нашла расхождения:\n" + "\n".join(f"• {h(p)}" for p in fresh))
     return problems

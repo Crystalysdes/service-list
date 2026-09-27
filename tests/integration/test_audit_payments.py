@@ -36,7 +36,7 @@ async def _approved_with_invoice(h, tg, db, ctx) -> tuple[Service, int]:
     if OWNER_ID not in tg.users:
         tg.add_user(OWNER_ID, "Owner", "owner")
     await h.click(OWNER_ID, card, h.button(card, "Одобрить")["callback_data"])
-    await h.press(USER, h.last(USER), "Оплатить")
+    await h.press(USER, h.last(USER), "1 мес.")
     async with db.session() as s:
         invoice = (await s.execute(select(Invoice))).scalar_one()
     return await _service(db), invoice.provider_invoice_id
@@ -104,14 +104,22 @@ async def test_a_listing_hidden_by_staff_cannot_be_renewed_for_money(h, tg, db, 
         service_id = service.id
     message = await h.say(USER, "/menu")
     await h.click(USER, message, f"my:{service_id}:renew")  # an old reminder's button
+    assert "нельзя оплатить" in _alert(tg)
+    await h.click(USER, message, f"my:{service_id}:lst:1")  # a term button kept from before
+    assert "нельзя оплатить" in _alert(tg)
     async with db.session() as s:
         assert (await s.execute(select(Order))).scalars().all() == []
         service = await s.get(Service, service_id)
         service.hidden_reason = "expired"  # the term ran out: renewing is what the button is for
+        service.listing_expires_at = utcnow() - timedelta(days=5)
         await s.commit()
     await h.click(USER, message, f"my:{service_id}:renew")
+    choice = tg.messages[USER][message["message_id"]]  # the screen shows the choice of term
+    assert "После оплаты сервис вернётся в канал" in choice["text"] and h.button(choice, "3 мес.")
+    await h.press(USER, choice, "3 мес.")
     async with db.session() as s:
-        assert [o.kind for o in (await s.execute(select(Order))).scalars()] == ["listing"]
+        [order] = (await s.execute(select(Order))).scalars().all()
+        assert (order.kind, order.months, order.params["days"]) == ("listing", 3, 90)
 
 
 async def test_a_paid_stale_invoice_is_not_lost_and_a_second_payment_goes_to_staff(h, tg, db, ctx):

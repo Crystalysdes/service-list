@@ -258,3 +258,54 @@ async def test_a_dispute_alert_in_the_group_opens_in_private(h, tg, db, ctx, pay
     await h.press(MOD, alert, "Открыть сделку")
     assert "у вас в личке" in _alert(tg)
     assert f"Сделка #{deal.id}" in _text(h.last(MOD)) and h.button(h.last(MOD), "Вынести решение")
+
+
+async def test_after_a_restore_payouts_wait_for_the_check_unless_the_owner_says_otherwise(
+    h, tg, db, ctx, pay
+):
+    async with db.session() as s:
+        await update_settings(s, EscrowRuntime, payouts_paused=True, pause_reason="restore")
+        await s.commit()
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Гарант")
+    home = h.last(OWNER_ID)
+    assert "база восстановлена из копии" in _text(home)
+    pay.transfers_refused = "METHOD_DISABLED"
+    await h.press(OWNER_ID, home, "Возобновить выплаты")
+    screen = tg.messages[OWNER_ID][home["message_id"]]
+    assert "Выплаты пока не включены" in _text(screen) and "METHOD_DISABLED" in _text(screen)
+    assert "Security → Transfers" in _text(screen)  # the reason, with the fix, stays on the screen
+    async with db.session() as s:
+        assert (await get_settings(s, EscrowRuntime)).payouts_paused
+    await h.press(OWNER_ID, screen, "Включить без сверки")
+    confirm = tg.messages[OWNER_ID][home["message_id"]]
+    assert "Включить выплаты без сверки?" in _text(confirm)
+    await h.press(OWNER_ID, confirm, "Да, включить без сверки")
+    assert "Список переводов не проверен: METHOD_DISABLED" in _alert(tg)
+    async with db.session() as s:
+        assert not (await get_settings(s, EscrowRuntime)).payouts_paused
+
+
+async def test_reconcile_now_and_network_hiccups_are_told_only_when_they_last(h, tg, db, ctx, pay):
+    pay.fail = True
+    await h.say(ADMIN, "/admin")
+    await h.press(ADMIN, h.last(ADMIN), "Гарант")
+    home = h.last(ADMIN)
+    await h.press(ADMIN, home, "Сверить сейчас")
+    screen = tg.messages[ADMIN][home["message_id"]]
+    assert "расхождений: 3" in _text(screen) and "нет ответа" in _text(screen)
+
+    def told() -> list[str]:
+        return [t for t in map(_text, tg.bot_messages(OWNER_ID)) if "Сверка нашла расхождения" in t]
+
+    assert told() == []  # once may be a hiccup
+    await h.press(ADMIN, screen, "Сверить сейчас")
+    assert len(told()) == 1 and "баланс приложения гаранта: нет ответа" in told()[0]  # it lasts: told
+    await h.press(ADMIN, screen, "Сверить сейчас")
+    assert len(told()) == 1  # and only once
+    pay.fail = False
+    await h.press(ADMIN, screen, "Сверить сейчас")
+    assert "Сверка прошла: расхождений нет" in _text(h.last(ADMIN))
+    pay.transfers_refused = "METHOD_DISABLED"  # a refusal is not a hiccup: told at once
+    await h.press(ADMIN, tg.messages[ADMIN][home["message_id"]], "Сверить сейчас")
+    assert len(told()) == 2 and "METHOD_DISABLED" in told()[-1]

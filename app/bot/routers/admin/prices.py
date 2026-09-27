@@ -22,8 +22,9 @@ router.message.filter(RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
 FIELDS = {
-    "listing": "Цена размещения в долларах (например 10):",
-    "listing_days": "Срок размещения в днях (0 — навсегда):",
+    "listing": "Цена размещения за один срок в долларах (например 10):",
+    "listing_days": "Срок размещения в днях (30 — помесячно, 0 — навсегда за один платёж):",
+    "listing_grace": "Сколько дней сервис ещё виден после окончания срока (например 3; 0 — скрыть сразу):",
     "top": "Цены топ-позиций по умолчанию через пробел (например 25 25 25). В ветке можно задать свои.",
     "emoji": "Цена премиум-эмодзи за месяц в долларах:",
     "font": "Цена названия из эмодзи за месяц в долларах:",
@@ -46,7 +47,11 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         "💵 <b>Цены и сроки</b>",
         "",
         f"Размещение: {money(prices.listing_cents)} "
-        + ("навсегда" if not prices.listing_days else f"на {prices.listing_days} дн."),
+        + (
+            "навсегда"
+            if not prices.listing_days
+            else f"на {prices.listing_days} дн., отсрочка {prices.listing_grace_days} дн."
+        ),
         "Топ по умолчанию: " + ", ".join(f"{k}-е — {money(v)}" for k, v in sorted(prices.top_cents.items())),
         f"Премиум-эмодзи: {money(prices.emoji_cents)} / мес.",
         f"Название из эмодзи: {money(prices.font_cents)} / мес.",
@@ -58,6 +63,7 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
     for key, title in (
         ("listing", "Размещение"),
         ("listing_days", "Срок размещения"),
+        ("listing_grace", "Отсрочка после срока"),
         ("top", "Топ"),
         ("emoji", "Эмодзи"),
         ("font", "Эмодзи-название"),
@@ -105,7 +111,13 @@ async def input_price(message: Message, data: dict[str, Any], fsm: dict[str, Any
         if key == "listing":
             prices.listing_cents = _cents(raw)
         elif key == "listing_days":
-            prices.listing_days = max(0, int(raw))
+            prices.listing_days = int(raw)
+            if not 0 <= prices.listing_days <= 3650:
+                raise ValueError
+        elif key == "listing_grace":
+            prices.listing_grace_days = int(raw)
+            if not 0 <= prices.listing_grace_days <= 30:
+                raise ValueError
         elif key == "top":
             values = [_cents(v) for v in raw.split()]
             if not values:

@@ -1,7 +1,8 @@
 """A short message to everyone in the bot when a new service appears in the list.
 
 A service a user submitted is announced once, the first time it is published (after payment or «🎁 Одобрить
-бесплатно»): the category, the name, the owner's description and a button with its link. The messages go out
+бесплатно») and shows in the channel: the category, the name, the owner's description and a button with its
+link. The messages go out
 in the background at a pace Telegram accepts. The last user reached is saved after every message, so a
 restart goes on from there and nobody gets it twice. Those who pressed 🔕, blocked the bot, are banned or have
 not passed the captcha get nothing; neither does the service's owner.
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import Any
 
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
@@ -35,6 +37,7 @@ PAUSE_SEC = 1 / 15
 DESCRIPTION_MAX = 300
 MUTE = "news:off"
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+SHOWN_WAIT = timedelta(minutes=30)
 
 
 async def enqueue_new_service(session: AsyncSession, service: Service) -> None:
@@ -97,9 +100,20 @@ async def job(ctx: AppContext) -> None:
         return
     report: dict[str, Any] | None = None
     async with ctx.db.session() as session:
+        # a service not in the channel yet (paid a moment ago) is announced once it shows there, or after
+        # SHOWN_WAIT at the latest; the ones behind it do not wait for it
+        shown = (
+            (Broadcast.status == "sending")
+            | Service.publish_notice_at.is_(None)
+            | (Service.publish_notice_at <= utcnow() - SHOWN_WAIT)
+        )
         row = (
             await session.execute(
-                select(Broadcast).where(Broadcast.status.in_(UNFINISHED)).order_by(Broadcast.id).limit(1)
+                select(Broadcast)
+                .outerjoin(Service, (Broadcast.kind == NEW_SERVICE) & (Service.id == Broadcast.ref_id))
+                .where(Broadcast.status.in_(UNFINISHED), shown)
+                .order_by(Broadcast.id)
+                .limit(1)
             )
         ).scalar_one_or_none()
         if row is None:

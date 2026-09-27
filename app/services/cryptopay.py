@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 import aiohttp
 
@@ -19,10 +19,12 @@ log = logging.getLogger(__name__)
 
 MAINNET = "https://pay.crypt.bot/api/"
 TESTNET = "https://testnet-pay.crypt.bot/api/"
+T = TypeVar("T")
 
 
 class CryptoPayError(Exception):
-    """The API answered with an error: the request was not carried out."""
+    """The API answered with an error: the request was not carried out. ``BAD_RESPONSE`` (``code`` is then
+    the HTTP status) is a reply that is not the API's: nothing is known about the outcome."""
 
     def __init__(self, name: str, code: int | None = None) -> None:
         super().__init__(name)
@@ -33,6 +35,8 @@ class CryptoPayError(Exception):
 # a reply that is not the API's JSON (a proxy's error page) or no reply at all: the request may have
 # been carried out, so a transfer must be checked by its spend_id before anything else
 UNKNOWN_OUTCOME = (aiohttp.ClientError, TimeoutError, OSError)
+# every way a call can fail: an error from the API, a garbled reply, no reply
+PROVIDER_ERRORS = (CryptoPayError, *UNKNOWN_OUTCOME)
 
 
 def outcome_unknown(exc: BaseException) -> bool:
@@ -88,7 +92,14 @@ class CryptoTransfer:
 
 
 def _items(result: Any) -> list[dict[str, Any]]:
-    return list(result.get("items", [])) if isinstance(result, dict) else list(result or [])
+    items = result["items"] if isinstance(result, dict) else result
+    if not isinstance(items, list):
+        raise TypeError(f"a list was expected, not {type(items).__name__}")
+    return items
+
+
+def _invoices(result: Any) -> list[CryptoInvoice]:
+    return [CryptoInvoice.from_api(item) for item in _items(result)]
 
 
 class PaymentProvider(Protocol):
@@ -115,7 +126,11 @@ class CryptoPayClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: aiohttp.ClientSession | None = None
 
-    async def _request(self, method: str, params: dict[str, Any]) -> Any:
+    async def _request(
+        self, method: str, params: dict[str, Any], parse: Callable[[Any], T] | None = None
+    ) -> Any:
+        """The call's ``result`` (read by ``parse``). Anything but the API's own answer, an empty body, a
+        proxy's page, JSON of another shape or a result that does not read, is ``BAD_RESPONSE``."""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=self.timeout, trust_env=True)
         async with self._session.post(
@@ -123,14 +138,25 @@ class CryptoPayClient:
             json={k: v for k, v in params.items() if v is not None},
             headers={"Crypto-Pay-API-Token": self.token},
         ) as response:
+            status = response.status
             try:
                 data = await response.json(content_type=None)
-            except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
-                raise CryptoPayError("BAD_RESPONSE", response.status) from exc
-        if not data.get("ok"):
-            error = data.get("error") or {}
-            raise CryptoPayError(str(error.get("name", "UNKNOWN")), error.get("code"))
-        return data["result"]
+            except (ValueError, aiohttp.ContentTypeError) as exc:  # not JSON, not text
+                raise CryptoPayError("BAD_RESPONSE", status) from exc
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(data, dict) and not data.get("ok") and isinstance(error, dict):
+            code = error.get("code")
+            raise CryptoPayError(str(error.get("name") or "UNKNOWN"), code if isinstance(code, int) else None)
+        if not isinstance(data, dict) or not data.get("ok") or "result" not in data:
+            log.warning("Crypto Pay %s: not an API reply (HTTP %s): %.200r", method, status, data)
+            raise CryptoPayError("BAD_RESPONSE", status)
+        if parse is None:
+            return data["result"]
+        try:
+            return parse(data["result"])
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            log.warning("Crypto Pay %s: a result that does not read: %.200r", method, data["result"])
+            raise CryptoPayError("BAD_RESPONSE", status) from exc
 
     async def create_invoice(
         self,
@@ -156,7 +182,7 @@ class CryptoPayClient:
         if paid_btn_url:
             params["paid_btn_name"] = "openBot"
             params["paid_btn_url"] = paid_btn_url
-        return CryptoInvoice.from_api(await self._request("createInvoice", params))
+        return await self._request("createInvoice", params, CryptoInvoice.from_api)
 
     async def create_crypto_invoice(
         self,
@@ -182,15 +208,14 @@ class CryptoPayClient:
         if paid_btn_url:
             params["paid_btn_name"] = "openBot"
             params["paid_btn_url"] = paid_btn_url
-        return CryptoInvoice.from_api(await self._request("createInvoice", params))
+        return await self._request("createInvoice", params, CryptoInvoice.from_api)
 
     async def get_invoices(self, invoice_ids: list[int]) -> list[CryptoInvoice]:
         if not invoice_ids:
             return []
-        result = await self._request(
-            "getInvoices", {"invoice_ids": ",".join(str(i) for i in invoice_ids), "count": 1000}
+        return await self._request(
+            "getInvoices", {"invoice_ids": ",".join(str(i) for i in invoice_ids), "count": 1000}, _invoices
         )
-        return [CryptoInvoice.from_api(item) for item in _items(result)]
 
     async def transfer(
         self, *, user_id: int, asset: str, amount: str, spend_id: str, comment: str | None = None
@@ -204,7 +229,7 @@ class CryptoPayClient:
             "comment": comment[:1024] if comment else None,
             "disable_send_notification": False,
         }
-        return CryptoTransfer.from_api(await self._request("transfer", params))
+        return await self._request("transfer", params, CryptoTransfer.from_api)
 
     async def get_transfers(self, *, spend_id: str | None = None) -> list[CryptoTransfer]:
         """The app's transfers: the one with this spend_id, or the latest 1000."""
@@ -213,21 +238,24 @@ class CryptoPayClient:
             "spend_id": spend_id[:64] if spend_id else None,
             "count": 1000,
         }
-        result = await self._request("getTransfers", params)
-        return [CryptoTransfer.from_api(item) for item in _items(result)]
+        return await self._request(
+            "getTransfers", params, lambda result: [CryptoTransfer.from_api(item) for item in _items(result)]
+        )
 
     async def paid_invoices(self) -> list[CryptoInvoice]:
         """The latest 1000 paid invoices of the app (the reconciliation looks for unknown ones)."""
-        result = await self._request("getInvoices", {"status": "paid", "count": 1000})
-        return [CryptoInvoice.from_api(item) for item in _items(result)]
+        return await self._request("getInvoices", {"status": "paid", "count": 1000}, _invoices)
 
     async def get_balance(self) -> dict[str, tuple[str, str]]:
         """asset -> (available, on hold), amounts as the API gives them."""
-        result = await self._request("getBalance", {})
-        return {
-            str(item.get("currency_code")): (str(item.get("available", "0")), str(item.get("onhold", "0")))
-            for item in _items(result)
-        }
+        return await self._request(
+            "getBalance",
+            {},
+            lambda result: {
+                str(item["currency_code"]): (str(item.get("available", "0")), str(item.get("onhold", "0")))
+                for item in _items(result)
+            },
+        )
 
     async def delete_invoice(self, invoice_id: int) -> bool:
         try:

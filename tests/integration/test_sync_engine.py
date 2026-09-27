@@ -10,7 +10,7 @@ from app.domain.richtext import Fragment
 from app.services import catalog
 from app.services.selftest import diagnostics, selftest
 from app.services.settings import Runtime, Templates, get_settings, update_settings
-from tests.helpers import MAIN, engine_for, imported_channel
+from tests.helpers import MAIN, STORAGE, engine_for, imported_channel
 
 
 def _posts(tg):
@@ -249,3 +249,13 @@ async def test_top_positions_order_items(tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     lines = [line for line in _posts(tg)[ids["travel"]]["text"].split("\n") if "↳" in line]
     assert "Tripmafia" in lines[0]
+
+
+async def test_a_probe_that_does_not_go_out_changes_nothing(tg, db, ctx):
+    await imported_channel(tg, db, ctx)  # emoji confirmed a moment ago
+    tg.inject("sendMessage", 400, "Bad Request: chat not found", chat_id=STORAGE)
+    check = await selftest(ctx)
+    assert check.ok is None and "не удалось проверить" in check.detail
+    async with db.session() as s:
+        runtime = await get_settings(s, Runtime)
+    assert runtime.selftest_emoji_ok and not runtime.safe_mode  # the channel keeps its posts' emoji

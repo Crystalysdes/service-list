@@ -13,14 +13,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Category, Feature, Invoice, Order, Service
+from app.db.models import Category, Feature, Invoice, Order, Service, User
 from app.services.audit import audit
-from app.services.cryptopay import CryptoInvoice, CryptoPayError
+from app.services.cryptopay import PROVIDER_ERRORS, CryptoInvoice
 from app.services.settings import Limits, Payments, Prices, get_settings
 
 log = logging.getLogger(__name__)
 
 MONTH = timedelta(days=30)
+LISTING_LOCK = 3  # first key of pg_advisory_xact_lock(int, int): one listing payment at a time per service
 KINDS = ("listing", "top", "emoji", "font")
 OPEN_ORDER = ("created", "invoiced")  # an invoice of an order in any other state must not be paid any more
 CLOSED_SERVICE = ("banned", "removed", "rejected")
@@ -104,11 +105,18 @@ async def base_price(
 async def price_for(
     session: AsyncSession, category: Category, kind: str, months: int = 1, top_position: int | None = None
 ) -> int:
+    """The price of ``months`` (terms of a listing), with the discount for a longer period; a listing without
+    a term is paid once."""
     base = await base_price(session, category, kind, top_position)
-    if kind == "listing":
-        return base
     prices = await get_settings(session, Prices)
+    if kind == "listing" and not prices.listing_days:
+        return base
     return period_price(base, months, prices.period_discount_pct)
+
+
+def term_ru(days: int) -> str:
+    """30 → «1 мес.», 45 → «45 дн.»."""
+    return f"{days // 30} мес." if days and days % 30 == 0 else f"{days} дн."
 
 
 async def create_order(
@@ -121,14 +129,18 @@ async def create_order(
     params: dict[str, Any] | None = None,
     amount_cents: int | None = None,
 ) -> Order:
+    if kind == "listing":
+        prices = await get_settings(session, Prices)
+        months = max(1, months) if prices.listing_days else 0
     if amount_cents is None:
         category = await session.get(Category, service.category_id)
         assert category is not None
         amount_cents = await price_for(
             session, category, kind, months or 1, (params or {}).get("position") if params else None
         )
-    if kind == "listing" and "days" not in (params or {}):  # the term is the one shown when the bill was made
-        params = {**(params or {}), "days": (await get_settings(session, Prices)).listing_days}
+    if kind == "listing" and "days" not in (params or {}):
+        # the term is the one shown when the bill was made: ``months`` terms, none for a free listing
+        params = {**(params or {}), "days": prices.listing_days * months if amount_cents else 0}
     # only one open order per service + kind
     await session.execute(
         update(Order)
@@ -167,7 +179,9 @@ async def active_invoice(session: AsyncSession, order: Order, now: datetime | No
 
 def order_title(order: Order, service_name: str) -> str:
     if order.kind == "listing":
-        return f"Размещение «{service_name}» в Service List"
+        days = int(order.params.get("days") or 0)
+        term = f" на {term_ru(days)}" if days else ""
+        return f"Размещение «{service_name}» в Service List{term}"
     if order.kind == "top":
         return f"Топ-{order.params.get('position')} для «{service_name}», {order.months} мес."
     if order.kind == "emoji":
@@ -181,7 +195,10 @@ async def ensure_invoice(ctx: AppContext, session: AsyncSession, order: Order) -
     provider = ctx.get("cryptopay")
     if provider is None:
         raise BillingError("Оплата временно недоступна.")
-    if order.status not in ("created", "invoiced"):
+    # one at a time per order (until the caller commits): a double tap gets the same invoice, not two
+    await session.execute(select(Order.id).where(Order.id == order.id).with_for_update())
+    await session.refresh(order)
+    if order.status not in OPEN_ORDER:
         raise BillingError("Этот заказ уже нельзя оплатить.")
     existing = await active_invoice(session, order)
     if existing is not None:
@@ -207,7 +224,7 @@ async def ensure_invoice(ctx: AppContext, session: AsyncSession, order: Order) -
             accepted_assets=payments.accepted_assets,
             paid_btn_url=f"https://t.me/{ctx.bot_username}" if ctx.bot_username else None,
         )
-    except (CryptoPayError, OSError, TimeoutError) as exc:
+    except PROVIDER_ERRORS as exc:
         log.warning("createInvoice failed: %s", exc)
         raise BillingError("Платёжная система не отвечает, попробуйте через пару минут.") from exc
     invoice = Invoice(
@@ -335,19 +352,72 @@ async def top_position_holder(session: AsyncSession, category_id: int, position:
     ).scalar_one_or_none()
 
 
+async def listing_refusal(
+    session: AsyncSession, service: Service, *, days: int, payer_id: int | None
+) -> str | None:
+    """Why a listing cannot be carried out now (None: it can). Asked before anything changes: a paid order
+    that is refused goes to staff with this reason (see ``handle_paid``)."""
+    if not listing_payable(service):
+        return f"сервис {service_state(service)}: размещение не выполнено"
+    if days and service.status == "active" and service.listing_expires_at is None:
+        return "у сервиса бессрочное размещение: срок ему не нужен"
+    from app.services.moderation import blacklist_hit
+
+    for user_id in {payer_id, service.owner_id} - {None}:
+        user = await session.get(User, user_id)
+        if user is not None and user.is_banned:
+            return "владелец или плательщик заблокирован"
+    if await blacklist_hit(session, service.url, service.owner_id) is not None:
+        return "ссылка или владелец в чёрном списке"
+    if service.status != "active":  # it comes into the channel: its branch is shown and has room for it
+        category = await session.get(Category, service.category_id)
+        if category is None or not category.is_visible:
+            return "ветка скрыта из канала"
+        from app.services.options import trial_fits
+
+        # one at a time per branch: two services paid together must not both take the last room
+        await session.execute(select(func.pg_advisory_xact_lock(service.category_id)))
+        if not await trial_fits(session, service):
+            return "в посте ветки нет места (лимиты Telegram)"
+    return None
+
+
+def listing_base(service: Service, grace_days: int, now: datetime) -> datetime:
+    """A renewal counts from the end of the term while the service is still shown (the days of grace it
+    was shown are not free); a service that is back after being hidden counts from now."""
+    current = service.listing_expires_at
+    if service.status == "active" and current is not None and current + timedelta(days=grace_days) > now:
+        return current
+    return now
+
+
 async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str]:
-    service = await session.get(Service, order.service_id)
+    service = (
+        await session.execute(
+            select(Service)
+            .where(Service.id == order.service_id)
+            .with_for_update(of=Service)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if service is None:
         raise FulfilError("сервис удалён")
     notes: list[str] = []
-    if order.kind == "listing" and not listing_payable(service):
-        raise FulfilError(f"сервис {service_state(service)}: размещение не выполнено")
     if order.kind != "listing" and service.status in CLOSED_SERVICE:
         raise FulfilError(f"сервис {service_state(service)}: опция не выполнена")
     if order.kind == "listing":
+        days = int(order.params.get("days") or 0)  # an order made when listings had no term keeps none
+        refusal = await listing_refusal(session, service, days=days, payer_id=order.user_id)
+        if refusal:
+            raise FulfilError(refusal)
         prices = await get_settings(session, Prices)
         was_active = service.status == "active"
         first_time = service.published_at is None  # a submitted service, never shown before
+        if days:
+            base = listing_base(service, prices.listing_grace_days, now)
+            service.listing_expires_at = base + timedelta(days=days)
+        else:  # listings without a term: paid once, shown until removed
+            service.listing_expires_at = None
         service.status = "active"
         service.hidden_reason = None
         service.published_at = service.published_at or now
@@ -355,20 +425,13 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
             from app.services.catalog import next_position
 
             service.position = await next_position(session, service.category_id)
+            service.publish_notice_at = now  # the owner hears "added" once the post shows it (published.py)
+            order.params = {**(order.params or {}), "came_in": True}
             if first_time:  # everyone in the bot hears about it (app/services/announce.py)
                 from app.services.announce import enqueue_new_service
 
                 await enqueue_new_service(session, service)
-        days = int(order.params.get("days", prices.listing_days) or 0)
-        if days:
-            base = (
-                service.listing_expires_at
-                if service.listing_expires_at and service.listing_expires_at > now
-                else now
-            )
-            service.listing_expires_at = base + timedelta(days=days)
-        else:  # listings without a term: paid once, shown until removed
-            service.listing_expires_at = None
+        await session.flush()
         return notes
     duration = MONTH * max(1, order.months)
     feature = await feature_row(session, service.id, order.kind)
@@ -417,8 +480,44 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
     return notes
 
 
+async def gift_listing(
+    session: AsyncSession, service: Service, staff_id: int, days: int, now: datetime
+) -> Order:
+    """Staff give ``days`` of listing (0: no term any more) without payment, carried out like a paid
+    renewal (a hidden service whose term ran out comes back). FulfilError when it cannot be."""
+    refusal = await listing_refusal(session, service, days=days, payer_id=None)
+    if refusal:
+        raise FulfilError(refusal)
+    order = Order(
+        user_id=service.owner_id or staff_id,
+        service_id=service.id,
+        kind="listing",
+        months=0,
+        params={"days": days, "by": staff_id},
+        amount_cents=0,
+        status="paid",
+        provider="free",
+        paid_at=now,
+        note="подарок от администрации" if days else "бессрочно по решению администрации",
+    )
+    session.add(order)
+    await session.flush()
+    await fulfil(session, order, now)
+    order.status = "fulfilled"
+    order.fulfilled_at = now
+    await audit(session, staff_id, "listing.gift", "service", service.id, {"days": days})
+    return order
+
+
 async def take_back(session: AsyncSession, order: Order, now: datetime) -> None:
-    """A refunded option order: the months it paid for come off the option (all of it, if nothing is left)."""
+    """A refunded order: the months it paid for come off the option (all of it, if nothing is left), the
+    days of a listing come off its term (the usual grace and hiding follow if it is over)."""
+    if order.kind == "listing":
+        service = await session.get(Service, order.service_id)
+        days = int(order.params.get("days") or 0)
+        if service is not None and days and service.listing_expires_at is not None:
+            service.listing_expires_at -= timedelta(days=days)
+        return
     feature = await feature_row(session, order.service_id, order.kind)
     if feature is None or feature.status != "active":
         return
@@ -433,7 +532,7 @@ async def _withdraw(provider: Any, provider_invoice_id: int) -> bool:
     """Delete an invoice at Crypto Pay; False when it refused (a paid one cannot be deleted) or is silent."""
     try:
         return bool(await provider.delete_invoice(provider_invoice_id))
-    except (CryptoPayError, OSError, TimeoutError):
+    except PROVIDER_ERRORS:
         log.warning("deleteInvoice %s failed", provider_invoice_id, exc_info=True)
         return False
 
@@ -464,7 +563,7 @@ async def poll_invoices(
             i.invoice_id: i
             for i in await provider.get_invoices([invoice.provider_invoice_id for invoice, _ in invoices])
         }
-    except (CryptoPayError, OSError, TimeoutError):
+    except PROVIDER_ERRORS:
         log.warning("getInvoices failed", exc_info=True)
         return []
     results = []
@@ -528,7 +627,7 @@ async def check_order_now(ctx: AppContext, order_id: int) -> PaidResult | None:
         return None
     try:  # every invoice still open for the order: the payer may have used an earlier one
         remote = await provider.get_invoices([invoice.provider_invoice_id for invoice in invoices])
-    except (CryptoPayError, OSError, TimeoutError):
+    except PROVIDER_ERRORS:
         return None
     for item in remote:
         if item.status == "paid":
@@ -552,9 +651,30 @@ async def open_listing_order(session: AsyncSession, service_id: int) -> Order | 
             .where(
                 Order.service_id == service_id,
                 Order.kind == "listing",
-                Order.status.in_(("created", "invoiced")),
+                Order.status.in_(OPEN_ORDER),
             )
             .order_by(Order.id.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
+
+
+async def listing_order(session: AsyncSession, user_id: int, service: Service, months: int) -> Order:
+    """The order for ``months`` of listing: the open one when it is exactly that (same term and price, so
+    its invoice stays valid), a new one otherwise (the open one is closed)."""
+    prices = await get_settings(session, Prices)
+    category = await session.get(Category, service.category_id)
+    assert category is not None
+    months = max(1, months) if prices.listing_days else 0
+    amount = await price_for(session, category, "listing", months or 1)
+    days = prices.listing_days * months if amount else 0
+    order = await open_listing_order(session, service.id)
+    if (
+        order is not None
+        and order.user_id == user_id
+        and order.months == months
+        and order.amount_cents == amount
+        and int(order.params.get("days") or 0) == days
+    ):
+        return order
+    return await create_order(session, user_id=user_id, service=service, kind="listing", months=months)

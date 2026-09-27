@@ -30,6 +30,7 @@ from app.db.base import utcnow
 from app.db.models import AuditLog, Deal, DealChat, DealPayout, User
 from app.services.audit import audit
 from app.services.catalog import request_sync
+from app.services.cryptopay import CryptoPayError
 from app.services.escrow import cards, chats, deals, money, payouts
 from app.services.escrow.deals import HELD, OPEN, UNPAID, DealError
 from app.services.escrow.notify import tell
@@ -70,6 +71,18 @@ PAUSE = {
     "restore": "база восстановлена из копии — проверьте выплаты",
     "owner": "остановлены владельцем",
 }
+
+
+def pause_label(reason: str) -> str:
+    """Why payouts stopped; a refusal of Crypto Pay (``funds:…``, ``config:…``) with its error and fix."""
+    kind, _sep, name = reason.partition(":")
+    if kind == "funds":
+        return f"на балансе приложения гаранта не хватает USDT ({name})"
+    if kind == "config" and name:
+        return f"Crypto Pay не даёт делать переводы: {payouts.why(CryptoPayError(name))}"
+    return PAUSE.get(reason, reason)
+
+
 LIST_TITLES = {
     "disputed": "⚖️ Споры",
     "active": "🔄 Активные сделки",
@@ -110,8 +123,7 @@ async def home_text(session: AsyncSession, ctx: AppContext) -> str:
         lines += ["⚠️ Не задан ESCROW_CRYPTOPAY_TOKEN — оплата сделок невозможна (servicelist config).", ""]
     lines.append(f"Приём сделок: {'✅ включён' if settings.enabled else '⏸ выключен'}")
     if runtime.payouts_paused:
-        reason = runtime.pause_reason or ""
-        lines.append(f"Выплаты: ⏸ на паузе — {h(PAUSE.get(reason, reason))}")
+        lines.append(f"Выплаты: ⏸ на паузе — {h(pause_label(runtime.pause_reason or ''))}")
     else:
         lines.append("Выплаты: ✅ работают")
     balance = runtime.last_balance or {}
@@ -166,6 +178,8 @@ async def home_markup(session: AsyncSession, role: str | None) -> Any:
             callback_data="a:g:c",
         )
     builder.button(text="🔎 Найти сделку", callback_data="a:g:find")
+    if has_role(role, "admin"):
+        builder.button(text="🔍 Сверить сейчас", callback_data="a:g:chk")
     if role == "owner":
         builder.button(
             text="⏸ Остановить приём сделок" if settings.enabled else "▶️ Включить приём сделок",
@@ -218,20 +232,36 @@ async def on_toggle(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
     await _show_home(call.message, {**data, "session": session})
 
 
-@router.callback_query(F.data.in_({"a:g:resume", "a:g:pause"}), RoleFilter("owner"))
+@router.callback_query(F.data.in_({"a:g:resume", "a:g:pause", "a:g:resume!"}), RoleFilter("owner"))
 async def on_payouts_switch(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     ctx: AppContext = data["ctx"]
-    if call.data == "a:g:resume":
+    assert call.message is not None
+    if call.data in ("a:g:resume", "a:g:resume!"):
         try:
-            await payouts.resume(ctx, data["user"].id)
-        except DealError:
-            await call.answer(
-                "Crypto Pay не отдал список переводов — без этой проверки выплаты не включаю. "
-                "Попробуйте через минуту.",
-                show_alert=True,
+            skipped = await payouts.resume(ctx, data["user"].id, unchecked=call.data == "a:g:resume!")
+        except DealError as exc:
+            await call.answer()
+            builder = InlineKeyboardBuilder()
+            builder.button(text="🔄 Попробовать снова", callback_data="a:g:resume")
+            builder.button(text="⚠️ Включить без сверки", callback_data="a:g:force")
+            builder.adjust(1)
+            await show_screen(
+                call.message,
+                "⏸ <b>Выплаты пока не включены</b>\n\n"
+                "База восстановлена из копии: прежде чем платить, бот сверяет её со списком переводов "
+                "Crypto Pay, чтобы никому не заплатить второй раз. Crypto Pay список не отдал: "
+                f"{h(str(exc.params.get('why') or '?'))}.\n\n"
+                "Устраните причину и попробуйте снова. «Включить без сверки» — только если вы сами "
+                "проверили в @CryptoBot переводы приложения гаранта, сделанные после даты копии.",
+                reply_markup=back_home(builder, "a:g"),
             )
             return
-        await call.answer("Выплаты возобновлены — очередь уйдёт в течение минуты", show_alert=True)
+        if skipped:
+            await call.answer(
+                f"Выплаты возобновлены. Список переводов не проверен: {skipped}"[:200], show_alert=True
+            )
+        else:
+            await call.answer("Выплаты возобновлены — очередь уйдёт в течение минуты", show_alert=True)
     else:
         await payouts.pause(ctx, "owner")
         async with ctx.db.session() as own:
@@ -240,6 +270,39 @@ async def on_payouts_switch(call: CallbackQuery, session: AsyncSession, **data: 
         await call.answer("Выплаты остановлены")
     assert call.message is not None
     await _show_home(call.message, {**data, "session": session})
+
+
+@router.callback_query(F.data == "a:g:force", RoleFilter("owner"))
+async def on_force_resume(call: CallbackQuery, **data: Any) -> None:
+    await call.answer()
+    assert call.message is not None
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚠️ Да, включить без сверки", callback_data="a:g:resume!", style="danger")
+    builder.button(text="Отмена", callback_data="a:g")
+    builder.adjust(1)
+    await show_screen(
+        call.message,
+        "Включить выплаты без сверки?\n\n"
+        "Если после даты копии бот уже отправил кому-то деньги по сделке, эта выплата может уйти ещё раз. "
+        "Переводы приложения видны в @CryptoBot → Crypto Pay → My Apps → приложение гаранта.",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "a:g:chk", RoleFilter("admin"))
+async def on_reconcile_now(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    ctx: AppContext = data["ctx"]
+    if ctx.get("escrow_pay") is None:
+        await call.answer("Не задан ESCROW_CRYPTOPAY_TOKEN (servicelist config)", show_alert=True)
+        return
+    await call.answer("Сверяю с Crypto Pay…")
+    problems = await payouts.reconcile(ctx)
+    await session.commit()  # the screen reads what the check has just written
+    assert call.message is not None
+    await _show_home(call.message, {**data, "session": session})
+    if not problems:
+        with contextlib.suppress(TelegramAPIError):
+            await call.message.answer("✅ Сверка прошла: расхождений нет.")
 
 
 # ------------------------------------------------------------------------------------------ lists

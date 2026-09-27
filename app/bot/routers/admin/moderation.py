@@ -22,7 +22,7 @@ from app.services import billing, moderation
 from app.services.catalog import request_sync
 from app.services.escrow.deals import open_deal_count
 from app.services.notify import notify_user
-from app.services.purchases import category_post_url
+from app.services.purchases import listing_choice, listing_offer, listing_term
 from app.services.settings import Limits, get_settings
 from app.services.users import get_role, has_role
 
@@ -67,11 +67,14 @@ async def _approve(
         await moderation.close_stale(ctx, session, request, str(exc))
         await call.answer(f"Заявка закрыта: {exc}", show_alert=True)
         return None
-    except moderation.NoRoom:
+    except moderation.NoRoom as exc:
+        why = (
+            "Эта ветка скрыта из канала: сервис в ней никто не увидит."
+            if exc.hidden
+            else "В этой ветке нет места: пост превысит лимиты Telegram."
+        )
         await call.answer(
-            "В этой ветке нет места: пост превысит лимиты Telegram. Перенесите заявку в другую ветку "
-            "(✏️ Исправить → Ветку) или отклоните.",
-            show_alert=True,
+            f"{why} Перенесите заявку в другую ветку (✏️ Исправить → Ветку) или отклоните.", show_alert=True
         )
         return None
 
@@ -86,29 +89,33 @@ async def _notify_decision(
             return
         category = await session.get(Category, service.category_id)
         limits = await get_settings(session, Limits)
-        post_url = await category_post_url(session, service.category_id)
-    t = Translator(user.lang if user else None)
+        t = Translator(user.lang if user else None)
+        choice = price = None
+        if approved and request.kind == "new" and follow and not follow.get("published"):
+            _text, choice = await listing_choice(session, service, t, ctx.config.timezone)
+            price = await listing_offer(session, service, t)
     name = h(service.name)
     builder = InlineKeyboardBuilder()
     if approved:
         if request.kind == "new" and follow and follow.get("published"):
-            text = t("add.approved_free", name=name, category=h(category.title if category else ""))
+            days = int(follow.get("days") or 0)
+            text = t(
+                "add.approved_free",
+                name=name,
+                category=h(category.title if category else ""),
+                gift=t("add.gift_term", term=listing_term(t, days)) if days else t("add.gift_forever"),
+            )
             builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
-            if post_url:
-                builder.button(text=t("pay.open_post"), url=post_url)
-        elif request.kind == "new" and follow:
+        elif request.kind == "new" and follow and choice is not None:
             text = t(
                 "add.approved",
                 name=name,
-                price=billing.money(follow["amount"]),
+                price=price,
                 category=h(category.title if category else ""),
                 days=limits.approval_ttl_days,
             )
-            builder.button(
-                text=t("pay.button", price=billing.money(follow["amount"])),
-                callback_data=f"pay:{follow['order_id']}",
-                style="success",
-            )
+            await notify_user(ctx, request.user_id, text, reply_markup=choice)
+            return
         elif request.kind == "edit":
             text = t("edit.approved", name=name)
             builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
@@ -267,7 +274,8 @@ async def on_edit_category(call: CallbackQuery, session: AsyncSession, **data: A
     if request is None:
         return
     builder = InlineKeyboardBuilder()
-    for category in (await session.execute(select(Category).order_by(Category.nav_order))).scalars():
+    shown = select(Category).where(Category.is_visible.is_(True)).order_by(Category.nav_order)
+    for category in (await session.execute(shown)).scalars():  # a hidden branch is not in the channel
         builder.button(text=category.title[:40], callback_data=f"mod:setcat:{request.id}:{category.id}")
     builder.adjust(2)
     await call.answer()
@@ -284,6 +292,9 @@ async def on_set_category(call: CallbackQuery, session: AsyncSession, **data: An
     target = await session.get(Category, int((call.data or "").split(":")[3]))
     if request.kind != "new" or service is None or service.status != "pending" or target is None:
         await call.answer("Ветку меняют только в новой заявке.", show_alert=True)  # a live one: /admin
+        return
+    if not target.is_visible:
+        await call.answer("Эта ветка скрыта из канала — выберите другую.", show_alert=True)
         return
     current = await session.get(Category, service.category_id)
     cheaper = current is not None and (

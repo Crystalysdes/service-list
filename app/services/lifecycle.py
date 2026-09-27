@@ -1,4 +1,5 @@
-"""Reminders before options end, expiry of options and listings, top-position waitlist holds."""
+"""Reminders before options and listings end, expiry of options, the grace days and hiding of listings,
+top-position waitlist holds."""
 
 from __future__ import annotations
 
@@ -7,7 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.i18n import Translator, h
@@ -17,7 +18,7 @@ from app.db.models import Category, Feature, Service, TopWaitlist, User
 from app.services.catalog import request_sync
 from app.services.notify import claim_notification, notify_user
 from app.services.options import next_waiter
-from app.services.settings import Limits, Reminders, get_settings
+from app.services.settings import Limits, Prices, Reminders, get_settings
 from app.services.timefmt import fmt_dt
 
 log = logging.getLogger(__name__)
@@ -157,29 +158,48 @@ async def expire(ctx: AppContext) -> int:
                 notices.extend(
                     await _offer_position(session, feature.category_id, feature.top_position, limits)
                 )
-        services = list(
-            (
-                await session.execute(
-                    select(Service).where(
-                        Service.status == "active",
-                        Service.listing_expires_at.is_not(None),
-                        Service.listing_expires_at <= now,
-                    )
+        # listings whose term ran out stay in the channel for the days of grace (the owner hears it once),
+        # then are hidden; paying brings them back
+        grace = timedelta(days=(await get_settings(session, Prices)).listing_grace_days)
+        over = (
+            await session.execute(
+                select(Service.id, Service.owner_id, Service.name, Service.listing_expires_at).where(
+                    Service.status == "active",
+                    Service.listing_expires_at.is_not(None),
+                    Service.listing_expires_at <= now,
+                    Service.listing_expires_at > now - grace,
                 )
-            ).scalars()
-        )
-        for service in services:
-            service.status = "hidden"
-            service.hidden_reason = "expired"
+            )
+        ).all()
+        for service_id, owner_id, name, expires_at in over:
+            if not owner_id or not await claim_notification(
+                session, f"lgrace:{service_id}:{expires_at.isoformat()}"
+            ):
+                continue
+            t = await _user_t(session, owner_id)
+            text = t(
+                "remind.listing_grace", name=h(name), until=fmt_dt(expires_at + grace, ctx.config.timezone)
+            )
+            notices.append((owner_id, text, _renew_kb(t, service_id, "listing")))
+        # one condition for all: a renewal paid this very moment is not hidden by a stale reading
+        hidden = (
+            await session.execute(
+                update(Service)
+                .where(
+                    Service.status == "active",
+                    Service.listing_expires_at.is_not(None),
+                    Service.listing_expires_at <= now - grace,
+                )
+                .values(status="hidden", hidden_reason="expired")
+                .returning(Service.id, Service.owner_id, Service.name)
+            )
+        ).all()
+        for service_id, owner_id, name in hidden:
             changed += 1
-            if service.owner_id:
-                t = await _user_t(session, service.owner_id)
+            if owner_id:
+                t = await _user_t(session, owner_id)
                 notices.append(
-                    (
-                        service.owner_id,
-                        t("remind.expired", what=h(t("remind.kind_listing")), name=h(service.name)),
-                        _renew_kb(t, service.id, "listing"),
-                    )
+                    (owner_id, t("remind.listing_hidden", name=h(name)), _renew_kb(t, service_id, "listing"))
                 )
         # waitlist holds that ran out: next in line
         holds = list(

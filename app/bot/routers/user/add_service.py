@@ -20,7 +20,8 @@ from app.domain.links import LinkError, clean_text, normalize
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
 from app.services import billing, moderation, render_db
-from app.services.settings import Limits, get_settings
+from app.services.purchases import listing_price
+from app.services.settings import Limits, Prices, get_settings
 
 log = logging.getLogger(__name__)
 router = Router(name="user_add_service")
@@ -202,7 +203,8 @@ async def on_link(message: Message, state: FSMContext, session: AsyncSession, **
     await state.set_state(AddService.confirm)
     category = await session.get(Category, info["category_id"])
     assert category is not None
-    price = await billing.price_for(session, category, "listing")
+    base = await billing.base_price(session, category, "listing")
+    price = listing_price(t, base, (await get_settings(session, Prices)).listing_days if base else 0)
     tpl = await render_db.templates(session)
     rt = RichText()
     rt.text(tpl.item_prefix)
@@ -220,7 +222,7 @@ async def on_link(message: Message, state: FSMContext, session: AsyncSession, **
             name=h(info["name"]),
             url=h(link.url),
             description=h(info["description"]),
-            price=billing.money(price),
+            price=price,
         ),
         link_preview_options=NO_PREVIEW,
     )
