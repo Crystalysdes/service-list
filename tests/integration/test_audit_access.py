@@ -139,3 +139,25 @@ async def test_moderators_do_not_decide_their_own_requests_nor_ban_staff(h, tg, 
         await s.commit()
     await h.click(MOD, card, f"mod:banyes:{request.id}")
     assert "Сотрудника так не забанить" in _alert(tg)
+
+
+async def test_in_the_group_only_a_reply_to_the_question_is_the_answer(h, tg, db, ctx):
+    await _setup(tg, db, ctx)
+    await _submit(h, tg)
+    card = h.last(GROUP)
+    if OWNER_ID not in tg.users:
+        tg.add_user(OWNER_ID, "Owner", "owner")
+    await h.click(OWNER_ID, card, h.button(card, "Отклонить")["callback_data"])
+    reasons = h.last(GROUP)
+    await h.press(OWNER_ID, reasons, "Своя причина")
+    question = h.last(GROUP)
+    assert "Ответьте на это сообщение" in question["text"]
+    await h.group_say(GROUP, OWNER_ID, "кто-нибудь видел новый обменник?")  # just chat in the group
+    async with db.session() as s:
+        assert (await s.execute(select(ModerationRequest))).scalar_one().status == "pending"
+    await h.group_send(
+        GROUP, OWNER_ID, text="Сервис не отвечает", reply_to_message=tg._export(dict(question))
+    )
+    async with db.session() as s:
+        request = (await s.execute(select(ModerationRequest))).scalar_one()
+    assert (request.status, request.reason) == ("rejected", "Сервис не отвечает")

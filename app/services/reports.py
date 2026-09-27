@@ -25,7 +25,7 @@ from app.db.models import (
     Service,
     User,
 )
-from app.domain.links import blacklist_keys, same_target, try_normalize
+from app.domain.links import ban_keys, same_target, try_normalize
 from app.domain.richtext import u16_trim
 from app.services import billing
 from app.services.audit import audit
@@ -436,7 +436,7 @@ async def blacklist_values(
 
 def url_keys(url: str | None) -> set[tuple[str, str]]:
     link = try_normalize(url) if url else None
-    return blacklist_keys(link) if link else set()
+    return ban_keys(link) if link else set()
 
 
 async def create_scam_entry(
@@ -561,7 +561,15 @@ async def reject_case(session: AsyncSession, case: ReportCase, moderator_id: int
 
 
 async def ban_reporter(session: AsyncSession, case: ReportCase, reporter_id: int, moderator_id: int) -> bool:
-    """Forbid a user to report; their reports in the case are rejected. True when the case got closed."""
+    """Forbid a user to report; their reports in the case are rejected. True when the case got closed.
+    Only someone who reported in this case (the id comes from a button and could be forged)."""
+    reported = await session.scalar(
+        select(func.count())
+        .select_from(Report)
+        .where(Report.case_id == case.id, Report.reporter_id == reporter_id)
+    )
+    if not reported:
+        raise ValueError("not a reporter of this case")
     user = await session.get(User, reporter_id)
     if user is not None:
         user.report_banned = True

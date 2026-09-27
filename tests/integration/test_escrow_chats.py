@@ -13,7 +13,7 @@ from app.db.models import Deal, DealChat, DealEvent, Staff, User
 from app.services.escrow import chats, deals, invoices
 from app.services.escrow.deals import Draft
 from app.services.escrow.sweep import poll_job, sweep
-from app.services.settings import Escrow, update_settings
+from app.services.settings import Escrow, EscrowRuntime, get_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.fakepay import FakeCryptoPay
 
@@ -44,6 +44,7 @@ async def pay(ctx, tg, db):
             tg.add_user(uid, name, username)
         s.add_all([Staff(user_id=MOD, role="moderator"), Staff(user_id=ADMIN, role="admin")])
         await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, cleanup_minutes=60)
+        await update_settings(s, EscrowRuntime, pool_creators=[KEEPER])  # the owner vouched for it
         await s.commit()
     for chat_id, title in ((G1, "Pool 1"), (G2, "Pool 2")):
         tg.add_chat(chat_id, "supergroup", title, rights=POOL_RIGHTS)
@@ -246,3 +247,20 @@ async def test_a_stranger_left_behind_puts_the_group_in_quarantine(h, tg, db, ct
     assert any("на карантине" in text for text in _texts(tg, OWNER_ID)[-3:])
     later = await _funded(ctx, pay, amount=2_000)
     assert later.chat_status == "waiting"  # the only group is held back
+
+
+async def test_a_group_made_by_an_outsider_waits_for_the_owner(h, tg, db, ctx, pay):
+    """Its creator would sit in every deal held there: an admin cannot bring such a group in, the owner can
+    (and so vouches for the account), and a creator who is nobody any more stops the group."""
+    async with db.session() as s:
+        await update_settings(s, EscrowRuntime, pool_creators=[])
+        await s.commit()
+    row, _check = await chats.add_group(ctx, G1, ADMIN)
+    assert row.state == "quarantine" and "не сотрудник бота" in (row.problem or "")
+    row, _check = await chats.add_group(ctx, G1, OWNER_ID)
+    assert row.state == "free"
+    async with db.session() as s:
+        assert (await get_settings(s, EscrowRuntime)).pool_creators == [KEEPER]
+        await update_settings(s, EscrowRuntime, pool_creators=[])  # the vouch withdrawn
+        await s.commit()
+    assert "не сотрудник бота" in " ".join((await chats.check_group(ctx, G1)).problems)

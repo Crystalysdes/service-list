@@ -36,6 +36,7 @@ router.callback_query.filter(F.message.chat.type == "private")
 
 PAGE = 20
 MAX_TEXT = 3000
+REPORT_IMAGE_MAX = 10 * 1024 * 1024  # bytes: a screenshot; bigger files are refused, not stored
 OWNER_MIN_TEXT = 20
 
 
@@ -250,7 +251,12 @@ async def _collect(
         )
         return
     file_id, unique_id, kind, mime = image
-    record = await store_file(ctx, session, file_id, unique_id, kind=kind, mime=mime)
+    source = message.photo[-1] if message.photo else message.document
+    size = source.file_size if source is not None else None
+    if size is not None and size > REPORT_IMAGE_MAX:  # a screenshot, not a 20 MB file for every report
+        await message.answer(t("rep.not_photo"), reply_markup=_photos_kb(t, purpose, len(media)))
+        return
+    record = await store_file(ctx, session, file_id, unique_id, kind=kind, mime=mime, size=size)
     media.append(record.id)
     previous = info.get("status_id")
     if previous:

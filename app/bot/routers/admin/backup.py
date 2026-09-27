@@ -71,7 +71,7 @@ async def _screen(session: AsyncSession, ctx: AppContext, role: str | None) -> t
         )
     builder = InlineKeyboardBuilder()
     builder.button(text="💾 Сделать копию сейчас", callback_data="a:bak:now")
-    if rows:
+    if rows and has_role(role, "owner"):
         builder.button(text="⬇️ Прислать последнюю", callback_data="a:bak:get")
     if has_role(role, "owner") and await database_is_empty(ctx.db):
         builder.button(text="♻️ Восстановить из файла", callback_data="a:bak:restore")
@@ -112,6 +112,9 @@ async def on_now(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
 
 @router.callback_query(F.data == "a:bak:get")
 async def on_get(call: CallbackQuery, session: AsyncSession, bot: Bot, **data: Any) -> None:
+    if not has_role(data.get("role"), "owner"):  # the whole database: users, payments, deal codes
+        await call.answer("Архив целиком получает только владелец.", show_alert=True)
+        return
     record = (
         await session.execute(select(Backup).order_by(Backup.created_at.desc()).limit(1))
     ).scalar_one_or_none()

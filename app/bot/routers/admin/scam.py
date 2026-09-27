@@ -38,7 +38,7 @@ router.callback_query.filter(RoleFilter("moderator"))
 
 PAGE = 10
 BL_PAGE = 15
-KIND_TITLES = {"url": "ссылка", "username": "@username", "user_id": "ID"}
+KIND_TITLES = {"url": "ссылка", "page": "страница", "host": "сайт", "username": "@username", "user_id": "ID"}
 FIELD_PROMPTS = {
     "name": "Новое название (до 60 символов):",
     "url": "Новая ссылка:",

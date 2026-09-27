@@ -16,7 +16,7 @@ from app.bot.i18n import gettext
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import BlacklistEntry, Category, ModerationCard, ModerationRequest, Order, Service, User
-from app.domain.links import blacklist_keys, try_normalize
+from app.domain.links import blacklist_keys, check_keys, try_normalize
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
 from app.services import billing, render_db
@@ -37,7 +37,7 @@ def reason_text(lang: str | None, code: str) -> str:
 # ------------------------------------------------------------------------------------------ checks
 async def blacklist_hit(session: AsyncSession, url: str, user_id: int | None) -> BlacklistEntry | None:
     link = try_normalize(url)
-    keys = blacklist_keys(link) if link else set()
+    keys = check_keys(link) if link else set()
     if user_id is not None:
         keys.add(("user_id", str(user_id)))
     for kind, value in keys:

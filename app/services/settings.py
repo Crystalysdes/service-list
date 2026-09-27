@@ -201,6 +201,9 @@ class EscrowRuntime(SettingsGroup):
     last_reconcile_at: datetime | None = None
     last_balance: dict[str, Any] = Field(default_factory=dict)  # cents: available, onhold, owed
     problems: list[str] = Field(default_factory=list)  # what the last check found
+    # accounts the owner vouched for as creators of deal groups (a service account): a group's creator stays
+    # in every deal held there, so only these, the owners and current admins may be one
+    pool_creators: list[int] = Field(default_factory=list)
 
 
 class Payments(SettingsGroup):

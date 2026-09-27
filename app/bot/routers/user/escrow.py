@@ -561,20 +561,23 @@ async def on_accept(call: CallbackQuery, **data: Any) -> None:
     await show_card(call, data, deal.id, t("g.done.wait_confirm"))
 
 
-@router.callback_query(F.data.regexp(r"^g:cf:\d+:[01]$"))
+@router.callback_query(F.data.regexp(r"^g:cf:\d+:[01](:\d+)?$"))
 async def on_confirm_party(call: CallbackQuery, **data: Any) -> None:
-    session: AsyncSession = data["session"]
     t: Translator = data["t"]
     ctx: AppContext = data["ctx"]
-    deal_id, approve = _id(call), (call.data or "").endswith(":1")
-    before = await deals.get_deal(session, deal_id)
-    other = None
-    if before is not None:
-        other = before.seller_id if before.creator_role == "buyer" else before.buyer_id
+    parts = (call.data or "").split(":")
+    deal_id, approve = _id(call), parts[3] == "1"
+    if len(parts) < 5:  # a button from before candidates were named: show the current card instead
+        await call.answer(error_text(t, DealError("stale")), show_alert=True)
+        await show_card(call, data, deal_id, answered=True)
+        return
+    other = int(parts[4])
     try:
-        deal = await deals.confirm_counterparty(ctx.db, deal_id, data["user"].id, approve)
+        deal = await deals.confirm_counterparty(ctx.db, deal_id, data["user"].id, approve, candidate=other)
     except DealError as exc:
         await call.answer(error_text(t, exc), show_alert=True)
+        if exc.key == "stale":
+            await show_card(call, data, deal_id, answered=True)
         return
     if other:
         await tell(ctx, other, deal, "confirmed" if approve else "turned_down")
@@ -678,6 +681,17 @@ async def on_cancel(call: CallbackQuery, **data: Any) -> None:
     t: Translator = data["t"]
     ctx: AppContext = data["ctx"]
     user_id = data["user"].id
+    current = await deals.get_deal(data["session"], _id(call))
+    if current is not None and current.status == "pending" and user_id != current.creator_id:
+        # the one who accepted leaves: the slot is free again, the creator's invitation stays open
+        try:
+            deal = await deals.withdraw_acceptance(ctx.db, current.id, user_id)
+        except DealError as exc:
+            await call.answer(error_text(t, exc), show_alert=True)
+            return
+        await tell(ctx, deal.creator_id, deal, "left")
+        await _after(call, data, deal, "left")
+        return
     try:
         deal = await invoices.cancel(ctx, _id(call), user_id)
     except DealError as exc:

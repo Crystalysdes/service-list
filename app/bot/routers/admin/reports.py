@@ -14,7 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.filters import RoleFilter
+from app.bot.filters import PromptReply, RoleFilter
 from app.bot.i18n import h
 from app.bot.routers.admin.panel import back_home
 from app.bot.routers.user.report import clean_report_text
@@ -177,7 +177,8 @@ async def on_draft_edit(call: CallbackQuery, state: FSMContext, **data: Any) -> 
     await state.update_data(input={"purpose": "draft", "field": field, "case_id": draft["case_id"]})
     await call.answer()
     assert call.message is not None
-    await call.message.answer(FIELD_PROMPTS[field])
+    prompt = await call.message.answer(FIELD_PROMPTS[field])
+    await state.update_data(prompt_id=prompt.message_id)
 
 
 @router.callback_query(F.data.regexp(r"^cban:media:\d+$"))
@@ -367,11 +368,14 @@ async def on_reject_custom(
     await state.update_data(input={"purpose": "reason", "case_id": case.id})
     await call.answer()
     assert call.message is not None
-    await call.message.reply(f"Напишите причину отклонения по делу #{case.id} (её увидят заявители):")
+    prompt = await call.message.reply(
+        f"Ответьте на это сообщение причиной отклонения по делу #{case.id} (её увидят заявители):"
+    )
+    await state.update_data(prompt_id=prompt.message_id)
 
 
 # ------------------------------------------------------------------------------------------ text input
-@router.message(CaseInput.value)
+@router.message(CaseInput.value, PromptReply())
 async def on_case_input(message: Message, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     info = await state.get_data()
     request = info.get("input") or {}
@@ -521,7 +525,11 @@ async def on_ban_reporter(call: CallbackQuery, session: AsyncSession, **data: An
         return
     reporter_id = int((call.data or "").rsplit(":", 1)[1])
     ctx: AppContext = data["ctx"]
-    closed = await reports.ban_reporter(session, case, reporter_id, data["user"].id)
+    try:
+        closed = await reports.ban_reporter(session, case, reporter_id, data["user"].id)
+    except ValueError:
+        await call.answer("Этот пользователь не жаловался по делу", show_alert=True)
+        return
     await session.commit()
     await call.answer("Заявителю запрещены жалобы")
     if call.message is not None:

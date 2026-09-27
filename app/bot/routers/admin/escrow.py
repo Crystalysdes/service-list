@@ -222,7 +222,15 @@ async def on_toggle(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
 async def on_payouts_switch(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     ctx: AppContext = data["ctx"]
     if call.data == "a:g:resume":
-        await payouts.resume(ctx, data["user"].id)
+        try:
+            await payouts.resume(ctx, data["user"].id)
+        except DealError:
+            await call.answer(
+                "Crypto Pay не отдал список переводов — без этой проверки выплаты не включаю. "
+                "Попробуйте через минуту.",
+                show_alert=True,
+            )
+            return
         await call.answer("Выплаты возобновлены — очередь уйдёт в течение минуты", show_alert=True)
     else:
         await payouts.pause(ctx, "owner")
@@ -296,7 +304,7 @@ async def on_find(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
     )
 
 
-@input_handler("g_find")
+@input_handler("g_find", role="moderator")
 async def input_find(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
     session: AsyncSession = data["session"]
     raw = (message.text or "").strip()
@@ -592,7 +600,7 @@ def _note_prompt(to_seller: int, to_buyer: int) -> str:
     )
 
 
-@input_handler("g_split")
+@input_handler("g_split", role="moderator")
 async def input_split(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
     session: AsyncSession = data["session"]
     deal = await deals.get_deal(session, int(fsm["deal_id"]))
@@ -617,7 +625,7 @@ async def input_split(message: Message, data: dict[str, Any], fsm: dict[str, Any
     return False
 
 
-@input_handler("g_note")
+@input_handler("g_note", role="moderator")
 async def input_note(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
     note = (message.text or "").strip()[: deals.NOTE_MAX]
     if not note:
@@ -780,7 +788,7 @@ async def on_manual(call: CallbackQuery, state: FSMContext, session: AsyncSessio
     )
 
 
-@input_handler("g_manual")
+@input_handler("g_manual", role="owner")
 async def input_manual(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
     ctx: AppContext = data["ctx"]
     ref = (message.text or "").strip()
@@ -850,7 +858,7 @@ async def on_ban(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
 FIELDS: dict[str, tuple[str, str]] = {
     # key: (title, how it is typed)
     "fee": ("Комиссия гаранта, %", "число от 1 до 20, можно с десятыми: 5 или 4.5"),
-    "min": ("Минимальная сумма сделки, USDT", "от 1 до максимальной"),
+    "min": ("Минимальная сумма сделки, USDT", "от 2 до максимальной"),
     "max": ("Максимальная сумма сделки, USDT", "от минимальной до 1 000 000"),
     "days": ("Сроки выполнения на выбор, дни", "до шести чисел от 1 до 60 через запятую: 1, 3, 7, 14"),
     "accept": ("Время на принятие приглашения, ч", "от 1 до 168"),
@@ -918,6 +926,10 @@ async def on_setting(call: CallbackQuery, state: FSMContext, **data: Any) -> Non
     await ask(call, state, "g_setting", f"{title}: пришлите {hint}.", "a:g:set", key=key)
 
 
+MIN_DEAL_CENTS = 200  # with any fee (≤ 20%) the payout of a deal stays at or above Crypto Pay's 1 USDT
+MAX_DEAL_CENTS = 100_000_000  # 1 000 000 USDT; amounts are stored as 32-bit cents
+
+
 def _parse_setting(key: str, raw: str, settings: Escrow) -> dict[str, Any] | None:
     raw = raw.strip().replace(" ", "")
     try:
@@ -926,11 +938,11 @@ def _parse_setting(key: str, raw: str, settings: Escrow) -> dict[str, Any] | Non
             return {"fee_bps": bps} if 100 <= bps <= 2000 else None
         if key in ("min", "max", "admin_only"):
             cents = 0 if raw == "0" else money.parse_amount(raw)
-            if key == "min":
-                return {"min_cents": cents} if 100 <= cents <= settings.max_cents else None
+            if key == "min":  # 2 USDT at least: after the fee a payout must still reach Crypto Pay's minimum
+                return {"min_cents": cents} if MIN_DEAL_CENTS <= cents <= settings.max_cents else None
             if key == "max":
-                return {"max_cents": cents} if settings.min_cents <= cents <= 100_000_000 else None
-            return {"admin_only_from_cents": cents}
+                return {"max_cents": cents} if settings.min_cents <= cents <= MAX_DEAL_CENTS else None
+            return {"admin_only_from_cents": cents} if 0 <= cents <= MAX_DEAL_CENTS else None
         if key == "days":
             days = sorted({int(part) for part in raw.split(",") if part})
             return (
@@ -955,7 +967,7 @@ def _parse_setting(key: str, raw: str, settings: Escrow) -> dict[str, Any] | Non
     return {field: value} if low <= value <= high else None
 
 
-@input_handler("g_setting")
+@input_handler("g_setting", role="owner")
 async def input_setting(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
     if data.get("role") != "owner":
         return True
@@ -1094,13 +1106,13 @@ async def _add_pool_group(message: Message, state: FSMContext, data: dict[str, A
     await message.answer(text, reply_markup=markup)
 
 
-@router.message(DealChatAdd.waiting, F.chat_shared, F.chat.type == "private")
+@router.message(DealChatAdd.waiting, F.chat_shared, F.chat.type == "private", RoleFilter("admin"))
 async def on_pool_shared(message: Message, state: FSMContext, **data: Any) -> None:
     assert message.chat_shared is not None
     await _add_pool_group(message, state, data, message.chat_shared.chat_id)
 
 
-@router.message(DealChatAdd.waiting, F.chat.type == "private")
+@router.message(DealChatAdd.waiting, F.chat.type == "private", RoleFilter("admin"))
 async def on_pool_id(message: Message, state: FSMContext, **data: Any) -> None:
     raw = (message.text or "").strip()
     if not re.fullmatch(r"-100\d{5,}", raw):

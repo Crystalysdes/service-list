@@ -1,7 +1,14 @@
+x-logging: &logging  # container logs are rotated, never fill the disk
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *logging
     environment:
       POSTGRES_USER: servicelist
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-servicelist}
@@ -17,6 +24,7 @@ services:
   bot:
     build: .
     restart: unless-stopped
+    logging: *logging
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://servicelist:${POSTGRES_PASSWORD:-servicelist}@db:5432/servicelist

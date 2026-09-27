@@ -30,13 +30,13 @@ from aiogram.types import FSInputFile
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from sqlalchemy import DateTime, Integer, func, select, text
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy import URL, DateTime, Integer, func, make_url, select, text
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from app.config import Config
 from app.context import AppContext
 from app.db.base import Base, utcnow
-from app.db.models import Backup, Category, Channel, Deal, MediaFile, Service
+from app.db.models import Backup, Deal, MediaFile
 from app.db.session import Database
 from app.services.settings import Chats, EscrowRuntime, Runtime, get_settings, update_settings
 
@@ -128,13 +128,26 @@ def _encode(value: Any) -> Any:
     return value
 
 
-def _libpq_url(url: str) -> str:
-    return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+def _dump_target(database_url: str) -> tuple[str, dict[str, str]]:
+    """The libpq URL without its password, and the password as PGPASSWORD: a command line is visible to
+    every user of the server (ps), the environment of a process is not."""
+    url = make_url(database_url)
+    password = url.password or ""
+    bare = URL.create(
+        "postgresql",
+        username=url.username,
+        host=url.host,
+        port=url.port,
+        database=url.database,
+        query=url.query,
+    ).render_as_string(hide_password=False)
+    return bare, ({"PGPASSWORD": str(password)} if password else {})
 
 
 async def _pg_dump(database_url: str, target: Path) -> bool:
     if shutil.which("pg_dump") is None:
         return False
+    url, secret_env = _dump_target(database_url)
     try:
         process = await asyncio.create_subprocess_exec(
             "pg_dump",
@@ -142,11 +155,12 @@ async def _pg_dump(database_url: str, target: Path) -> bool:
             "--no-owner",
             "--no-privileges",
             "-d",
-            _libpq_url(database_url),
+            url,
             "-f",
             str(target),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **secret_env},
         )
         _, stderr = await asyncio.wait_for(process.communicate(), timeout=600)
     except (OSError, TimeoutError):
@@ -318,12 +332,41 @@ class RestoreResult:
     created_at: str | None
 
 
-async def database_is_empty(db: Database) -> bool:
+# what a fresh install already has before a restore: the owner who opened the bot, the settings the wizard
+# wrote, the chats it saw; a restore replaces these too. Anything else means the bot is in use.
+FRESH_TABLES = frozenset(
+    {"users", "staff", "settings", "bot_chats", "notifications", "audit_log", "media_files", "custom_emoji"}
+)
+
+
+async def busy_tables(db: Database) -> dict[str, int]:
+    """Tables a restore would wipe that hold real work (orders, deals, services...), with their row counts."""
+    busy: dict[str, int] = {}
     async with db.session() as session:
-        for model in (Category, Service, Channel):
-            if await session.scalar(select(func.count()).select_from(model)):
-                return False
-    return True
+        for table in _tables():
+            if table.name in FRESH_TABLES:
+                continue
+            count = int(await session.scalar(select(func.count()).select_from(table)) or 0)
+            if count:
+                busy[table.name] = count
+    return busy
+
+
+async def database_is_empty(db: Database) -> bool:
+    """Nothing but a fresh install: a restore (which empties every table first) loses no work."""
+    return not await busy_tables(db)
+
+
+def _open_with_any(path: Path, passphrases: list[str], workdir: Path) -> zipfile.ZipFile:
+    """The current passphrase, then the previous one (archives made before it was changed)."""
+    problem: BackupError | None = None
+    for passphrase in passphrases or [""]:
+        try:
+            return _open_archive(path, passphrase, workdir)
+        except BackupError as exc:
+            problem = exc
+    assert problem is not None
+    raise problem
 
 
 def _open_archive(path: Path, passphrase: str, workdir: Path) -> zipfile.ZipFile:
@@ -342,11 +385,30 @@ def _open_archive(path: Path, passphrase: str, workdir: Path) -> zipfile.ZipFile
     return archive
 
 
+MAX_MANIFEST = 4 << 20  # bytes
+MAX_ENTRY = 1 << 30  # one table or file, unpacked
+MAX_TOTAL = 8 << 30  # the whole archive, unpacked
+
+
+def _check_sizes(archive: zipfile.ZipFile) -> None:
+    """A small archive must not unpack into something that fills the memory or the disk."""
+    total = 0
+    for info in archive.infolist():
+        if info.file_size > MAX_ENTRY or (info.filename == "manifest.json" and info.file_size > MAX_MANIFEST):
+            raise BackupError(f"в архиве слишком большой файл: {info.filename}")
+        total += info.file_size
+    if total > MAX_TOTAL:
+        raise BackupError("архив распаковывается в слишком большой объём")
+
+
 def _extract_media(archive: zipfile.ZipFile, manifest: dict[str, Any], media_dir: Path) -> dict[str, Path]:
     media_dir.mkdir(parents=True, exist_ok=True)
     extracted: dict[str, Path] = {}
     for item in manifest.get("media", []):
-        target = media_dir / Path(item["name"]).name
+        name = Path(str(item.get("name") or "")).name
+        if name in ("", ".", "..") or item.get("name") not in archive.namelist():
+            raise BackupError(f"в архиве повреждён список файлов: {item.get('name')!r}")
+        target = media_dir / name
         with archive.open(item["name"]) as src, target.open("wb") as out:
             shutil.copyfileobj(src, out)
         extracted[target.name] = target
@@ -368,12 +430,20 @@ def _decode_row(table: Any, row: dict[str, Any]) -> dict[str, Any]:
 async def restore_archive(
     config: Config, db: Database, path: Path, *, require_empty: bool = True
 ) -> RestoreResult:
-    if require_empty and not await database_is_empty(db):
-        raise BackupError("в базе уже есть данные: восстановление возможно только в пустую базу")
-    passphrase = config.backup_passphrase.get_secret_value() if config.backup_passphrase else ""
+    if require_empty:
+        busy = await busy_tables(db)
+        if busy:
+            listed = ", ".join(f"{name}: {count}" for name, count in sorted(busy.items()))
+            raise BackupError(f"в базе уже есть данные ({listed}): восстановление только в пустую базу")
+    passphrases = [
+        secret.get_secret_value()
+        for secret in (config.backup_passphrase, config.backup_passphrase_old)
+        if secret is not None and secret.get_secret_value()
+    ]
     with tempfile.TemporaryDirectory() as tmp:
-        archive = await asyncio.to_thread(_open_archive, Path(path), passphrase, Path(tmp))
+        archive = await asyncio.to_thread(_open_with_any, Path(path), passphrases, Path(tmp))
         with archive:
+            _check_sizes(archive)
             manifest = json.loads(archive.read("manifest.json"))
             if manifest.get("app") != "service-list" or int(manifest.get("format", 0)) > FORMAT:
                 raise BackupError("архив создан другой программой или более новой версией бота")
@@ -414,19 +484,25 @@ async def restore_archive(
                                 f'(SELECT MAX(id) IS NOT NULL FROM "{table.name}"))'
                             )
                         )
-    async with db.session() as session:
-        # the new server must prove premium emoji work again before posts with them are touched
-        await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
-        from app.services.announce import cancel_unfinished
-
-        await cancel_unfinished(session)  # the archive may predate announcements sent since
-        # the archive may predate payouts made since: garant payouts wait until the owner has checked
-        if await session.scalar(select(func.count()).select_from(Deal)):
-            await update_settings(
-                session, EscrowRuntime, payouts_paused=True, pause_reason="restore", paused_at=utcnow()
-            )
-        await session.commit()
+                # in the same transaction: jobs waiting on the emptied tables must not see the restored
+                # state before these are in place (a resent announcement, a payout from an old archive)
+                async with AsyncSession(bind=conn) as session:
+                    await _after_restore(session)
+                    await session.flush()
     return RestoreResult(tables=counts, media=len(extracted), created_at=manifest.get("created_at"))
+
+
+async def _after_restore(session: AsyncSession) -> None:
+    # the new server must prove premium emoji work again before posts with them are touched
+    await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
+    from app.services.announce import cancel_unfinished
+
+    await cancel_unfinished(session)  # the archive may predate announcements sent since
+    # the archive may predate payouts made since: garant payouts wait until the owner has checked
+    if await session.scalar(select(func.count()).select_from(Deal)):
+        await update_settings(
+            session, EscrowRuntime, payouts_paused=True, pause_reason="restore", paused_at=utcnow()
+        )
 
 
 # ------------------------------------------------------------------------------------------ CLI

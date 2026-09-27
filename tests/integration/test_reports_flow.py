@@ -296,18 +296,20 @@ async def test_manual_scam_entry_and_blacklist_screen(h, tg, db, ctx):
     async with db.session() as s:
         keys = {(b.kind, b.value) for b in (await s.execute(select(BlacklistEntry))).scalars()}
     assert ("url", "https://fake-exchange.example/login") in keys
+    assert ("page", "fake-exchange.example/login") in keys  # any query or "www." of that page too
+    assert ("host", "fake-exchange.example") not in keys  # a page, not the whole site
 
     # the blacklist screen lists and removes entries; moderators add by user id
     await h.say(OWNER_ID, "/admin")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Чёрный список")
     screen = h.last(OWNER_ID)
-    assert "записей — 1" in screen["text"]
+    assert "записей — 2" in screen["text"]
     await h.press(OWNER_ID, screen, "Добавить")
     await h.say(OWNER_ID, "777000111")
     assert "Добавлено записей: 1" in h.last(OWNER_ID)["text"]
     await h.press(OWNER_ID, h.last(OWNER_ID), "ID: 777000111")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Удалить из чёрного списка")
-    assert "записей — 1" in h.last(OWNER_ID)["text"]
+    assert "записей — 2" in h.last(OWNER_ID)["text"]
 
 
 async def test_empty_scam_channel_gets_the_pinned_intro_and_page_one_stays_on_top(h, tg, db, ctx):

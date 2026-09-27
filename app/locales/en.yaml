@@ -377,6 +377,7 @@ g:
     withdrawn: "Offer taken back"
     agreed: "The deal is being cancelled — the money goes back to the buyer"
     declined: "The deal goes on"
+    left: "You left the deal — the invitation is free again"
   inv:
     title: "🛡 <b>Invitation to deal #{n}</b>\n\n{creator} offers a deal through the garant. You are the {role}."
     rep: "📊 Record: in the bot since {since} · successful deals {completed} · different counterparties {partners} · turnover {turnover} · disputes {disputes}"
@@ -489,6 +490,7 @@ g:
     confirmed: "✅ The creator confirmed you in deal #{n} «{title}»."
     turned_down: "✖️ The creator of deal #{n} did not confirm your participation."
     cancelled: "✖️ Deal #{n} «{title}» was cancelled before payment."
+    left: "↩️ The person who accepted deal #{n} «{title}» changed their mind. The invitation is free again — send the link to your counterparty."
     delivered: "📦 The seller marked deal #{n} delivered.\nCheck and release the money, or open a dispute. Without an answer, {seller_gets} go to the seller at {release_due}."
     released: "✅ The buyer confirmed deal #{n} — {seller_gets} are on the way to you in @CryptoBot."
     dispute: "⚠️ A dispute is open on deal #{n}. The money stays with the garant, a moderator will look into it."

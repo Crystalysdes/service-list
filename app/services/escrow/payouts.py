@@ -133,10 +133,59 @@ async def pause(ctx: AppContext, reason: str, *, now: datetime | None = None) ->
 
 
 async def resume(ctx: AppContext, owner_id: int) -> None:
+    """Payouts go again, but only after Crypto Pay's list of transfers is checked (after a restore the bot may
+    not know a transfer it made: that deal's other payouts are held, never paid a second time)."""
+    if provider(ctx) is not None and await hold_unknown_transfers(ctx) is None:
+        raise DealError("provider")
     async with ctx.db.session() as session:
         await update_settings(session, EscrowRuntime, payouts_paused=False, pause_reason=None, paused_at=None)
         await audit(session, owner_id, "escrow.payouts_resumed")
         await session.commit()
+
+
+def deal_code_of(spend_id: str) -> str | None:
+    """``esc-{code}-{purpose}`` → code (see :func:`deals.spend_id`)."""
+    if not spend_id.startswith("esc-"):
+        return None
+    code, _sep, _purpose = spend_id[4:].rpartition("-")
+    return code or None
+
+
+async def hold_unknown_transfers(ctx: AppContext, transfers: list[Any] | None = None) -> list[Any] | None:
+    """Garant transfers the bot has no row for (made before a restore, say): each one's deal is marked for
+    attention and its other payouts that have not gone out are stopped, so that deal is never paid twice.
+    Returns those transfers (None: Crypto Pay did not give the list)."""
+    if transfers is None:
+        pay = provider(ctx)
+        if pay is None:
+            return None
+        try:
+            transfers = await pay.get_transfers()
+        except PROVIDER_ERRORS:
+            return None
+    ours = [t for t in transfers if t.spend_id.startswith("esc-")]
+    async with ctx.db.session() as session:
+        known = set(
+            (
+                await session.execute(
+                    select(DealPayout.spend_id).where(DealPayout.spend_id.in_([t.spend_id for t in ours]))
+                )
+            ).scalars()
+        )
+        unknown = [t for t in ours if t.spend_id not in known]
+        for transfer in unknown:
+            code = deal_code_of(transfer.spend_id)
+            deal = (await session.execute(select(Deal).where(Deal.code == code))).scalar_one_or_none()
+            if deal is None:
+                continue
+            deal.needs_attention = True
+            await session.execute(
+                update(DealPayout)
+                .where(DealPayout.deal_id == deal.id, DealPayout.status.in_(("pending", "retry")))
+                .values(status="failed", last_error=f"по сделке уже был перевод {transfer.spend_id}")
+            )
+        await session.commit()
+    return unknown
 
 
 async def check_balance(
@@ -485,6 +534,7 @@ async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str
         transfers = None
         problems.append(f"Crypto Pay не отдаёт список переводов: {why(exc)}")
     if transfers:
+        await hold_unknown_transfers(ctx, transfers)  # their deals are not paid again meanwhile
         ours = [t for t in transfers if t.spend_id.startswith("esc-")]
         async with ctx.db.session() as session:
             known = {

@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.db.base import utcnow
 from app.db.models import Feature, ModerationRequest, Service, User
-from app.domain.linkcheck import fingerprint
+from app.domain.linkcheck import Page, fingerprint
 from app.services.linkcheck import LinkChecker
 from app.services.settings import LinkCheckSettings, update_settings
 from tests.conftest import OWNER_ID
@@ -66,6 +66,7 @@ def _travel_lines(tg, ids) -> str:
 
 async def test_dead_link_hidden_after_streak_and_restored(h, tg, db, ctx):
     ids, engine, checker, fetcher = await _setup(tg, db, ctx)
+    await checker.run_pass()  # every link alive: their titles are known from now on
     fetcher.tme("hannibal_lecter", None)
     first = await checker.run_pass()
     assert (first.checked, first.dead, first.hidden, first.breaker) == (15, 1, [], False)
@@ -85,7 +86,7 @@ async def test_dead_link_hidden_after_streak_and_restored(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     assert "Hannibal Lecter" not in _travel_lines(tg, ids)
 
-    # the link works again: the service returns by itself
+    # the link works again with the title it had: the service returns by itself
     fetcher.tme("hannibal_lecter", "Hannibal Lecter")
     report = await checker.run_pass()
     assert report.restored == [hannibal.id]
@@ -93,6 +94,35 @@ async def test_dead_link_hidden_after_streak_and_restored(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     assert "Hannibal Lecter" in _travel_lines(tg, ids)
     assert (await _service(db, "Hannibal Lecter")).link_dead_streak == 0
+
+
+async def test_a_site_that_opens_again_waits_for_staff(h, tg, db, ctx):
+    """An expired domain can be bought by someone else: a site that is back is not shown again by itself."""
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    async with db.session() as s:
+        site = Service(category_id=1, name="Old Site", url="https://old-site.example", status="active")
+        s.add(site)
+        await s.commit()
+        site_id = site.id
+    fetcher.pages["GET https://old-site.example"] = Page(None, error="dns")
+    fetcher.pages["HEAD https://old-site.example"] = Page(None, error="dns")
+    for _ in range(3):
+        await checker.run_pass()
+    await _patch(db, site_id, link_first_dead_at=utcnow() - timedelta(hours=49))
+    assert (await checker.run_pass()).hidden == [site_id]
+
+    fetcher.pages["GET https://old-site.example"] = Page(200, "<title>Casino</title>")
+    fetcher.pages["HEAD https://old-site.example"] = Page(200)
+    report = await checker.run_pass()
+    assert report.restored == []
+    service = await _service(db, "Old Site")
+    assert (service.status, service.hidden_reason) == ("hidden", "dead_link")
+    alert = h.last(OWNER_ID)
+    assert "снова открывается, но сервис остаётся скрытым" in alert["text"]
+    await checker.run_pass()
+    assert h.last(OWNER_ID)["message_id"] == alert["message_id"]  # told once
+    await h.press(OWNER_ID, alert, "Вернуть в список")
+    assert (await _service(db, "Old Site")).status == "active"
 
 
 async def test_owner_is_warned_as_soon_as_the_link_dies(h, tg, db, ctx):

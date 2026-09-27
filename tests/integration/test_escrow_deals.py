@@ -154,6 +154,23 @@ async def test_without_a_username_the_creator_confirms_who_accepted(db):
     assert deal.status == "awaiting_payment" and deal.buyer_id == BUYER and deal.pay_due_at is not None
 
 
+async def test_leaving_before_confirmation_frees_the_slot_and_old_buttons_confirm_nobody(db):
+    await _setup(db)
+    deal = await deals.create_deal(db, SELLER, "seller_s", _draft(role="seller", counterparty=None))
+    deal = await deals.accept_deal(db, deal.code, STRANGER, "stranger_x", deal.terms_hash)
+    with pytest.raises(DealError):  # only the one who holds the slot can leave it
+        await deals.withdraw_acceptance(db, deal.id, BUYER)
+    deal = await deals.withdraw_acceptance(db, deal.id, STRANGER)
+    assert (deal.status, deal.buyer_id) == ("pending", None)  # the creator's invitation stays open
+
+    deal = await deals.accept_deal(db, deal.code, BUYER, "buyer_b", deal.terms_hash)
+    with pytest.raises(DealError) as err:  # the creator's old message showed STRANGER
+        await deals.confirm_counterparty(db, deal.id, SELLER, True, candidate=STRANGER)
+    assert err.value.key == "stale"
+    deal = await deals.confirm_counterparty(db, deal.id, SELLER, True, candidate=BUYER)
+    assert deal.status == "awaiting_payment" and deal.buyer_id == BUYER
+
+
 async def test_who_may_create_and_accept(db):
     await _setup(db, max_unpaid_per_user=2, min_cents=500, max_cents=100_000)
     for bad, key in (

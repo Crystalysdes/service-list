@@ -50,10 +50,17 @@ def _back(t: Translator, service_id: int, builder: InlineKeyboardBuilder | None 
 
 
 async def _periods_keyboard(
-    session: AsyncSession, t: Translator, service_id: int, kind: str, arg: str, base_cents: int
+    session: AsyncSession,
+    t: Translator,
+    service_id: int,
+    kind: str,
+    arg: str,
+    base_cents: int,
+    builder: InlineKeyboardBuilder | None = None,
 ) -> Any:
+    """Period buttons (under ``builder``'s buttons, if given): buying while the option runs extends it."""
     prices = await get_settings(session, Prices)
-    builder = InlineKeyboardBuilder()
+    builder = builder or InlineKeyboardBuilder()
     for months in prices.periods:
         amount = billing.period_price(base_cents, months, prices.period_discount_pct)
         pct = prices.period_discount_pct.get(str(months))
@@ -257,18 +264,14 @@ async def on_emoji_pick(call: CallbackQuery, session: AsyncSession, **data: Any)
         return
     tpl = await render_db.templates(session)
     preview = _line_preview(tpl, service, emoji=(emoji.id, emoji.alt), glyphs=_current_glyphs(service))
-    active = render_db.active_feature(service, "emoji") is not None
-    if active:
-        builder = InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
+    if render_db.active_feature(service, "emoji") is not None:  # switch for free, or extend (periods below)
         builder.button(
             text=t("opt.emoji_set_free"), callback_data=f"opt:{service.id}:eset:{emoji.id}", style="success"
         )
-        builder.adjust(1)
-        markup = _back(t, service.id, builder)
-    else:
-        category = await session.get(Category, service.category_id)
-        base = await billing.base_price(session, category, "emoji")  # type: ignore[arg-type]
-        markup = await _periods_keyboard(session, t, service.id, "emoji", emoji.id, base)
+    category = await session.get(Category, service.category_id)
+    base = await billing.base_price(session, category, "emoji")  # type: ignore[arg-type]
+    markup = await _periods_keyboard(session, t, service.id, "emoji", emoji.id, base, builder)
     await call.answer()
     assert call.message is not None
     await call.message.answer(t("opt.emoji_preview"))
@@ -415,17 +418,14 @@ async def on_font_pick(call: CallbackQuery, session: AsyncSession, **data: Any) 
         (emoji_feature.params["emoji_id"], emoji_feature.params.get("alt", "⭐")) if emoji_feature else None
     )
     preview = _line_preview(tpl, service, emoji=emoji, glyphs=glyphs)
-    if render_db.active_feature(service, "font") is not None:
-        builder = InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
+    if render_db.active_feature(service, "font") is not None:  # switch for free, or extend (periods below)
         builder.button(
             text=t("opt.font_set_free"), callback_data=f"opt:{service.id}:fset:{font.id}", style="success"
         )
-        builder.adjust(1)
-        markup = _back(t, service.id, builder)
-    else:
-        category = await session.get(Category, service.category_id)
-        base = await billing.base_price(session, category, "font")  # type: ignore[arg-type]
-        markup = await _periods_keyboard(session, t, service.id, "font", str(font.id), base)
+    category = await session.get(Category, service.category_id)
+    base = await billing.base_price(session, category, "font")  # type: ignore[arg-type]
+    markup = await _periods_keyboard(session, t, service.id, "font", str(font.id), base, builder)
     await call.answer()
     assert call.message is not None
     await call.message.answer(t("opt.emoji_preview"))

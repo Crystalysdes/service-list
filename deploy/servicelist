@@ -5,7 +5,8 @@
 #   servicelist deploy [SHA]  update the code (branch head or a commit of the branch) and restart
 #   servicelist deploy-key    create the SSH key GitHub Actions deploys with, print the GitHub secrets
 #   servicelist status | logs [N] | start | restart | stop
-#   servicelist backup        make a backup archive now (also sent to the storage channel)
+#   servicelist backup        make a backup archive now, kept on the server (the daily one also goes to
+#                             the storage channel; a copy made in /admin → 💾 too)
 #   servicelist restore FILE  restore a backup archive into the (empty) database
 #
 # The deploy key may run only "servicelist ssh-deploy", which accepts nothing but "deploy <commit sha>".
@@ -20,7 +21,7 @@ DEFAULT_BRANCH="claude/amazing-pasteur-j0islp"
 KEY_COMMENT="github-actions-deploy"
 ENV_FILE="$SL_DIR/.env"
 MANAGED_KEYS=(BOT_TOKEN OWNER_IDS POSTGRES_PASSWORD CRYPTOPAY_TOKEN CRYPTOPAY_TESTNET ESCROW_CRYPTOPAY_TOKEN
-    ESCROW_CRYPTOPAY_TESTNET TIMEZONE BACKUP_PASSPHRASE LOG_LEVEL)
+    ESCROW_CRYPTOPAY_TESTNET TIMEZONE BACKUP_PASSPHRASE BACKUP_PASSPHRASE_OLD LOG_LEVEL)
 
 if [[ -t 1 ]]; then
     B=$'\033[1m' G=$'\033[32m' Y=$'\033[33m' R=$'\033[31m' C=$'\033[36m' N=$'\033[0m'
@@ -187,7 +188,7 @@ write_env() {  # KEY=VALUE pairs; other lines of the existing file are kept
 cmd_config() {
     need_dir
     local bot_token owner_ids pay_token pay_testnet escrow_token escrow_testnet timezone passphrase pg_password log_level
-    local username status reply new_passphrase=""
+    local username status reply new_passphrase="" old_passphrase
     bot_token=$(env_get BOT_TOKEN)
     owner_ids=$(env_get OWNER_IDS)
     pay_token=$(env_get CRYPTOPAY_TOKEN)
@@ -196,6 +197,7 @@ cmd_config() {
     escrow_testnet=$(env_get ESCROW_CRYPTOPAY_TESTNET)
     timezone=$(env_get TIMEZONE)
     passphrase=$(env_get BACKUP_PASSPHRASE)
+    old_passphrase=$(env_get BACKUP_PASSPHRASE_OLD)
     pg_password=$(env_get POSTGRES_PASSWORD)
     log_level=$(env_get LOG_LEVEL)
 
@@ -332,7 +334,10 @@ cmd_config() {
             warn "Нужно от 12 символов: латиница, цифры и . _ ~ + / = @ # % ^ * ! ? : , -"
             continue
         fi
-        [[ -n "$passphrase" ]] && warn "Старые бэкапы открываются только старым паролем — сохраните его тоже."
+        if [[ -n "$passphrase" && "$passphrase" != "$reply" ]]; then
+            old_passphrase=$passphrase  # older archives still open: restore tries this one too
+            warn "Прежний пароль сохранён как BACKUP_PASSPHRASE_OLD — им бот откроет старые бэкапы."
+        fi
         passphrase=$reply
         new_passphrase=$reply
         break
@@ -352,6 +357,7 @@ cmd_config() {
         "ESCROW_CRYPTOPAY_TESTNET=$escrow_testnet" \
         "TIMEZONE=$timezone" \
         "BACKUP_PASSPHRASE=$passphrase" \
+        "BACKUP_PASSPHRASE_OLD=$old_passphrase" \
         "LOG_LEVEL=$log_level"
     ok "Настройки сохранены в $ENV_FILE (доступ только у root)"
 
@@ -372,6 +378,8 @@ self_update() {
     local source="$SL_DIR/deploy/servicelist"
     [[ -f "$source" && "$SL_SELF" == /usr/local/bin/servicelist && -w "$(dirname "$SL_SELF")" ]] || return 0
     cmp -s "$source" "$SL_SELF" && return 0
+    # a broken script here would lock out every later deploy (the deploy key runs nothing else)
+    bash -n "$source" || die "deploy/servicelist не проходит проверку синтаксиса — не обновляю его"
     run install -m 755 "$source" "$SL_SELF.new"
     run mv -f "$SL_SELF.new" "$SL_SELF"
 }
@@ -397,7 +405,7 @@ wait_healthy() {
 
 cmd_deploy() {
     need_dir
-    local sha=${1-} target current_branch
+    local sha=${1-} forward_only=${2-} target current_branch
     current_branch=$(branch)
     info "Получаю код ($current_branch)"
     run git fetch --quiet origin "$current_branch"
@@ -406,6 +414,11 @@ cmd_deploy() {
         [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "Некорректный коммит: $sha"
         git cat-file -e "$sha^{commit}" 2>/dev/null || die "Коммит $sha не найден"
         git merge-base --is-ancestor "$sha" "origin/$current_branch" || die "Коммит $sha не из ветки $current_branch"
+        # GitHub deploys only move forward: a re-run of an old job must not roll the server (and its
+        # database migrations) back; a rollback is a deliberate «servicelist deploy SHA» on the server
+        if [[ -n "$forward_only" ]] && ! git merge-base --is-ancestor HEAD "$sha"; then
+            die "Коммит $sha старее установленного $(git rev-parse --short HEAD) — откат только вручную"
+        fi
         target=$sha
     fi
     run git checkout --quiet --force -B "$current_branch" "$target"
@@ -427,7 +440,7 @@ cmd_ssh_deploy() {
     mkdir -p "$(dirname "$SL_LOCK")"
     exec 9>"$SL_LOCK"
     flock -w 900 9 || die "Другой деплой идёт слишком долго"
-    cmd_deploy "$sha"
+    cmd_deploy "$sha" forward-only
 }
 
 ssh_port() {

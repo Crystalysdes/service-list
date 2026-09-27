@@ -121,14 +121,21 @@ class ThrottlingMiddleware(BaseMiddleware):
         self.limit = limit
         self.window = window
         self._hits: dict[int, deque[float]] = defaultdict(deque)
+        self._albums: dict[str, float] = {}  # media_group_id -> when its first message came
 
     async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
         tg_user = data.get("event_from_user")
         if tg_user is None or data.get("role") or not _is_private(event):
             return await handler(event, data)
-        if isinstance(event, Message) and event.media_group_id:
-            return await handler(event, data)  # an album arrives as up to 10 messages at once
         now = time.monotonic()
+        if isinstance(event, Message) and event.media_group_id:
+            # an album arrives as up to 10 messages at once: it counts as one event, its first message
+            seen = self._albums.get(event.media_group_id)
+            self._albums[event.media_group_id] = now
+            if len(self._albums) > 10_000:
+                self._albums = {k: v for k, v in self._albums.items() if now - v < 60}
+            if seen is not None and now - seen < 60:
+                return await handler(event, data)
         hits = self._hits[tg_user.id]
         while hits and now - hits[0] > self.window:
             hits.popleft()

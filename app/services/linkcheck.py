@@ -4,15 +4,17 @@ A pass checks every listed service (plus services hidden for a dead link, to bri
 reference links ("canaries") must come out right before "dead" verdicts of their group (t.me / sites) are
 trusted, and a pass that suddenly finds many new dead links is not applied at all (breaker). A service is
 hidden only after ``dead_streak`` dead verdicts in a row spanning at least ``dead_min_hours``; a paid service
-first gets ``paid_grace_hours`` to change the link. Any alive verdict resets the streak; a hidden service
-whose link comes back within ``auto_restore_days`` returns by itself. A changed page title (another owner
-took the username) is reported to the admins instead of being trusted.
+first gets ``paid_grace_hours`` to change the link. Any alive verdict resets the streak; a hidden Telegram
+link whose known title comes back within ``auto_restore_days`` returns by itself, a site that opens again is
+shown to staff first (its domain may have a new owner). A changed page title (another owner took the
+username) is reported to the admins instead of being trusted.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import socket
 from dataclasses import asdict, dataclass, field
@@ -22,8 +24,9 @@ from typing import Any
 import aiohttp
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from yarl import URL
 
 from app.bot.i18n import Translator, h
 from app.context import AppContext
@@ -41,7 +44,7 @@ from app.domain.linkcheck import (
     post_verdict,
     tme_verdict,
 )
-from app.domain.links import Link, try_normalize
+from app.domain.links import LOCAL_SUFFIXES, Link, try_normalize
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.notify import claim_notification, notify_staff, notify_user
@@ -65,8 +68,51 @@ def _nxdomain(exc: BaseException) -> bool:
     return isinstance(error, socket.gaierror) and error.errno in NXDOMAIN_CODES
 
 
+REDIRECTS = (301, 302, 303, 307, 308)
+
+
+def public_address(address: str) -> bool:
+    """An address on the internet (not loopback, a private network, link-local like cloud metadata...)."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def unsafe_hop(url: URL) -> bool:
+    """A redirect the checker does not follow: not http(s), an unusual port, or an address of a private
+    network written as a number (those never reach the resolver below)."""
+    if url.scheme not in ("http", "https") or url.explicit_port not in (None, 80, 443):
+        return True
+    host = (url.host or "").rstrip(".").lower()
+    if not host or host == "localhost" or host.endswith(LOCAL_SUFFIXES):
+        return True
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False  # a name: its addresses are checked when it is resolved
+    return not public_address(host.strip("[]"))
+
+
+class PublicResolver(aiohttp.ThreadedResolver):
+    """Resolves names to public addresses only: a site (or its redirect) whose name points into the bot's
+    own network (the database, 127.0.0.1, cloud metadata) is simply not reached."""
+
+    async def resolve(  # type: ignore[override]
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[Any]:
+        found = [item for item in await super().resolve(host, port, family) if public_address(item["host"])]
+        if not found:
+            raise OSError(f"{host}: no public address")
+        return found
+
+
 class HttpFetcher:
-    """GET/HEAD with redirects, a timeout and a size cap; errors become ``Page.error``."""
+    """GET/HEAD with redirects, a timeout and a size cap; errors become ``Page.error``. Only public
+    addresses are reached, on every redirect too (see :class:`PublicResolver` and :func:`unsafe_hop`)."""
 
     def __init__(self, timeout: float = 10.0, max_redirects: int = 5, max_bytes: int = 1 << 20) -> None:
         self.timeout = timeout
@@ -78,7 +124,7 @@ class HttpFetcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 # the threaded resolver reports NXDOMAIN as socket.gaierror, which "dead" relies on
-                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver(), limit=4),
+                connector=aiohttp.TCPConnector(resolver=PublicResolver(), limit=4),
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
                 headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9,ru;q=0.8"},
                 trust_env=True,
@@ -87,24 +133,16 @@ class HttpFetcher:
 
     async def fetch(self, url: str, method: str = "GET") -> Page:
         try:
-            async with self._client().request(
-                method, url, allow_redirects=True, max_redirects=self.max_redirects
-            ) as response:
-                chunks: list[bytes] = []
-                size = 0
-                if method == "GET":
-                    async for chunk in response.content.iter_chunked(65536):
-                        chunks.append(chunk)
-                        size += len(chunk)
-                        if size >= self.max_bytes:
-                            break
-                body = b"".join(chunks)[: self.max_bytes]
-                try:
-                    text = body.decode(response.charset or "utf-8", "replace")
-                except LookupError:
-                    text = body.decode("utf-8", "replace")
-                return Page(response.status, text, final_url=str(response.url))
-        except aiohttp.TooManyRedirects:
+            current = URL(url)
+            for _hop in range(self.max_redirects + 1):  # redirects are followed here, each one checked
+                if unsafe_hop(current):
+                    return Page(None, error="blocked")
+                async with self._client().request(method, current, allow_redirects=False) as response:
+                    location = response.headers.get("Location")
+                    if response.status in REDIRECTS and location:
+                        current = response.url.join(URL(location))
+                        continue
+                    return await self._page(response, method)
             return Page(None, error="redirects")
         except aiohttp.ClientConnectorDNSError as exc:
             return Page(None, error="dns" if _nxdomain(exc) else "network")
@@ -114,6 +152,22 @@ class HttpFetcher:
             return Page(None, error="timeout")
         except (aiohttp.ClientError, OSError, ValueError) as exc:
             return Page(None, error="dns" if _nxdomain(exc) else "network")
+
+    async def _page(self, response: aiohttp.ClientResponse, method: str) -> Page:
+        chunks: list[bytes] = []
+        size = 0
+        if method == "GET":
+            async for chunk in response.content.iter_chunked(65536):
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= self.max_bytes:
+                    break
+        body = b"".join(chunks)[: self.max_bytes]
+        try:
+            text = body.decode(response.charset or "utf-8", "replace")
+        except LookupError:
+            text = body.decode("utf-8", "replace")
+        return Page(response.status, text, final_url=str(response.url))
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -186,7 +240,7 @@ def restore_service(service: Service) -> bool:
     if extra.get("fp_alert"):
         service.link_fingerprint = extra["fp_alert"]
         extra["link_title"] = extra.get("fp_title")
-    for key in ("fp_alert", "fp_title", "dead_hidden_at"):
+    for key in ("fp_alert", "fp_title", "dead_hidden_at", "back_alert"):
         extra.pop(key, None)
     service.extra = extra
     service.link_state = "unknown"
@@ -423,6 +477,7 @@ class LinkChecker:
         service.link_first_dead_at = None
         service.link_grace_until = None
         extra = dict(service.extra or {})
+        known = service.link_fingerprint  # the title the link had before (a first one is adopted below)
         if verdict.fingerprint:
             if not service.link_fingerprint:
                 service.link_fingerprint = verdict.fingerprint
@@ -452,12 +507,18 @@ class LinkChecker:
         ):
             hidden_at = _parse_dt(extra.get("dead_hidden_at"))
             if hidden_at is None or now - hidden_at <= timedelta(days=settings.auto_restore_days):
-                service.status = "active"
-                service.hidden_reason = None
-                extra.pop("dead_hidden_at", None)
-                report.restored.append(service.id)
-                notices.append(("restored", service.id, {}))
-                await audit(session, None, "service.restore_alive", "service", service.id)
+                # only a Telegram link whose known title is back returns by itself: a site that comes back
+                # after being gone may be an expired domain someone else bought, so staff look first
+                if known and verdict.fingerprint == known:
+                    service.status = "active"
+                    service.hidden_reason = None
+                    extra.pop("dead_hidden_at", None)
+                    report.restored.append(service.id)
+                    notices.append(("restored", service.id, {}))
+                    await audit(session, None, "service.restore_alive", "service", service.id)
+                elif not extra.get("back_alert"):
+                    extra["back_alert"] = now.isoformat()
+                    notices.append(("back", service.id, {}))
         service.extra = extra
 
     async def _dead(
@@ -511,7 +572,7 @@ class LinkChecker:
                 owner = await session.get(User, service.owner_id) if service.owner_id else None
             name, where, url = h(service.name), h(category.title if category else "?"), h(service.url)
             staff = InlineKeyboardBuilder()
-            has_buttons = kind in ("hidden", "takeover")
+            has_buttons = kind in ("hidden", "takeover", "back")
             text = ""
             if kind == "hidden":
                 text = (
@@ -528,6 +589,13 @@ class LinkChecker:
                 )
             elif kind == "restored":
                 text = f"♻️ Ссылка «{name}» ({where}) снова открывается — сервис вернулся в список."
+            elif kind == "back":
+                text = (
+                    f"🔎 Ссылка «{name}» ({where}) {url} снова открывается, но сервис остаётся скрытым, пока "
+                    "вы не проверите, что это тот же владелец: домен с истёкшим сроком мог купить кто-то "
+                    "другой."
+                )
+                staff.button(text="♻️ Вернуть в список", callback_data=f"lnk:restore:{service.id}")
             elif kind == "takeover":
                 text = (
                     f"⚠️ По ссылке «{name}» ({where}) {url} сменилось название: «{h(info['old'])}» → "
@@ -537,7 +605,7 @@ class LinkChecker:
                 staff.button(text="🙈 Скрыть", callback_data=f"lnk:fphide:{service.id}")
             if kind != "dead":  # the staff hear about a dead link when the service is hidden
                 await notify_staff(self.ctx, text, reply_markup=staff.as_markup() if has_buttons else None)
-            if owner is None or kind == "takeover":
+            if owner is None or kind in ("takeover", "back"):
                 continue
             t = Translator(owner.lang)
             builder = InlineKeyboardBuilder()
@@ -587,10 +655,22 @@ class LinkChecker:
             )
 
 
+HISTORY_DAYS = 60  # link check results kept (one row per service per pass: the table and backups grow)
+
+
+async def prune_history(ctx: AppContext, now: datetime | None = None) -> int:
+    cutoff = (now or utcnow()) - timedelta(days=HISTORY_DAYS)
+    async with ctx.db.session() as session:
+        result = await session.execute(delete(LinkCheck).where(LinkCheck.checked_at < cutoff))
+        await session.commit()
+    return int(result.rowcount or 0)
+
+
 async def job_pass(ctx: AppContext) -> PassReport | None:
     checker: LinkChecker | None = ctx.get("linkcheck")
     if checker is None or checker.running or not await checker.due():
         return None
+    await prune_history(ctx)
     return await checker.run_pass(mode="auto")
 
 

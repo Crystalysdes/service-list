@@ -35,6 +35,7 @@ from app.services.escrow import cards, deals
 from app.services.escrow.deals import HELD, SETTLED, role_of
 from app.services.escrow.notify import alert_owner, to_staff, translator_for
 from app.services.notify import notify_user
+from app.services.settings import EscrowRuntime, get_settings, update_settings
 from app.services.timefmt import fmt_dt
 
 log = logging.getLogger(__name__)
@@ -139,11 +140,50 @@ async def check_group(ctx: AppContext, chat_id: int) -> GroupCheck:
     if others:
         names = ", ".join(h(a.user.full_name) for a in others)
         result.problems.append(f"кроме бота и владельца группы есть администраторы: {names}")
+    # the group's creator stays in every deal held there and cannot be removed by the bot: it must be
+    # someone who may see deals anyway, checked again at every use (a removed admin's groups stop here)
+    if result.owner_id is not None and not await creator_trusted(ctx, result.owner_id):
+        creator = next((a.user for a in admins if a.status == "creator"), None)
+        name = h(creator.full_name) if creator is not None else str(result.owner_id)
+        result.problems.append(
+            f"группу создал {name} (ID {result.owner_id}) — он не сотрудник бота. Создатель группы видит "
+            "все сделки в ней, поэтому доверить служебный аккаунт может только владелец бота: пусть он "
+            "добавит эту группу сам"
+        )
     return result
+
+
+async def creator_trusted(ctx: AppContext, user_id: int) -> bool:
+    """An owner, a current admin, or an account an owner vouched for (``EscrowRuntime.pool_creators``)."""
+    from app.services.users import get_role, has_role
+
+    async with ctx.db.session() as session:
+        if has_role(await get_role(session, user_id, ctx.config.owner_ids), "admin"):
+            return True
+        return user_id in (await get_settings(session, EscrowRuntime)).pool_creators
+
+
+async def _vouch(ctx: AppContext, chat_id: int, staff_id: int) -> None:
+    """An owner adding a group vouches for its creator (the service account the groups are made with)."""
+    if staff_id not in ctx.config.owner_ids or ctx.bot is None:
+        return
+    try:
+        admins = await ctx.bot.get_chat_administrators(chat_id)
+    except TelegramAPIError:
+        return
+    creator = next((a.user.id for a in admins if a.status == "creator"), None)
+    if creator is None or await creator_trusted(ctx, creator):
+        return
+    async with ctx.db.session() as session:
+        runtime = await get_settings(session, EscrowRuntime)
+        await update_settings(session, EscrowRuntime, pool_creators=[*runtime.pool_creators, creator])
+        await audit(session, staff_id, "escrow.pool_creator", "user", creator, {"chat_id": chat_id})
+        await session.commit()
 
 
 async def add_group(ctx: AppContext, chat_id: int, staff_id: int) -> tuple[DealChat, GroupCheck]:
     """Put a group into the pool (or into quarantine, with the reasons, if it does not pass)."""
+    await _vouch(ctx, chat_id, staff_id)
     check = await check_group(ctx, chat_id)
     if check.ok and ctx.bot is not None:
         with contextlib.suppress(TelegramAPIError):

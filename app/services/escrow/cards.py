@@ -213,9 +213,9 @@ def card_keyboard(t: Translator, deal: Deal, viewer: int | None) -> InlineKeyboa
         builder.button(text=t("g.btn.chat"), url=link, style="primary")
     if s == "pending":
         other = deal.seller_id if deal.creator_role == "buyer" else deal.buyer_id
-        if creator and other is not None:
-            builder.button(text=t("g.btn.yes_party"), callback_data=f"g:cf:{n}:1", style="success")
-            builder.button(text=t("g.btn.no_party"), callback_data=f"g:cf:{n}:0")
+        if creator and other is not None:  # the buttons name the person shown, not whoever holds the slot
+            builder.button(text=t("g.btn.yes_party"), callback_data=f"g:cf:{n}:1:{other}", style="success")
+            builder.button(text=t("g.btn.no_party"), callback_data=f"g:cf:{n}:0:{other}")
         elif creator:
             builder.button(text=t("g.btn.invite"), callback_data=f"g:inv:{n}", style="primary")
         if creator:

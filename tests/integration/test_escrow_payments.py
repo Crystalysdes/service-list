@@ -371,3 +371,32 @@ async def test_a_banned_seller_is_not_paid_by_the_timer(ctx, pay, tg):
     with pytest.raises(DealError) as err:  # the banned seller cannot join a new deal either
         await deals.accept_deal(ctx.db, other.code, SELLER, "seller_s", other.terms_hash)
     assert err.value.key == "banned"
+
+
+async def test_a_transfer_the_bot_does_not_know_holds_that_deals_other_payouts(ctx, pay):
+    """After a restore the bot may not know a refund it already sent: the deal, rolled back and released
+    again, must not pay the seller too. Payouts resume only after that check."""
+    deal = await _funded(ctx, pay)
+    pay.transfers.append(  # a refund sent after the restored backup was made: the bot has no row for it
+        {
+            "transfer_id": 4999,
+            "spend_id": deals.spend_id(deal.code, "buyer"),
+            "user_id": BUYER,
+            "asset": "USDT",
+            "amount": "100",
+            "status": "completed",
+            "comment": None,
+        }
+    )
+    await payouts.pause(ctx, "restore")
+    await deals.release(ctx.db, deal.id, BUYER)  # the restored deal goes on and gets released
+    await payouts.resume(ctx, OWNER_ID)
+    await sweep(ctx)
+    [payout] = await _payouts(ctx, deal.id)
+    assert payout.purpose == "seller" and payout.status == "failed" and pay.paid_to(SELLER) == 0
+    assert (await _fresh(ctx, deal.id)).needs_attention
+
+    pay.fail = True  # Crypto Pay silent: payouts stay stopped rather than go unchecked
+    await payouts.pause(ctx, "owner")
+    with pytest.raises(DealError):
+        await payouts.resume(ctx, OWNER_ID)

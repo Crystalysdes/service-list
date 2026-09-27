@@ -12,7 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.filters import RoleFilter
+from app.bot.filters import PromptReply, RoleFilter
 from app.bot.i18n import Translator, h
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
@@ -224,7 +224,10 @@ async def on_reject_custom(
     await state.set_data({"purpose": "reason", "request_id": request.id})
     await call.answer()
     assert call.message is not None
-    await call.message.reply(f"Напишите причину отказа по заявке #{request.id} (её увидит пользователь):")
+    prompt = await call.message.reply(
+        f"Ответьте на это сообщение причиной отказа по заявке #{request.id} (её увидит пользователь):"
+    )
+    await state.update_data(prompt_id=prompt.message_id)
 
 
 @router.callback_query(F.data.startswith("mod:ed:"))
@@ -253,7 +256,9 @@ async def on_edit_field(call: CallbackQuery, state: FSMContext, session: AsyncSe
     await state.set_data({"purpose": field, "request_id": request.id})
     await call.answer()
     assert call.message is not None
-    await call.message.reply("Новое название:" if field == "name" else "Новая ссылка:")
+    what = "новым названием" if field == "name" else "новой ссылкой"
+    prompt = await call.message.reply(f"Ответьте на это сообщение {what}:")
+    await state.update_data(prompt_id=prompt.message_id)
 
 
 @router.callback_query(F.data.startswith("mod:ecat:"))
@@ -328,7 +333,7 @@ async def _refresh_cards(ctx: AppContext, request_id: int) -> None:
             continue
 
 
-@router.message(ModInput.value)
+@router.message(ModInput.value, PromptReply())
 async def on_mod_input(message: Message, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     info = await state.get_data()
     request = await session.get(ModerationRequest, info.get("request_id", 0))

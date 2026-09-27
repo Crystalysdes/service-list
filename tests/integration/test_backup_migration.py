@@ -8,7 +8,18 @@ from pydantic import SecretStr
 from sqlalchemy import func, select, text
 
 from app.db.base import Base, utcnow
-from app.db.models import Backup, Broadcast, Category, Channel, ChannelPost, MediaFile, Order, Service, User
+from app.db.models import (
+    Backup,
+    BlacklistEntry,
+    Broadcast,
+    Category,
+    Channel,
+    ChannelPost,
+    MediaFile,
+    Order,
+    Service,
+    User,
+)
 from app.services import migration
 from app.services.backup import (
     BackupError,
@@ -101,6 +112,18 @@ async def test_backup_restore_roundtrip(h, tg, db, ctx):
     await _wipe(db)
     with pytest.raises(BackupError):
         await restore_archive(ctx.config, db, result.path)
+
+
+async def test_a_bot_in_use_without_a_catalog_is_not_wiped_by_a_restore(db):
+    """A blacklist, orders, deals or reports without any category yet: real work a restore would erase."""
+    async with db.session() as s:
+        s.add(User(id=GUEST, username="guest", lang="ru"))  # a fresh install has users: that is fine
+        await s.commit()
+    assert await database_is_empty(db)
+    async with db.session() as s:
+        s.add(BlacklistEntry(kind="user_id", value="666", reason="scam"))
+        await s.commit()
+    assert not await database_is_empty(db)
 
 
 async def test_restore_from_uploaded_file(h, tg, db, ctx):

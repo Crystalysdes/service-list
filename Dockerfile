@@ -21,9 +21,14 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv/bot
+# the dependencies first, in a layer of their own: a code change does not download them all again
 COPY pyproject.toml ./
+RUN mkdir -p app && touch app/__init__.py \
+ && pip install . \
+ && pip uninstall -y service-list-bot \
+ && rm -rf app build
 COPY app ./app
-RUN pip install .
+RUN pip install --no-deps .
 COPY alembic.ini ./
 COPY migrations ./migrations
 

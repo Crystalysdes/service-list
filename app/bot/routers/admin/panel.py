@@ -56,8 +56,9 @@ def home_keyboard(
         builder.button(text="♻️ Восстановить из резервной копии", callback_data="a:bak:restore")
     builder.button(text=f"📥 Заявки ({pending})", callback_data="a:mod")
     builder.button(text=f"⚠️ Жалобы ({reports})", callback_data="a:rep")
-    builder.button(text="🗂 Категории", callback_data="a:cat")
-    builder.button(text="🧩 Сервисы", callback_data="a:svc")
+    if role in ("admin", "owner"):  # the catalog screens are admin-only
+        builder.button(text="🗂 Категории", callback_data="a:cat")
+        builder.button(text="🧩 Сервисы", callback_data="a:svc")
     builder.button(text="🚫 Скам-лист", callback_data="a:scam")
     builder.button(text="⛔️ Чёрный список", callback_data="a:bl")
     builder.button(text="🛡 Гарант", callback_data="a:g")

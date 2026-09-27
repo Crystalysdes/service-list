@@ -86,6 +86,28 @@ def test_clean_text():
     assert clean_text("two\nlines", allow_newlines=True) == "two\nlines"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Shop\u2028✅ Проверен",  # a line separator: the name would pose as two lines
+        "Shop\u2029✅",
+        "soft\u00adhyphen",
+        "\u3164\u3164",  # Hangul fillers: a blank name
+        "tag\U000e0041",
+        "mark\u061c",
+        "braille\u2800blank",
+    ],
+)
+def test_invisible_characters_are_refused(value):
+    with pytest.raises(LinkError):
+        clean_text(value, allow_newlines=True)
+
+
+def test_ordinary_names_still_pass():
+    for value in ("Café Délice", "Кофе ☕ 24/7", "🇷🇺 Russia", "Frame-Studio_2"):
+        assert clean_text(value) == value
+
+
 def test_link_context_resolution():
     ctx = LinkContext(
         bot_username="list_bot",

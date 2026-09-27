@@ -409,9 +409,16 @@ async def accept_deal(
 
 
 async def confirm_counterparty(
-    db: Database, deal_id: int, by_user: int, approve: bool, *, now: datetime | None = None
+    db: Database,
+    deal_id: int,
+    by_user: int,
+    approve: bool,
+    *,
+    candidate: int | None = None,
+    now: datetime | None = None,
 ) -> Deal:
-    """The creator says whether the one who accepted is really their counterparty."""
+    """The creator says whether the one who accepted is really their counterparty. ``candidate`` is the
+    person the creator was shown: whoever took the slot since is not confirmed by that old button."""
     now = now or utcnow()
     async with _change(db, Deal.id == deal_id) as (session, deal):
         _need(by_user == deal.creator_id, "not_creator")
@@ -419,6 +426,7 @@ async def confirm_counterparty(
         side = other_side(deal.creator_role)
         other = getattr(deal, f"{side}_id")
         _need(other is not None, "state")
+        _need(candidate is None or candidate == other, "stale")
         if approve:
             await refuse_barred_parties(session, deal, by_user)
             deal.counterparty_confirmed_at = now
@@ -442,6 +450,18 @@ async def _active_invoices(session: AsyncSession, deal_id: int) -> int:
         )
         or 0
     )
+
+
+async def withdraw_acceptance(db: Database, deal_id: int, by_user: int) -> Deal:
+    """The one who accepted an invitation (not yet confirmed by the creator) changes their mind: the slot is
+    free again and the invitation stays open; the deal itself is the creator's to call off."""
+    async with _change(db, Deal.id == deal_id) as (session, deal):
+        _need(deal.status == "pending" and deal.counterparty_confirmed_at is None, "state")
+        side = other_side(deal.creator_role)
+        _need(by_user != deal.creator_id and getattr(deal, f"{side}_id") == by_user, "not_party")
+        setattr(deal, f"{side}_id", None)
+        deal.accepted_at = None
+        return await _done(session, deal, by_user, "withdraw")
 
 
 async def cancel_unpaid(

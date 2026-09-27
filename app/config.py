@@ -27,6 +27,7 @@ class Config(BaseSettings):
     timezone: str = "Europe/Moscow"
     data_dir: Path = Path("data")
     backup_passphrase: SecretStr | None = None
+    backup_passphrase_old: SecretStr | None = None  # the one before a change: older archives still open
     log_level: str = "INFO"
 
     @field_validator("owner_ids", mode="before")
