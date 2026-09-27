@@ -457,7 +457,8 @@ class Notification(Base):
 
 
 class Broadcast(CreatedMixin, Base):
-    """A message to every user of the bot (now: a new service in the list), sent in the background.
+    """A message to every user of the bot (a new service in the list, or one its owner confirmed), sent in the
+    background.
 
     ``cursor`` is the last user id it went to (users are taken in id order), moved after every message: a
     restart goes on from there and nobody gets it twice.
@@ -467,7 +468,7 @@ class Broadcast(CreatedMixin, Base):
     __table_args__ = (UniqueConstraint("kind", "ref_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    kind: Mapped[str] = mapped_column(String(24))  # new_service
+    kind: Mapped[str] = mapped_column(String(24))  # new_service / claimed (its owner confirmed it)
     ref_id: Mapped[int] = mapped_column(Integer)  # the service
     # pending / sending / done / cancelled
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)

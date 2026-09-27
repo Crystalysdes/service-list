@@ -7,7 +7,7 @@ from datetime import timedelta
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import Feature, ModerationRequest, Service, User
+from app.db.models import Broadcast, Feature, ModerationRequest, Service, User
 from app.domain.linkcheck import Page, fingerprint
 from app.services.linkcheck import LinkChecker
 from app.services.settings import LinkCheckSettings, update_settings
@@ -284,6 +284,10 @@ async def test_claim_by_username_code_and_manual_review(h, tg, db, ctx):
     async with db.session() as s:
         request = (await s.execute(select(ModerationRequest))).scalar_one()
         assert (request.kind, request.status) == ("claim", "approved")
+        # each confirmed owner: everyone in the bot hears about the service (app/services/announce.py)
+        claimed = (await s.execute(select(Broadcast.ref_id).where(Broadcast.kind == "claimed"))).scalars()
+        names = {(await s.get(Service, ref_id)).name for ref_id in claimed}
+    assert names == {"Travel with Coco Jango", "LuckyManTravel", "Sirop"}
 
     # an owned service cannot be claimed again
     await h.click(OTHER, h.last(OTHER), f"claim:svc:{coco.id}")

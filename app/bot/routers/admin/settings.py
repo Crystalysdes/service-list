@@ -50,7 +50,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         "Ссылка на чат (кнопка «💬 Chat» в меню): "
         + h(chats.community_url or "не задана — берётся из строки «Chat:» главного поста"),
         f"Капча при входе: {'включена' if captcha.enabled else 'выключена'}",
-        "Рассылка в боте о новых сервисах (после одобрения и публикации): "
+        "Рассылка в боте о новых сервисах и о подтверждённых владельцами: "
         + ("включена" if announce.new_services else "выключена"),
         "Свои премиум-эмодзи от пользователей (через модерацию): "
         + ("да" if limits.allow_own_emoji else "нет"),

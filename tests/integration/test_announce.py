@@ -7,8 +7,8 @@ import pytest
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import Broadcast, Channel, Service, User
-from app.services import announce
+from app.db.models import Broadcast, Category, Channel, Service, User
+from app.services import announce, claims
 from app.services.settings import Limits, update_settings
 from tests.conftest import OWNER_ID
 from tests.integration.test_submission_flow import GROUP, USER, _setup, _submit
@@ -139,7 +139,7 @@ async def test_goes_on_after_a_restart_and_the_owner_can_switch_it_off(h, tg, db
     await h.press(OWNER_ID, h.last(OWNER_ID), "Настройки")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Выключить рассылку о новых сервисах")
     assert (
-        "Рассылка в боте о новых сервисах (после одобрения и публикации): выключена"
+        "Рассылка в боте о новых сервисах и о подтверждённых владельцами: выключена"
         in h.last(OWNER_ID)["text"]
     )
     await announce.job(ctx)
@@ -162,3 +162,39 @@ async def test_the_announcement_waits_until_the_channel_shows_the_service(h, tg,
         await s.commit()
     await announce.job(ctx)
     assert len(_news(tg, ANN)) == 1
+
+
+async def test_a_service_its_owner_confirmed_is_announced_the_same_way(h, tg, db, ctx):
+    await _setup(tg, db, ctx)
+    await _readers(tg, db, ANN, BOB)
+    async with db.session() as s:
+        travel = (await s.execute(select(Category).where(Category.slug == "travel"))).scalar_one()
+        service = Service(
+            category_id=travel.id,
+            name="Seller Tours",
+            url="https://t.me/seller_tours",
+            status="active",
+            position=100,
+            description="Туры от продавца.",
+        )
+        s.add(service)
+        await s.commit()
+        await claims.assign_owner(ctx, s, service, await s.get(User, USER), "код найден в описании")
+    row = await _broadcast(db)
+    assert (row.kind, row.ref_id, row.status) == ("claimed", service.id, "pending")
+
+    await announce.job(ctx)
+    [ann] = [m for m in tg.bot_messages(ANN) if (m.get("text") or "").startswith("✅")]
+    assert ann["text"] == (
+        "✅ Владелец подтвердил свой сервис в категории «🗺️Travel [путешествия]»"
+        "\n\nSeller Tours\nТуры от продавца."
+    )
+    assert [(b["text"], b.get("url")) for b in h.buttons(ann)] == [
+        ("🔗 Открыть", "https://t.me/seller_tours"),
+        ("🔕 Не присылать", None),
+    ]
+    assert any((m.get("text") or "").startswith("✅ Its owner confirmed") for m in tg.bot_messages(BOB))
+    assert not [m for m in tg.bot_messages(USER) if "подтвердил свой сервис" in (m.get("text") or "")]
+    await announce.job(ctx)
+    report = h.last(GROUP)["text"]
+    assert "Рассылка о подтверждённом владельцем сервисе «Seller Tours» закончена: доставлено 2" in report

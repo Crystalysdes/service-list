@@ -551,6 +551,9 @@ async def approve(
             service.description = payload["description"]
     elif request.kind == "claim":
         service.owner_id = request.user_id
+        from app.services.announce import enqueue_claimed
+
+        await enqueue_claimed(session, service)  # everyone in the bot hears that its owner confirmed it
     elif request.kind == "emoji":
         from app.services.options import apply_custom_emoji
 

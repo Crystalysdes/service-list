@@ -1,8 +1,9 @@
-"""A short message to everyone in the bot when a new service appears in the list.
+"""A short message to everyone in the bot when a new service appears in the list, or when the person who runs
+a service already in the list confirms it is theirs («🙋 Это мой сервис»).
 
 A service a user submitted is announced once, the first time it is published (after payment or «🎁 Одобрить
 бесплатно») and shows in the channel: the category, the name, the owner's description and a button with its
-link. The messages go out
+link. A service its owner confirmed is announced the same way, once, with its own title. The messages go out
 in the background at a pace Telegram accepts. The last user reached is saved after every message, so a
 restart goes on from there and nobody gets it twice. Those who pressed 🔕, blocked the bot, are banned or have
 not passed the captcha get nothing; neither does the service's owner.
@@ -30,6 +31,8 @@ from app.services.settings import Announce, get_settings
 log = logging.getLogger(__name__)
 
 NEW_SERVICE = "new_service"
+CLAIMED = "claimed"  # the owner of a service in the list confirmed it
+TITLES = {NEW_SERVICE: "news.title", CLAIMED: "news.claimed"}
 UNFINISHED = ("pending", "sending")
 BATCH = 200  # people per run of the job
 # between two messages: Telegram takes about 30 a second to different chats, and the bot answers people too
@@ -51,6 +54,17 @@ async def enqueue_new_service(session: AsyncSession, service: Service) -> None:
     )
 
 
+async def enqueue_claimed(session: AsyncSession, service: Service) -> None:
+    """In the transaction that gives the service its confirmed owner: announced if it is in the channel."""
+    if service.status != "active" or not (await get_settings(session, Announce)).new_services:
+        return
+    await session.execute(
+        insert(Broadcast)
+        .values(kind=CLAIMED, ref_id=service.id, status="pending", created_at=utcnow())
+        .on_conflict_do_nothing(index_elements=["kind", "ref_id"])
+    )
+
+
 def short(text: str | None, limit: int = DESCRIPTION_MAX) -> str:
     """The owner's description in one paragraph, cut at a word if it is long."""
     text = " ".join((text or "").split())
@@ -62,8 +76,12 @@ def short(text: str | None, limit: int = DESCRIPTION_MAX) -> str:
     return cut.rstrip(" ,.;:—-") + "…"
 
 
-def message(t: Translator, service: Service, category: Category | None) -> tuple[str, InlineKeyboardMarkup]:
-    text = t("news.title", category=h(category.title if category is not None else "—"))
+def message(
+    t: Translator, service: Service, category: Category | None, kind: str = NEW_SERVICE
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = t(
+        TITLES.get(kind, TITLES[NEW_SERVICE]), category=h(category.title if category is not None else "—")
+    )
     text += f"\n\n<b>{h(service.name)}</b>"
     about = short(service.description)
     if about:
@@ -145,9 +163,15 @@ async def job(ctx: AppContext) -> None:
         if not people:
             row.status = "done"
             row.finished_at = utcnow()
-            report = {"name": service.name, "sent": row.sent, "blocked": row.blocked, "failed": row.failed}
+            report = {
+                "name": service.name,
+                "kind": row.kind,
+                "sent": row.sent,
+                "blocked": row.blocked,
+                "failed": row.failed,
+            }
         category = await session.get(Category, service.category_id)
-        texts = {lang: message(Translator(lang), service, category) for lang in LANGS}
+        texts = {lang: message(Translator(lang), service, category, row.kind) for lang in LANGS}
         broadcast_id, owner_id = row.id, service.owner_id
         await session.commit()
     if report is not None:
@@ -170,9 +194,10 @@ async def job(ctx: AppContext) -> None:
 async def _report(ctx: AppContext, report: dict[str, Any]) -> None:
     from app.services.notify import notify_staff
 
+    about = "подтверждённом владельцем сервисе" if report.get("kind") == CLAIMED else "новом сервисе"
     await notify_staff(
         ctx,
-        f"📣 Рассылка о новом сервисе «{h(report['name'])}» закончена: доставлено {report['sent']}, "
+        f"📣 Рассылка о {about} «{h(report['name'])}» закончена: доставлено {report['sent']}, "
         f"заблокировали бота {report['blocked']}, не доставлено {report['failed']}.",
     )
 
