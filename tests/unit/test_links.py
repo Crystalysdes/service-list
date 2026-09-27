@@ -1,6 +1,6 @@
 import pytest
 
-from app.domain.links import LinkError, blacklist_keys, clean_text, normalize, same_target
+from app.domain.links import LinkError, blacklist_keys, clean_text, normalize, same_target, without_emoji
 from app.domain.symbols import LinkContext, channel_post_base
 
 
@@ -123,3 +123,20 @@ def test_link_context_resolution():
     assert ctx.resolve("channel:main") == "https://t.me/servicelist"
     assert ctx.resolve("https://example.com") == "https://example.com"
     assert channel_post_base(-100555, "MyChan") == "https://t.me/MyChan/"
+
+
+@pytest.mark.parametrize(
+    ("typed", "kept", "dropped"),
+    [
+        ("🔥Fly Cheap✈️", "Fly Cheap", True),
+        ("Магазин №1 😀", "Магазин №1", True),  # "№" is text
+        ("Shop 1️⃣", "Shop 1", True),  # a keycap leaves its digit
+        ("👨\u200d💻 Dev team", "Dev team", True),  # a joined emoji goes whole
+        ("🇷🇺 Прокси", "Прокси", True),  # a flag
+        ("Temp 20° ™ A→B", "Temp 20° ™ A→B", False),  # symbols that are text stay
+        ("⭐️⭐️", "", True),
+        ("Plain name", "Plain name", False),
+    ],
+)
+def test_emoji_are_dropped_from_names(typed, kept, dropped):
+    assert without_emoji(typed) == (kept, dropped)

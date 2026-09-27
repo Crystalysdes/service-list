@@ -77,6 +77,38 @@ def has_forbidden_chars(value: str) -> bool:
 BLANK_CHARS = frozenset("\u115f\u1160\u3164\uffa0\u2800\u180e")
 
 
+# emoji and what glues them together: pictographs, dingbats, flags, skin tones, keycaps, variation
+# selectors, joiners (not "№", "°", "©", "™", arrows: those are text too)
+EMOJI_RANGES = (
+    (0x1F000, 0x1FAFF),
+    (0x2600, 0x27BF),
+    (0x2300, 0x23FF),
+    (0x2B00, 0x2BFF),
+    (0x25A0, 0x25FF),
+    (0x2934, 0x2935),
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    (0xE0020, 0xE007F),
+    (0xFE00, 0xFE0F),
+    (0x200D, 0x200D),
+    (0x20E3, 0x20E3),
+)
+
+
+def _is_emoji(char: str) -> bool:
+    code = ord(char)
+    return any(low <= code <= high for low, high in EMOJI_RANGES)
+
+
+def without_emoji(value: str) -> tuple[str, bool]:
+    """A service name as its owner may give it: emoji are a paid option, so they are simply dropped (a
+    premium emoji is a plain one in the text too); the spaces they leave are tidied. Also whether any went."""
+    kept = " ".join("".join(char for char in value if not _is_emoji(char)).split())
+    return kept, kept != " ".join(value.split())
+
+
 def clean_text(value: str, *, allow_newlines: bool = False) -> str:
     """Validate free text coming from users (names, descriptions): no control or invisible characters, no
     line breaks hidden as separators (a name cannot pose as two lines, e.g. a fake "✅ verified" one)."""

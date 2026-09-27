@@ -16,7 +16,7 @@ from app.bot.flows.start import register_payload, show_screen
 from app.bot.i18n import Translator, h
 from app.bot.states import AddService
 from app.db.models import Category
-from app.domain.links import LinkError, clean_text, normalize
+from app.domain.links import LinkError, clean_text, normalize, without_emoji
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
 from app.services import billing, moderation, render_db
@@ -148,18 +148,22 @@ async def on_category(call: CallbackQuery, state: FSMContext, session: AsyncSess
 async def on_name(message: Message, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     t: Translator = data["t"]
     limits = await get_settings(session, Limits)
+    name, dropped = without_emoji(message.text or "")  # emoji in the name are a paid option
     try:
-        name = clean_text(message.text or "")
+        name = clean_text(name)
     except LinkError:
         name = ""
+    if not name and dropped:
+        await message.answer(t("add.emoji_only"), reply_markup=_cancel_kb(t))
+        return
     if not name or len(name) > limits.max_name_len:
         await message.answer(t("add.bad_name", max=limits.max_name_len), reply_markup=_cancel_kb(t))
         return
     await state.update_data(name=name)
     await state.set_state(AddService.description)
+    ask = t("add.ask_description", min=limits.description_min, max=limits.description_max)
     await message.answer(
-        t("add.ask_description", min=limits.description_min, max=limits.description_max),
-        reply_markup=_cancel_kb(t),
+        (t("add.emoji_dropped", name=h(name)) + "\n\n" if dropped else "") + ask, reply_markup=_cancel_kb(t)
     )
 
 

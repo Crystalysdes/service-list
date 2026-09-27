@@ -444,3 +444,31 @@ async def test_approve_for_free_for_any_number_of_days_or_for_good(h, tg, db, ct
     async with db.session() as s:
         service = (await s.execute(select(Service).where(Service.name == "Forever Fly"))).scalar_one()
         assert service.status == "active" and service.listing_expires_at is None
+
+
+async def test_emoji_in_a_name_are_not_taken_they_are_a_paid_option(h, tg, db, ctx):
+    await _setup(tg, db, ctx)
+    await h.say(USER, "/menu")
+    await h.press(USER, h.last(USER), "Add service")
+    await h.press(USER, h.last(USER), "Travel")
+    await h.say(USER, "🔥✈️")  # nothing but emoji
+    assert "должны быть буквы или цифры" in h.last(USER)["text"]
+    await h.say(USER, "🔥Fly Cheap✈️")
+    assert "Название: «Fly Cheap». Эмодзи из названия убраны" in h.last(USER)["text"]
+    await h.say(USER, "Дешёвые авиабилеты по всему миру, поддержка 24/7, оплата криптой.")
+    await h.say(USER, "@flycheap_bot")
+    await h.press(USER, h.last(USER), "Отправить на модерацию")
+    async with db.session() as s:
+        service = (await s.execute(select(Service).where(Service.owner_id == USER))).scalar_one()
+        assert service.name == "Fly Cheap"
+        service.status = "active"
+        await s.commit()
+
+    menu = await h.say(USER, "/menu")
+    await h.click(USER, menu, f"my:{service.id}:ef:name")  # a new name: the same rule
+    await h.say(USER, "😀 Fly Cheaper")
+    async with db.session() as s:
+        request = (
+            await s.execute(select(ModerationRequest).where(ModerationRequest.kind == "edit"))
+        ).scalar_one()
+    assert request.payload["name"] == "Fly Cheaper"

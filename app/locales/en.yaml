@@ -54,6 +54,8 @@ add:
   closed: "Submissions to this branch are closed right now."
   ask_name: "What is your service called? This is how it will appear in the list (up to {max} characters)."
   bad_name: "The name must be one line of up to {max} characters, without special symbols."
+  emoji_dropped: "ℹ️ Name: «{name}». Emoji were removed from the name — emoji in a name are a separate paid option."
+  emoji_only: "The name needs letters or digits. Emoji in a name are a separate paid option."
   ask_description: "Describe the service: what it does, terms, support contacts. {min} to {max} characters. Only moderators see the description."
   bad_description: "The description must be {min} to {max} characters long."
   ask_link: "Send the link to your service: @username, t.me/… or https://…"

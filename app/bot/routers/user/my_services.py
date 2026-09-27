@@ -16,7 +16,7 @@ from app.bot.i18n import Translator, h
 from app.bot.states import EditService
 from app.db.base import utcnow
 from app.db.models import Category, ModerationRequest, Service
-from app.domain.links import LinkError, clean_text, normalize
+from app.domain.links import LinkError, clean_text, normalize, without_emoji
 from app.services import billing, moderation
 from app.services.catalog import request_sync
 from app.services.purchases import listing_renewable, listing_state
@@ -236,7 +236,10 @@ async def on_edit_value(message: Message, state: FSMContext, session: AsyncSessi
     field = info["field"]
     try:
         if field == "name":
-            value = clean_text(message.text or "")
+            value, dropped = without_emoji(message.text or "")  # emoji in the name are a paid option
+            value = clean_text(value)
+            if not value and dropped:
+                raise LinkError("emoji_only")
             if not value or len(value) > limits.max_name_len:
                 raise LinkError("bad_name")
         elif field == "description":
@@ -252,6 +255,7 @@ async def on_edit_value(message: Message, state: FSMContext, session: AsyncSessi
             value = link.url
     except LinkError as exc:
         key = {
+            "emoji_only": t("add.emoji_only"),
             "bad_name": t("add.bad_name", max=limits.max_name_len),
             "bad_description": t(
                 "add.bad_description", min=limits.description_min, max=limits.description_max
