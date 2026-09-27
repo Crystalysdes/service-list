@@ -17,11 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.flows.start import register_payload, show_screen
 from app.bot.i18n import Translator, h
-from app.bot.states import DealDispute, DealWizard
+from app.bot.states import DealAddress, DealDispute, DealWizard
 from app.context import AppContext
-from app.db.models import Deal
+from app.db.models import Deal, DealInvoice, DealReceipt
 from app.domain.links import LinkError, clean_text
-from app.services.escrow import cards, deals, invoices, money
+from app.services import evm
+from app.services.escrow import cards, deals, invoices, money, wallets
 from app.services.escrow.deals import OPEN, DealError, Draft
 from app.services.escrow.notify import dispute_alert, tell, translator_for
 from app.services.escrow.sweep import on_funding
@@ -87,10 +88,10 @@ async def card_parts(
     ctx: AppContext, session: AsyncSession, t: Translator, deal: Deal, viewer: int
 ) -> tuple[str, Any]:
     users = await cards.people(session, deal)
-    payouts = await deals.payouts_of(session, deal.id) if deal.status in deals.SETTLED else []
+    payouts = await deals.payouts_of(session, deal.id)
     shown = [p for p in payouts if p.recipient_id == viewer or p.purpose != "extra"]
     text = cards.card_text(t, deal, viewer, users, ctx.config.timezone, shown)
-    return text, cards.card_keyboard(t, deal, viewer)
+    return text, cards.card_keyboard(t, deal, viewer, payouts)
 
 
 async def _visible_deal(session: AsyncSession, deal_id: int, viewer: int) -> Deal | None:
@@ -351,6 +352,8 @@ def _transient(draft: Draft, creator_id: int, settings: Escrow) -> Deal:
     total = money.amounts(draft.amount_cents, settings.fee_bps, draft.fee_payer)
     return Deal(
         status="pending",
+        gateway=deals.GATEWAY,
+        seller_address=draft.address if draft.role == "seller" else None,
         creator_id=creator_id,
         creator_role=draft.role,
         buyer_id=creator_id if draft.role == "buyer" else None,
@@ -381,6 +384,7 @@ def _draft(fsm: dict[str, Any]) -> Draft | None:
             fee_payer=fsm["g_fee_payer"],
             delivery_days=int(fsm["g_days"]),
             counterparty=fsm.get("g_counterparty"),
+            address=fsm.get("g_address"),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -426,7 +430,7 @@ async def on_counterparty(message: Message, state: FSMContext, **data: Any) -> N
         )
         return
     await state.update_data(g_counterparty=username)
-    await _preview(message, {**data, "state": state}, edit=False)
+    await _address_step(message, {**data, "state": state}, edit=False)
 
 
 @router.callback_query(F.data == "g:w:skip")
@@ -434,7 +438,66 @@ async def on_skip(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
     await state.update_data(g_counterparty=None)
     await call.answer()
     assert call.message is not None
-    await _preview(call.message, {**data, "state": state}, edit=True)
+    await _address_step(call.message, {**data, "state": state}, edit=True)
+
+
+def address_error(t: Translator, exc: evm.AddressError | DealError) -> str:
+    if isinstance(exc, evm.AddressError):
+        return t(f"g.addr.bad_{exc.code}")
+    code = exc.key.removeprefix("address_")
+    if exc.key.startswith("address_") and code in ("format", "checksum", "forbidden"):
+        return t(f"g.addr.bad_{code}")
+    return error_text(t, exc)
+
+
+async def _address_step(target: Message, data: dict[str, Any], *, edit: bool) -> None:
+    """A seller says where the money goes before the deal exists (the buyer is asked only for a refund)."""
+    t: Translator = data["t"]
+    state: FSMContext = data["state"]
+    if (await state.get_data()).get("g_role") != "seller":
+        await _preview(target, data, edit=edit)
+        return
+    await state.set_state(DealWizard.address)
+    saved = await wallets.remembered(data["session"], data["user"].id)
+    builder = InlineKeyboardBuilder()
+    if saved:
+        builder.button(
+            text=t("g.addr.use", address=evm.short(saved)), callback_data="g:w:addr", style="success"
+        )
+    builder.button(text=t("common.cancel"), callback_data="g:w:x")
+    builder.adjust(1)
+    text = t("g.addr.ask") + ("\n\n" + t("g.addr.saved", address=saved) if saved else "")
+    if edit:
+        await show_screen(target, text, reply_markup=builder.as_markup())
+    else:
+        await target.answer(text, reply_markup=builder.as_markup())
+
+
+@router.message(DealWizard.address)
+async def on_wizard_address(message: Message, state: FSMContext, session: AsyncSession, **data: Any) -> None:
+    t: Translator = data["t"]
+    try:
+        address = await wallets.check(session, message.text or "")
+    except evm.AddressError as exc:
+        await message.answer(address_error(t, exc), reply_markup=_cancel_kb(t))
+        return
+    await state.update_data(g_address=address)
+    await _preview(message, {**data, "session": session, "state": state}, edit=False)
+
+
+@router.callback_query(F.data == "g:w:addr")
+async def on_wizard_saved_address(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any
+) -> None:
+    t: Translator = data["t"]
+    saved = await wallets.remembered(session, data["user"].id)
+    if saved is None or "g_days" not in await state.get_data():
+        await call.answer(t("g.err.wizard_gone"), show_alert=True)
+        return
+    await state.update_data(g_address=saved)
+    await call.answer()
+    assert call.message is not None
+    await _preview(call.message, {**data, "session": session, "state": state}, edit=True)
 
 
 def invite_link(ctx: AppContext, deal: Deal) -> str:
@@ -550,15 +613,18 @@ async def on_accept(call: CallbackQuery, **data: Any) -> None:
     if deal.status == "awaiting_payment":
         await tell(ctx, deal.creator_id, deal, "accepted", who=cards.who(user, user.id))
         await show_card(call, data, deal.id, t("g.done.accepted"))
-        return
-    creator_t = await translator_for(ctx, deal.creator_id)  # "is this your counterparty?"
-    await notify_user(
-        ctx,
-        deal.creator_id,
-        creator_t("g.ev.confirm_who", n=deal.id, who=cards.who(user, user.id)),
-        reply_markup=cards.card_keyboard(creator_t, deal, deal.creator_id),
-    )
-    await show_card(call, data, deal.id, t("g.done.wait_confirm"))
+    else:
+        creator_t = await translator_for(ctx, deal.creator_id)  # "is this your counterparty?"
+        await notify_user(
+            ctx,
+            deal.creator_id,
+            creator_t("g.ev.confirm_who", n=deal.id, who=cards.who(user, user.id)),
+            reply_markup=cards.card_keyboard(creator_t, deal, deal.creator_id),
+        )
+        await show_card(call, data, deal.id, t("g.done.wait_confirm"))
+    if deal.seller_id == user.id and not deal.seller_address:  # the seller: where the money goes
+        assert call.message is not None
+        await _address_prompt(call.message.chat.id, data, deal, fresh=True)
 
 
 @router.callback_query(F.data.regexp(r"^g:cf:\d+:[01](:\d+)?$"))
@@ -584,20 +650,138 @@ async def on_confirm_party(call: CallbackQuery, **data: Any) -> None:
     await show_card(call, data, deal.id, t("g.done.confirmed" if approve else "g.done.turned_down"))
 
 
-# ------------------------------------------------------------------------------------------ before payment
-async def _pay_message(ctx: AppContext, t: Translator, deal: Deal, pay_url: str) -> tuple[str, Any]:
-    text = t(
-        "g.pay.invoice",
-        n=deal.id,
-        buyer_pays=money.show(deal.buyer_pays_cents),
-        pay_due=fmt_dt(deal.pay_due_at, ctx.config.timezone),
-    )
+# ------------------------------------------------------------------------------------------ payout address
+async def _address_prompt(chat_id: int, data: dict[str, Any], deal: Deal, *, fresh: bool = False) -> None:
+    """A message that asks a side for its payout address (the remembered one is a tap away)."""
+    t: Translator = data["t"]
+    saved = await wallets.remembered(data["session"], data["user"].id)
     builder = InlineKeyboardBuilder()
-    builder.button(text=t("g.pay.open"), url=pay_url, style="success")
+    if saved:
+        builder.button(
+            text=t("g.addr.use", address=evm.short(saved)),
+            callback_data=f"g:addr:{deal.id}:s",
+            style="success",
+        )
+    builder.button(text=t("g.addr.enter"), callback_data=f"g:addr:{deal.id}")
+    builder.button(text=t("g.open_deal", n=deal.id), callback_data=f"g:d:{deal.id}")
+    builder.adjust(1)
+    text = t("g.addr.after_accept" if fresh else "g.addr.ask_deal", n=deal.id)
+    if saved:
+        text += "\n\n" + t("g.addr.saved", address=saved)
+    await data["bot"].send_message(chat_id, text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^g:addr:\d+$"))
+async def on_address(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
+    t: Translator = data["t"]
+    deal = await _visible_deal(session, _id(call), data["user"].id)
+    payouts = await deals.payouts_of(session, deal.id) if deal else []
+    if deal is None or not cards.may_set_address(deal, data["user"].id, payouts):
+        await call.answer(t("g.err.state"), show_alert=True)
+        return
+    await state.set_state(DealAddress.waiting)
+    await state.update_data(g_addr_deal=deal.id)
+    saved = await wallets.remembered(session, data["user"].id)
+    builder = InlineKeyboardBuilder()
+    if saved:
+        builder.button(
+            text=t("g.addr.use", address=evm.short(saved)),
+            callback_data=f"g:addr:{deal.id}:s",
+            style="success",
+        )
+    builder.button(text=t("common.cancel"), callback_data=f"g:d:{deal.id}")
+    builder.adjust(1)
+    role = deals.role_of(deal, data["user"].id) or "seller"
+    current = deal.seller_address if role == "seller" else deal.buyer_address
+    text = t("g.addr.ask_deal", n=deal.id)
+    if current:
+        text += "\n\n" + t("g.addr.current", address=current)
+    elif saved:
+        text += "\n\n" + t("g.addr.saved", address=saved)
+    await call.answer()
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=builder.as_markup())
+
+
+async def _save_address(data: dict[str, Any], deal_id: int, text: str) -> tuple[Deal | None, str]:
+    """(the deal, the note to show): the deal is None when the address was not taken."""
+    t: Translator = data["t"]
+    ctx: AppContext = data["ctx"]
+    try:
+        deal, woken = await deals.set_address(ctx.db, deal_id, data["user"].id, text)
+    except DealError as exc:
+        return None, address_error(t, exc) if exc.key.startswith("address_") else error_text(t, exc)
+    role = deals.role_of(deal, data["user"].id) or "seller"
+    address = deal.seller_address if role == "seller" else deal.buyer_address
+    return deal, t("g.addr.saved_ok" if not woken else "g.addr.saved_payout", address=address or "")
+
+
+@router.callback_query(F.data.regexp(r"^g:addr:\d+:s$"))
+async def on_saved_address(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any
+) -> None:
+    t: Translator = data["t"]
+    saved = await wallets.remembered(session, data["user"].id)
+    if saved is None:
+        await call.answer(t("g.err.state"), show_alert=True)
+        return
+    deal, note = await _save_address(data, _id(call), saved)
+    if deal is None:
+        await call.answer(note, show_alert=True)
+        return
+    await state.clear()
+    await call.answer()
+    assert call.message is not None
+    await call.message.answer(note)
+    await send_card({**data, "session": session}, call.message.chat.id, deal)
+
+
+@router.message(DealAddress.waiting)
+async def on_address_text(message: Message, state: FSMContext, **data: Any) -> None:
+    t: Translator = data["t"]
+    deal_id = (await state.get_data()).get("g_addr_deal")
+    if not deal_id:
+        await state.clear()
+        return
+    deal, note = await _save_address(data, int(deal_id), message.text or "")
+    if deal is None:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t("common.cancel"), callback_data=f"g:d:{deal_id}")
+        await message.answer(note, reply_markup=builder.as_markup())
+        return
+    await state.clear()
+    await message.answer(note)
+    await send_card(data, message.chat.id, deal)
+
+
+# ------------------------------------------------------------------------------------------ before payment
+async def _pay_message(ctx: AppContext, t: Translator, deal: Deal, invoice: DealInvoice) -> tuple[str, Any]:
+    async with ctx.db.session() as session:
+        received = sum(
+            int(amount)
+            for amount in (
+                await session.execute(select(DealReceipt.amount).where(DealReceipt.invoice_id == invoice.id))
+            ).scalars()
+        )
+    lines = [
+        t(
+            "g.pay.invoice",
+            n=deal.id,
+            buyer_pays=money.show(deal.buyer_pays_cents),
+            address=evm.checksummed(invoice.address) if invoice.address else "—",
+            pay_due=fmt_dt(deal.pay_due_at, ctx.config.timezone),
+        )
+    ]
+    if received:
+        missing = max(money.to_minor(invoice.amount_cents) - received, 0)
+        lines.append(t("g.pay.received", got=money.show_minor(received), missing=money.show_minor(missing)))
+    builder = InlineKeyboardBuilder()
+    if invoice.pay_url:
+        builder.button(text=t("g.pay.open"), url=invoice.pay_url, style="success")
     builder.button(text=t("g.pay.check"), callback_data=f"g:chk:{deal.id}")
     builder.button(text=t("g.open_deal", n=deal.id), callback_data=f"g:d:{deal.id}")
     builder.adjust(1)
-    return text, builder.as_markup()
+    return "\n\n".join(lines), builder.as_markup()
 
 
 @router.callback_query(F.data.regexp(r"^g:pay:\d+$"))
@@ -615,9 +799,9 @@ async def on_pay(call: CallbackQuery, **data: Any) -> None:
     deal = await deals.get_deal(session, invoice.deal_id)
     assert deal is not None
     await call.answer()
-    text, markup = await _pay_message(ctx, t, deal, invoice.pay_url)
+    text, markup = await _pay_message(ctx, t, deal, invoice)
     assert call.message is not None
-    await show_screen(call.message, text, reply_markup=markup)
+    await show_screen(call.message, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
 
 
 @router.callback_query(F.data.regexp(r"^g:chk:\d+$"))
@@ -630,13 +814,21 @@ async def on_check(call: CallbackQuery, **data: Any) -> None:
         await call.answer(t("g.err.not_found"), show_alert=True)
         return
     result = await invoices.check_now(ctx, deal.id) if deal.status == "awaiting_payment" else None
-    if result is not None:  # the one who pressed sees the card instead of a notice
-        await on_funding(ctx, result, seen_by=data["user"].id)
+    if result is not None and result.outcome in ("funded", "refund", "mismatch"):
+        await on_funding(ctx, result, seen_by=data["user"].id)  # the one who pressed sees the card
     fresh = await deals.get_deal(session, deal.id)
     if fresh is not None and fresh.status != "awaiting_payment":
         await show_card(call, data, deal.id, t("g.pay.got"))
         return
-    await call.answer(t("g.pay.not_yet"), show_alert=True)
+    if result is not None and result.outcome == "partial":
+        note = t(
+            "g.pay.partial", got=money.show_minor(result.received), missing=money.show_minor(result.missing)
+        )
+    elif result is not None and result.outcome == "confirming":
+        note = t("g.pay.confirming")
+    else:
+        note = t("g.pay.not_yet")
+    await call.answer(note, show_alert=True)
 
 
 async def _ask(
@@ -696,7 +888,7 @@ async def on_cancel(call: CallbackQuery, **data: Any) -> None:
         deal = await invoices.cancel(ctx, _id(call), user_id)
     except DealError as exc:
         await call.answer(error_text(t, exc), show_alert=True)
-        if exc.key == "already_paid":
+        if exc.key in ("already_paid", "confirming"):
             await show_card(call, data, _id(call), answered=True)
         return
     for other in {deal.buyer_id, deal.seller_id, deal.creator_id} - {user_id, None}:

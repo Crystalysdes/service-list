@@ -15,7 +15,7 @@ from app.services.escrow.deals import Draft
 from app.services.escrow.sweep import poll_job, sweep
 from app.services.settings import Escrow, EscrowRuntime, get_settings, update_settings
 from tests.conftest import OWNER_ID
-from tests.fakepay import FakeCryptoPay
+from tests.fakeapirone import FakeApirone
 
 BUYER, SELLER, STRANGER, MOD, ADMIN, KEEPER = 7601, 7602, 7603, 7604, 7605, 7606
 G1, G2 = -1004440001, -1004440002
@@ -27,7 +27,7 @@ POOL_RIGHTS = dict.fromkeys(chats.REQUIRED_RIGHTS, True) | {
 
 @pytest.fixture
 async def pay(ctx, tg, db):
-    fake = FakeCryptoPay()
+    fake = FakeApirone()
     ctx.services["escrow_pay"] = fake
     async with db.session() as s:
         people = (
@@ -44,7 +44,7 @@ async def pay(ctx, tg, db):
             tg.add_user(uid, name, username)
         s.add_all([Staff(user_id=MOD, role="moderator"), Staff(user_id=ADMIN, role="admin")])
         await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, cleanup_minutes=60, fee_bps=500)
-        await update_settings(s, EscrowRuntime, pool_creators=[KEEPER])  # the owner vouched for it
+        await update_settings(s, EscrowRuntime, pool_creators=[KEEPER], switched_at=utcnow())  # vouched for
         await s.commit()
     for chat_id, title in ((G1, "Pool 1"), (G2, "Pool 2")):
         tg.add_chat(chat_id, "supergroup", title, rights=POOL_RIGHTS)
@@ -64,8 +64,9 @@ async def _funded(ctx, pay, amount: int = 10_000) -> Deal:
     )
     deal = await deals.create_deal(ctx.db, BUYER, "ann_b", draft)
     deal = await deals.accept_deal(ctx.db, deal.code, SELLER, "bob_s", deal.terms_hash)
+    await deals.set_address(ctx.db, deal.id, SELLER, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed")
     row = await invoices.invoice_for(ctx, deal.id, BUYER)
-    pay.pay(row.provider_invoice_id)
+    pay.pay(row.provider_invoice_id, confirmed=True)
     await poll_job(ctx)
     return await _fresh(ctx, deal.id)
 
@@ -264,3 +265,21 @@ async def test_a_group_made_by_an_outsider_waits_for_the_owner(h, tg, db, ctx, p
         await update_settings(s, EscrowRuntime, pool_creators=[])  # the vouch withdrawn
         await s.commit()
     assert "не сотрудник бота" in " ".join((await chats.check_group(ctx, G1)).problems)
+
+
+async def test_payment_pages_are_removed_and_bare_addresses_get_a_warning(h, tg, db, ctx, pay):
+    await chats.add_group(ctx, G1, ADMIN)
+    deal = await _funded(ctx, pay)
+    invites = deal.data["invites"]
+    assert await h.join_request(BUYER, G1, invites["buyer"])
+    assert await h.join_request(SELLER, G1, invites["seller"])
+    fake = await h.group_send(G1, SELLER, text="Доплати по счёту: https://apirone.com/invoice?id=Fake123")
+    assert fake["message_id"] not in tg.messages[G1]  # removed
+    assert "ссылкой на оплату удалено" in _texts(tg, G1)[-1]
+    wallet = await h.group_send(G1, SELLER, text="Мой кошелёк: 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed")
+    assert wallet["message_id"] in tg.messages[G1]  # kept: deals in crypto need addresses
+    assert "адреса из переписки гарант не проверяет" in _texts(tg, G1)[-1]
+    tx = "0x" + "ab" * 32
+    before = len(_texts(tg, G1))
+    await h.group_send(G1, BUYER, text=f"Отправил, вот транзакция {tx}")  # a hash is not an address
+    assert len(_texts(tg, G1)) == before

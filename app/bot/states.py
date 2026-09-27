@@ -48,10 +48,15 @@ class DealWizard(StatesGroup):
     terms = State()
     amount = State()
     counterparty = State()
+    address = State()
 
 
 class DealDispute(StatesGroup):
     reason = State()
+
+
+class DealAddress(StatesGroup):
+    waiting = State()
 
 
 class DealChatAdd(StatesGroup):

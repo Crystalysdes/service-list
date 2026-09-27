@@ -6,22 +6,26 @@ import pytest
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import Deal, DealPayout, Staff, User
-from app.services.escrow import deals, invoices
+from app.db.models import Deal, DealPayout, EscrowWithdrawal, Staff, User
+from app.services.apirone import ApironeError
+from app.services.escrow import deals, invoices, payouts
 from app.services.escrow.deals import Draft
 from app.services.escrow.notify import dispute_alert
 from app.services.escrow.sweep import poll_job, sweep
 from app.services.settings import Chats, Escrow, EscrowRuntime, get_settings, update_settings
 from tests.conftest import OWNER_ID
-from tests.fakepay import FakeCryptoPay
+from tests.fakeapirone import FakeApirone
 
 MOD, ADMIN, BUYER, SELLER = 7501, 7502, 7503, 7504
 GROUP = -1009990001
+SELLER_WALLET = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+BUYER_WALLET = "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"
+OWNER_WALLET = "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb"
 
 
 @pytest.fixture
 async def pay(ctx, tg, db):
-    fake = FakeCryptoPay()
+    fake = FakeApirone()
     ctx.services["escrow_pay"] = fake
     async with db.session() as s:
         people = (
@@ -37,6 +41,7 @@ async def pay(ctx, tg, db):
         await update_settings(
             s, Escrow, enabled=True, create_cooldown_sec=0, admin_only_from_cents=50_000, fee_bps=500
         )
+        await update_settings(s, EscrowRuntime, switched_at=utcnow())
         await s.commit()
     return fake
 
@@ -53,8 +58,9 @@ async def _funded(ctx, pay, *, buyer=BUYER, seller=SELLER, amount=10_000) -> Dea
     deal = await deals.create_deal(ctx.db, buyer, None, draft)
     deal = await deals.accept_deal(ctx.db, deal.code, seller, None, deal.terms_hash)
     deal = await deals.confirm_counterparty(ctx.db, deal.id, buyer, True)
+    await deals.set_address(ctx.db, deal.id, seller, SELLER_WALLET)
     row = await invoices.invoice_for(ctx, deal.id, buyer)
-    pay.pay(row.provider_invoice_id)
+    pay.pay(row.provider_invoice_id, confirmed=True)
     await poll_job(ctx)
     return await _fresh(ctx, deal.id)
 
@@ -120,8 +126,13 @@ async def test_a_moderator_splits_a_disputed_deal(h, tg, db, ctx, pay):
     assert "Вердикт по сделке #1" in _text(h.last(OWNER_ID))
     assert "решено" in _text(tg.messages[MOD][alert["message_id"]])  # the dispute alert shows the decision
     await sweep(ctx)
+    assert (await _fresh(ctx, deal.id)).status == "settling"  # the buyer's part waits for their address
+    await deals.set_address(ctx.db, deal.id, BUYER, BUYER_WALLET)
+    await sweep(ctx)
     assert (await _fresh(ctx, deal.id)).status == "split"
-    assert pay.paid_to(SELLER) == 60 and pay.paid_to(BUYER) == 40
+    assert pay.asked_to(SELLER_WALLET) == 6_000 and pay.asked_to(BUYER_WALLET) == 4_000
+    card = await _open(h, ADMIN, deal.id)
+    assert "продавцу 60 USDT — отправлено · на 0x5aAe…eAed" in _text(card) and "комиссия" in _text(card)
 
 
 async def test_who_may_decide(h, tg, db, ctx, pay):
@@ -159,28 +170,29 @@ async def test_who_may_decide(h, tg, db, ctx, pay):
 async def test_payouts_by_hand_and_again(h, tg, db, ctx, pay):
     deal = await _funded(ctx, pay)
     await deals.release(ctx.db, deal.id, BUYER)
-    pay.transfer_errors = ["AMOUNT_TOO_SMALL"]
+    pay.transfer_errors = [(400, "Amount is too small")]
     await sweep(ctx)
     card = await _open(h, ADMIN, deal.id)
-    assert "ошибка · AMOUNT_TOO_SMALL" in _text(card)
+    assert "ждёт решения · на 0x5aAe…eAed · Amount is too small" in _text(card)
     assert h.button(card, "Повторить") and not [b for b in h.buttons(card) if "вручную" in b["text"]]
     card = await _open(h, OWNER_ID, deal.id)
     await h.press(OWNER_ID, card, "Выплачено вручную")
-    await h.say(OWNER_ID, "чек https://t.me/CryptoBot?start=CQ1")
+    assert "хеш транзакции" in _text(h.last(OWNER_ID))
+    await h.say(OWNER_ID, "0xabc — отправил из кабинета Apirone")
     assert "отмечена как выплаченная вручную" in _text(h.last(OWNER_ID))
     assert "выплачены вам вручную" in _text(h.last(SELLER))
     assert (await _fresh(ctx, deal.id)).status == "completed" and not pay.transfers
 
     other = await _funded(ctx, pay, amount=3_000)
     await deals.release(ctx.db, other.id, BUYER)
-    pay.transfer_errors = ["AMOUNT_TOO_SMALL"]
+    pay.transfer_errors = [(400, "Amount is too small")]
     await sweep(ctx)
     card = await _open(h, ADMIN, other.id)
     await h.press(ADMIN, card, "Повторить")
     await sweep(ctx)
     async with db.session() as s:
         payout = (await s.execute(select(DealPayout).where(DealPayout.deal_id == other.id))).scalar_one()
-    assert payout.status == "done" and pay.paid_to(SELLER) == 30
+    assert payout.status == "done" and pay.asked_to(SELLER_WALLET) == 3_000
 
 
 async def test_owner_settings_and_switches(h, tg, db, ctx, pay):
@@ -208,14 +220,18 @@ async def test_owner_settings_and_switches(h, tg, db, ctx, pay):
         assert (await get_settings(s, EscrowRuntime)).pause_reason == "owner"
     del ctx.services["escrow_pay"]
     await h.press(OWNER_ID, h.last(OWNER_ID), "Включить приём сделок")
-    assert "ESCROW_CRYPTOPAY_TOKEN" in _alert(tg)
+    assert "ESCROW_APIRONE_ACCOUNT" in _alert(tg)
     ctx.services["escrow_pay"] = pay
-    pay.transfers_refused = "METHOD_DISABLED"  # deals that could not be paid out must not start
+
+    async def refused(**kw):
+        raise ApironeError("Unauthorized", 401)
+
+    pay.invoices = refused  # a wrong transfer key: deals that could not be paid out must not start
     await h.press(OWNER_ID, h.last(OWNER_ID), "Включить приём сделок")
-    assert _alert(tg).startswith("Пока нельзя: METHOD_DISABLED") and "Transfers" in _alert(tg)
+    assert _alert(tg).startswith("Пока нельзя: Apirone отказал (HTTP 401)") and "TRANSFER_KEY" in _alert(tg)
     async with db.session() as s:
         assert not (await get_settings(s, Escrow)).enabled
-    pay.transfers_refused = None
+    del pay.invoices
     await h.press(OWNER_ID, h.last(OWNER_ID), "Включить приём сделок")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Возобновить выплаты")
     async with db.session() as s:
@@ -272,18 +288,18 @@ async def test_after_a_restore_payouts_wait_for_the_check_unless_the_owner_says_
     await h.press(OWNER_ID, h.last(OWNER_ID), "Гарант")
     home = h.last(OWNER_ID)
     assert "база восстановлена из копии" in _text(home)
-    pay.transfers_refused = "METHOD_DISABLED"
+    pay.history_fail = True
     await h.press(OWNER_ID, home, "Возобновить выплаты")
     screen = tg.messages[OWNER_ID][home["message_id"]]
-    assert "Выплаты пока не включены" in _text(screen) and "METHOD_DISABLED" in _text(screen)
-    assert "Security → Transfers" in _text(screen)  # the reason, with the fix, stays on the screen
+    assert "Выплаты пока не включены" in _text(screen) and "нет ответа" in _text(screen)
+    assert "историю аккаунта Apirone" in _text(screen)  # the reason stays on the screen
     async with db.session() as s:
         assert (await get_settings(s, EscrowRuntime)).payouts_paused
     await h.press(OWNER_ID, screen, "Включить без сверки")
     confirm = tg.messages[OWNER_ID][home["message_id"]]
     assert "Включить выплаты без сверки?" in _text(confirm)
     await h.press(OWNER_ID, confirm, "Да, включить без сверки")
-    assert "Список переводов не проверен: METHOD_DISABLED" in _alert(tg)
+    assert "История Apirone не проверена: нет ответа" in _alert(tg)
     async with db.session() as s:
         assert not (await get_settings(s, EscrowRuntime)).payouts_paused
 
@@ -302,12 +318,70 @@ async def test_reconcile_now_and_network_hiccups_are_told_only_when_they_last(h,
 
     assert told() == []  # once may be a hiccup
     await h.press(ADMIN, screen, "Сверить сейчас")
-    assert len(told()) == 1 and "баланс приложения гаранта: нет ответа" in told()[0]  # it lasts: told
+    assert len(told()) == 1 and "баланс аккаунта: нет ответа" in told()[0]  # it lasts: told
     await h.press(ADMIN, screen, "Сверить сейчас")
     assert len(told()) == 1  # and only once
     pay.fail = False
     await h.press(ADMIN, screen, "Сверить сейчас")
     assert "Сверка прошла: расхождений нет" in _text(h.last(ADMIN))
-    pay.transfers_refused = "METHOD_DISABLED"  # a refusal is not a hiccup: told at once
+
+    async def refused(**kw):
+        raise ApironeError("Forbidden", 403)
+
+    pay.history = refused  # a refusal is not a hiccup: told at once
     await h.press(ADMIN, tg.messages[ADMIN][home["message_id"]], "Сверить сейчас")
-    assert len(told()) == 2 and "METHOD_DISABLED" in told()[-1]
+    assert len(told()) == 2 and "Apirone отказал (HTTP 403)" in told()[-1]
+
+
+async def test_the_owner_takes_the_income(h, tg, db, ctx, pay):
+    deal = await _funded(ctx, pay)
+    await deals.release(ctx.db, deal.id, BUYER)
+    await sweep(ctx)  # 105 came in, 100 went to the seller: the 5 USDT fee is the income
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Гарант")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Вывести доход")
+    screen = h.last(OWNER_ID)
+    assert "Можно вывести: 5 USDT" in _text(screen) and "Адрес не задан" in _text(screen)
+    await h.press(OWNER_ID, screen, "Задать адрес")
+    await h.say(OWNER_ID, "0xnope")
+    assert "Это не адрес BEP20" in _text(h.last(OWNER_ID))
+    await h.say(OWNER_ID, OWNER_WALLET)
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Другая сумма")
+    await h.say(OWNER_ID, "10")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Да, вывести 10 USDT")
+    assert "Столько вывести нельзя: доступно 5 USDT" in _alert(tg) and not pay.transfers[1:]
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Нет")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Вывести всё: 5 USDT")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Да, вывести 5 USDT")
+    assert "Вывод отправлен" in _alert(tg) and pay.asked_to(OWNER_WALLET) == 500
+    async with db.session() as s:
+        row = (await s.execute(select(EscrowWithdrawal))).scalar_one()
+    assert row.status == "done" and row.txid == pay.transfers[-1]["txid"]
+    assert "Можно вывести: 0 USDT" in _text(h.last(OWNER_ID))
+    await payouts.reconcile(ctx)  # the withdrawal is the bot's own: no question for the owner
+    async with db.session() as s:
+        assert not (await get_settings(s, EscrowRuntime)).unknown_payments
+
+
+async def test_unknown_transfers_are_named_by_the_owner(h, tg, db, ctx, pay):
+    await _funded(ctx, pay)
+    pay.fund(1_000)
+    pay.send_by_hand("0x" + "4" * 40, 1_000)
+    await payouts.reconcile(ctx)
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Гарант")
+    home = h.last(OWNER_ID)
+    assert "Непонятных переводов с аккаунта: 1" in _text(home)
+    await h.press(OWNER_ID, home, "Непонятные переводы (1)")
+    screen = h.last(OWNER_ID)
+    assert "10 USDT → 0x4444…4444" in _text(screen)
+    await h.press(OWNER_ID, screen, "Это выплата по сделке")
+    assert "Невыплаченных выплат на этот адрес нет" in _text(h.last(OWNER_ID))
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Назад")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Это мой перевод")
+    async with db.session() as s:
+        [entry] = (await get_settings(s, EscrowRuntime)).unknown_payments
+    assert entry["status"] == "owner" and entry["by"] == OWNER_ID
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Гарант")
+    assert not [b for b in h.buttons(h.last(OWNER_ID)) if "Непонятные" in b["text"]]

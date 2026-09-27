@@ -1,14 +1,15 @@
 """Admin: 🛡 Гарант — the summary, disputes and verdicts, deals, payouts that failed, the owner's settings.
 
 Moderators see deals that are or were in a dispute and decide those below the admin-only amount; admins see
-and decide every deal; only the owner changes the settings, switches deals on, resumes payouts and marks a
-payout as paid by hand. Every decision is checked again by the deal itself."""
+and decide every deal; only the owner changes the settings, switches deals on, resumes payouts, marks a
+payout as paid by hand, names the transfers nobody explained and takes the income off the Apirone account.
+Every decision is checked again by the deal itself."""
 
 from __future__ import annotations
 
 import contextlib
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from aiogram import F, Router
@@ -27,12 +28,12 @@ from app.bot.routers.admin.panel import back_home
 from app.bot.states import DealChatAdd
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import AuditLog, Deal, DealChat, DealPayout, User
+from app.db.models import AuditLog, Deal, DealChat, DealPayout, DealReceipt, EscrowWithdrawal, User
+from app.services import evm
 from app.services.audit import audit
 from app.services.catalog import request_sync
-from app.services.cryptopay import CryptoPayError
-from app.services.escrow import cards, chats, deals, money, payouts
-from app.services.escrow.deals import HELD, OPEN, UNPAID, DealError
+from app.services.escrow import cards, chats, deals, ledger, money, payouts, wallets
+from app.services.escrow.deals import GATEWAY, HELD, OPEN, UNPAID, DealError
 from app.services.escrow.notify import tell
 from app.services.escrow.staff import ROLE_TITLES, after_ban, after_verdict, staff_cancel, staff_dispute
 from app.services.settings import Escrow, EscrowRuntime, get_settings, update_settings
@@ -60,26 +61,31 @@ PAYOUT = {
     "pending": "ждёт отправки",
     "sending": "отправляется",
     "retry": "повтор",
-    "unknown": "проверяется",
-    "failed": "ошибка",
+    "unknown": "исход неизвестен — ищется в истории",
+    "failed": "ждёт решения",
     "done": "отправлено",
     "manual": "выплачено вручную",
+    "no_address": "ждёт адрес получателя",
 }
-PURPOSE = {"seller": "продавцу", "buyer": "покупателю", "extra": "возврат лишнего"}
+PURPOSE = {"seller": "продавцу", "buyer": "покупателю", "extra": "возврат покупателю"}
 PAUSE = {
-    "balance": "на балансе меньше, чем гарант должен",
-    "restore": "база восстановлена из копии — проверьте выплаты",
+    "balance": "на аккаунте Apirone меньше, чем гарант должен",
+    "restore": "база восстановлена из копии — нужна сверка с историей Apirone",
     "owner": "остановлены владельцем",
 }
+RECEIPT = {None: "ждёт", "deal": "в сделке", "refund": "возвращается", "review": "ждёт решения владельца"}
+NO_ACCOUNT = (
+    "не задан аккаунт Apirone: ESCROW_APIRONE_ACCOUNT и ESCROW_APIRONE_TRANSFER_KEY (servicelist config)"
+)
 
 
 def pause_label(reason: str) -> str:
-    """Why payouts stopped; a refusal of Crypto Pay (``funds:…``, ``config:…``) with its error and fix."""
+    """Why payouts stopped; a refusal of Apirone (``funds:…``, ``config:…``) with its words."""
     kind, _sep, name = reason.partition(":")
     if kind == "funds":
-        return f"на балансе приложения гаранта не хватает USDT ({name})"
+        return f"на аккаунте Apirone не хватает USDT ({name})"
     if kind == "config" and name:
-        return f"Crypto Pay не даёт делать переводы: {payouts.why(CryptoPayError(name))}"
+        return f"Apirone не даёт делать переводы: {name} — проверьте аккаунт и ключ в servicelist config"
     return PAUSE.get(reason, reason)
 
 
@@ -87,6 +93,7 @@ LIST_TITLES = {
     "disputed": "⚖️ Споры",
     "active": "🔄 Активные сделки",
     "payouts": "💸 Выплаты с ошибкой",
+    "address": "📭 Выплаты ждут адрес",
     "all": "📜 Все сделки",
 }
 
@@ -107,7 +114,7 @@ def _parts(call: CallbackQuery) -> list[str]:
 async def home_text(session: AsyncSession, ctx: AppContext) -> str:
     settings = await get_settings(session, Escrow)
     runtime = await get_settings(session, EscrowRuntime)
-    owe = await payouts.obligations(session)
+    owe = await ledger.obligations(session)
     now = utcnow()
     finished = ("settling", "completed", "refunded", "split")
     fees_all = await session.scalar(
@@ -118,9 +125,9 @@ async def home_text(session: AsyncSession, ctx: AppContext) -> str:
             Deal.status.in_(finished), Deal.settled_at >= now - timedelta(days=30)
         )
     )
-    lines = ["🛡 <b>Гарант</b>", ""]
+    lines = ["🛡 <b>Гарант</b> · Apirone, USDT BEP20", ""]
     if ctx.get("escrow_pay") is None:
-        lines += ["⚠️ Не задан ESCROW_CRYPTOPAY_TOKEN — оплата сделок невозможна (servicelist config).", ""]
+        lines += [f"⚠️ {NO_ACCOUNT} — оплата сделок невозможна.", ""]
     lines.append(f"Приём сделок: {'✅ включён' if settings.enabled else '⏸ выключен'}")
     if runtime.payouts_paused:
         lines.append(f"Выплаты: ⏸ на паузе — {h(pause_label(runtime.pause_reason or ''))}")
@@ -128,12 +135,18 @@ async def home_text(session: AsyncSession, ctx: AppContext) -> str:
         lines.append("Выплаты: ✅ работают")
     balance = runtime.last_balance or {}
     if "available" in balance:
-        free = int(balance["available"]) - owe["held"] - owe["owed"]
+        free = await ledger.withdrawable(ctx, {**owe, "available": int(balance["available"])})
         lines.append(
-            f"💰 Баланс приложения: {money.show(int(balance['available']))} "
-            f"· можно вывести {money.show(max(free, 0))}"
+            f"💰 На аккаунте: {money.show(int(balance['available']))} · можно вывести {money.show(free or 0)}"
         )
     lines.append(f"🔒 Заморожено в сделках: {money.show(owe['held'])} · к выплате: {money.show(owe['owed'])}")
+    if owe["waiting"]:
+        lines.append(f"📥 Получено, но ещё не распределено: {money.show(owe['waiting'])}")
+    if owe["doubtful"]:
+        lines.append(f"❓ Переводы с неизвестным исходом: {money.show(owe['doubtful'])}")
+    unknown = [e for e in runtime.unknown_payments if e.get("status") == "open"]
+    if unknown:
+        lines.append(f"⚠️ Непонятных переводов с аккаунта: {len(unknown)} — ждут вашего решения")
     lines.append(
         f"💵 Комиссии: за 30 дней {money.show(int(fees_30 or 0))} · всего {money.show(int(fees_all or 0))}"
     )
@@ -154,12 +167,20 @@ async def _counts(session: AsyncSession) -> dict[str, int]:
         .select_from(DealPayout)
         .where(
             or_(
-                DealPayout.status == "failed",
+                DealPayout.status.in_(("failed", "unknown")),
                 (DealPayout.status == "retry") & DealPayout.last_error.is_not(None),
             )
         )
     )
-    return {"disputed": int(disputed or 0), "active": int(active or 0), "payouts": int(failed or 0)}
+    address = await session.scalar(
+        select(func.count()).select_from(DealPayout).where(DealPayout.status == "no_address")
+    )
+    return {
+        "disputed": int(disputed or 0),
+        "active": int(active or 0),
+        "payouts": int(failed or 0),
+        "address": int(address or 0),
+    }
 
 
 async def home_markup(session: AsyncSession, role: str | None) -> Any:
@@ -171,6 +192,8 @@ async def home_markup(session: AsyncSession, role: str | None) -> Any:
     if has_role(role, "admin"):
         builder.button(text=f"🔄 Активные ({counts['active']})", callback_data="a:g:l:active")
         builder.button(text=f"💸 Выплаты с ошибкой ({counts['payouts']})", callback_data="a:g:l:payouts")
+        if counts["address"]:
+            builder.button(text=f"📭 Ждут адрес ({counts['address']})", callback_data="a:g:l:address")
         builder.button(text="📜 Все сделки", callback_data="a:g:l:all")
         pool = await chats.pool_counts(session)
         builder.button(
@@ -181,6 +204,12 @@ async def home_markup(session: AsyncSession, role: str | None) -> Any:
     if has_role(role, "admin"):
         builder.button(text="🔍 Сверить сейчас", callback_data="a:g:chk")
     if role == "owner":
+        unknown = [e for e in runtime.unknown_payments if e.get("status") == "open"]
+        if unknown:
+            builder.button(
+                text=f"❓ Непонятные переводы ({len(unknown)})", callback_data="a:g:u", style="danger"
+            )
+        builder.button(text="💵 Вывести доход", callback_data="a:g:wd")
         builder.button(
             text="⏸ Остановить приём сделок" if settings.enabled else "▶️ Включить приём сделок",
             callback_data="a:g:on",
@@ -213,13 +242,10 @@ async def on_toggle(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
     ctx: AppContext = data["ctx"]
     settings = await get_settings(session, Escrow)
     if not settings.enabled and ctx.get("escrow_pay") is None:
-        await call.answer(
-            "Сначала задайте ESCROW_CRYPTOPAY_TOKEN (отдельное приложение Crypto Pay) в servicelist config.",
-            show_alert=True,
-        )
+        await call.answer(f"Сначала: {NO_ACCOUNT}."[:200], show_alert=True)
         return
     if not settings.enabled:  # deals that could not be paid out must not start
-        problem = await payouts.transfers_problem(ctx)
+        problem = await payouts.setup_problem(ctx)
         if problem is not None:
             await call.answer(f"Пока нельзя: {problem}"[:200], show_alert=True)
             return
@@ -248,17 +274,17 @@ async def on_payouts_switch(call: CallbackQuery, session: AsyncSession, **data: 
             await show_screen(
                 call.message,
                 "⏸ <b>Выплаты пока не включены</b>\n\n"
-                "База восстановлена из копии: прежде чем платить, бот сверяет её со списком переводов "
-                "Crypto Pay, чтобы никому не заплатить второй раз. Crypto Pay список не отдал: "
+                "База восстановлена из копии: прежде чем платить, бот читает историю аккаунта Apirone "
+                "с даты копии, чтобы никому не заплатить второй раз. История не пришла: "
                 f"{h(str(exc.params.get('why') or '?'))}.\n\n"
                 "Устраните причину и попробуйте снова. «Включить без сверки» — только если вы сами "
-                "проверили в @CryptoBot переводы приложения гаранта, сделанные после даты копии.",
+                "проверили в кабинете Apirone исходящие переводы после даты копии.",
                 reply_markup=back_home(builder, "a:g"),
             )
             return
         if skipped:
             await call.answer(
-                f"Выплаты возобновлены. Список переводов не проверен: {skipped}"[:200], show_alert=True
+                f"Выплаты возобновлены. История Apirone не проверена: {skipped}"[:200], show_alert=True
             )
         else:
             await call.answer("Выплаты возобновлены — очередь уйдёт в течение минуты", show_alert=True)
@@ -283,8 +309,9 @@ async def on_force_resume(call: CallbackQuery, **data: Any) -> None:
     await show_screen(
         call.message,
         "Включить выплаты без сверки?\n\n"
-        "Если после даты копии бот уже отправил кому-то деньги по сделке, эта выплата может уйти ещё раз. "
-        "Переводы приложения видны в @CryptoBot → Crypto Pay → My Apps → приложение гаранта.",
+        "Если после даты копии бот уже отправил кому-то деньги по сделке, а история Apirone этого не "
+        "покажет, выплата может уйти ещё раз. Исходящие переводы видны в кабинете Apirone → "
+        "история аккаунта.",
         reply_markup=builder.as_markup(),
     )
 
@@ -293,9 +320,9 @@ async def on_force_resume(call: CallbackQuery, **data: Any) -> None:
 async def on_reconcile_now(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     ctx: AppContext = data["ctx"]
     if ctx.get("escrow_pay") is None:
-        await call.answer("Не задан ESCROW_CRYPTOPAY_TOKEN (servicelist config)", show_alert=True)
+        await call.answer(NO_ACCOUNT[:200], show_alert=True)
         return
-    await call.answer("Сверяю с Crypto Pay…")
+    await call.answer("Сверяю с Apirone…")
     problems = await payouts.reconcile(ctx)
     await session.commit()  # the screen reads what the check has just written
     assert call.message is not None
@@ -311,7 +338,7 @@ def _deal_button(deal: Deal) -> str:
     return f"{icon} #{deal.id} · {money.show(deal.amount_cents)} · {deal.title[:24]}"
 
 
-@router.callback_query(F.data.regexp(r"^a:g:l:(disputed|active|payouts|all)$"))
+@router.callback_query(F.data.regexp(r"^a:g:l:(disputed|active|payouts|address|all)$"))
 async def on_list(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     kind = _parts(call)[3]
     role = _role(data)
@@ -319,19 +346,17 @@ async def on_list(call: CallbackQuery, session: AsyncSession, **data: Any) -> No
         await call.answer("Только для администраторов", show_alert=True)
         return
     builder = InlineKeyboardBuilder()
-    if kind == "payouts":
-        rows = (
-            await session.execute(
-                select(DealPayout)
-                .where(
-                    or_(
-                        DealPayout.status == "failed",
-                        (DealPayout.status == "retry") & DealPayout.last_error.is_not(None),
-                    )
-                )
-                .order_by(DealPayout.id)
-                .limit(40)
+    if kind in ("payouts", "address"):
+        where = (
+            DealPayout.status == "no_address"
+            if kind == "address"
+            else or_(
+                DealPayout.status.in_(("failed", "unknown")),
+                (DealPayout.status == "retry") & DealPayout.last_error.is_not(None),
             )
+        )
+        rows = (
+            await session.execute(select(DealPayout).where(where).order_by(DealPayout.id).limit(40))
         ).scalars()
         for payout in rows:
             builder.button(
@@ -400,6 +425,25 @@ async def input_find(message: Message, data: dict[str, Any], fsm: dict[str, Any]
 
 
 # ------------------------------------------------------------------------------------------ the deal card
+def payout_line(payout: DealPayout) -> str:
+    """A payout for staff: to whom, how much, where it stands, where it went, what it cost."""
+    parts = [
+        f"💸 {PURPOSE.get(payout.purpose, payout.purpose)} {money.show(payout.amount_cents)} — "
+        f"{PAYOUT.get(payout.status, payout.status)}"
+    ]
+    if payout.address:
+        parts.append(f"на {evm.short(evm.checksummed(payout.address))}")
+    if payout.txid:
+        parts.append(f'<a href="{wallets.tx_url(payout.txid)}">транзакция</a>')
+    if payout.fee_minor and payout.fee_minor.isdigit():
+        parts.append(f"комиссия {money.show_minor(int(payout.fee_minor))}")
+    if payout.last_error and payout.status not in ("done", "manual"):
+        parts.append(h(payout.last_error))
+    if payout.manual_ref:
+        parts.append(h(payout.manual_ref))
+    return " · ".join(parts)
+
+
 async def staff_card(
     session: AsyncSession, ctx: AppContext, deal: Deal, staff_id: int, role: str | None
 ) -> tuple[str, Any]:
@@ -429,10 +473,29 @@ async def staff_card(
         f"➡️ Покупатель платит {money.show(deal.buyer_pays_cents)}, продавец получает "
         f"{money.show(deal.seller_gets_cents)}",
     ]
-    if deal.received_cents is not None:
+    if deal.gateway != GATEWAY:
+        lines.append("🏦 Сделка на CryptoBot: её деньги в приложении гаранта в @CryptoBot, выплаты — вручную")
+    for side, address in (("продавца", deal.seller_address), ("покупателя", deal.buyer_address)):
+        if address:
+            lines.append(f'💳 Адрес {side}: <a href="{wallets.address_url(address)}">{address}</a>')
+    receipts = list(
+        (
+            await session.execute(
+                select(DealReceipt).where(DealReceipt.deal_id == deal.id).order_by(DealReceipt.id)
+            )
+        ).scalars()
+    )
+    if deal.received_cents is not None or receipts:
+        total = sum(int(r.amount) for r in receipts)
         lines.append(
-            f"📥 Получено: {money.show(deal.received_cents)} (комиссия Crypto Pay "
-            f"{money.show(deal.provider_fee_cents or 0)})"
+            f"📥 Получено: {money.show_minor(total) if receipts else money.show(deal.received_cents or 0)}"
+        )
+    for receipt in receipts:
+        state = RECEIPT.get(receipt.purpose, receipt.purpose or "")
+        lines.append(
+            f"    • {money.show_minor(int(receipt.amount))} · "
+            f'<a href="{wallets.tx_url(receipt.txid)}">tx</a> · '
+            f"{'подтверждён' if receipt.confirmed else 'не подтверждён'} · {state}"
         )
     for title, value in (
         ("Создана", deal.created_at),
@@ -465,12 +528,7 @@ async def staff_card(
         lines.append("🤝 Одна из сторон предложила отменить сделку")
     rows = await deals.payouts_of(session, deal.id)
     for payout in rows:
-        detail = f" · {h(payout.last_error)}" if payout.last_error and payout.status != "done" else ""
-        ref = f" · {h(payout.manual_ref)}" if payout.manual_ref else ""
-        lines.append(
-            f"💸 {PURPOSE.get(payout.purpose, payout.purpose)} {money.show(payout.amount_cents)} — "
-            f"{PAYOUT.get(payout.status, payout.status)}{detail}{ref}"
-        )
+        lines.append(payout_line(payout))
     if deal.needs_attention:
         lines.append("❗️ Требует внимания: был платёж, который не подошёл к сделке")
     chat_line = {
@@ -502,13 +560,21 @@ async def staff_card(
         if deal.status in UNPAID:
             builder.button(text="✖️ Отменить сделку", callback_data=f"a:g:cx:{deal.id}")
         for payout in rows:
-            if payout.status in ("failed", "retry"):
-                label = f"{PURPOSE.get(payout.purpose, '')} {money.show(payout.amount_cents)}"
+            label = f"{PURPOSE.get(payout.purpose, '')} {money.show(payout.amount_cents)}"
+            if payout.status in ("failed", "retry") and deal.gateway == GATEWAY:
                 builder.button(text=f"🔁 Повторить: {label}", callback_data=f"a:g:pr:{payout.id}")
-                if role == "owner" and payout.status == "retry":  # stopped first: never paid twice
-                    builder.button(text=f"⏸ Остановить повторы: {label}", callback_data=f"a:g:ph:{payout.id}")
-                elif role == "owner":
-                    builder.button(text=f"✍️ Выплачено вручную: {label}", callback_data=f"a:g:pm:{payout.id}")
+            if role == "owner" and payout.status in ("pending", "retry", "no_address"):  # stopped first
+                builder.button(text=f"⏸ Остановить повторы: {label}", callback_data=f"a:g:ph:{payout.id}")
+            elif role == "owner" and payout.status == "failed":
+                builder.button(text=f"✍️ Выплачено вручную: {label}", callback_data=f"a:g:pm:{payout.id}")
+        if role == "owner":
+            for receipt in receipts:
+                if receipt.purpose == "review" and receipt.payout_id is None and receipt.confirmed:
+                    value = money.show_minor(int(receipt.amount))
+                    builder.button(text=f"↩️ Вернуть покупателю {value}", callback_data=f"a:g:rr:{receipt.id}")
+                    builder.button(
+                        text=f"✔️ Оставить {value} (не возвращать)", callback_data=f"a:g:rk:{receipt.id}"
+                    )
         for side, user_id in (("buyer", deal.buyer_id), ("seller", deal.seller_id)):
             if user_id and not (users.get(user_id) and users[user_id].is_banned):
                 title = "покупателя" if side == "buyer" else "продавца"
@@ -805,8 +871,17 @@ async def on_retry(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
         return
     try:
         await payouts.retry_now(data["ctx"], payout.id, data["user"].id)
-    except DealError:
-        await call.answer("Эту выплату сейчас повторить нельзя", show_alert=True)
+    except DealError as exc:
+        texts = {
+            "too_soon": "Исход прошлой попытки был неизвестен: повторить можно не раньше чем через 2 часа "
+            "после неё — пусть история Apirone успеет её показать.",
+            "already_sent": "История Apirone показывает этот перевод — выплата отмечена отправленной.",
+            "provider": "Apirone не отдал историю — без неё повторять нельзя. Попробуйте позже.",
+            "legacy": "Это сделка на CryptoBot: выплатите её из приложения гаранта и отметьте вручную.",
+        }
+        await call.answer(texts.get(exc.key, "Эту выплату сейчас повторить нельзя"), show_alert=True)
+        if exc.key == "already_sent":
+            await _open_card(call, {**data, "session": session}, payout.deal_id)
         return
     await _open_card(
         call, {**data, "session": session}, payout.deal_id, "Выплата повторится в течение минуты"
@@ -844,8 +919,10 @@ async def on_manual(call: CallbackQuery, state: FSMContext, session: AsyncSessio
         "g_manual",
         f"Выплата {PURPOSE.get(payout.purpose, '')} {money.show(payout.amount_cents)} "
         f"по сделке #{payout.deal_id}.\n\n"
-        "Пришлите, как она сделана: ссылку на чек @CryptoBot или номер перевода. Получатель увидит это "
-        "сообщение, бот больше не будет пытаться её отправить.",
+        "Пришлите, как она сделана: хеш транзакции (0x…) или другое подтверждение. Получатель увидит это "
+        "сообщение, бот больше не будет пытаться её отправить.\n\n"
+        "Перед отметкой бот ещё раз смотрит историю Apirone: если перевод этой выплаты там есть, "
+        "она будет отмечена отправленной им.",
         f"a:g:d:{payout.deal_id}",
         payout_id=payout.id,
     )
@@ -859,9 +936,11 @@ async def input_manual(message: Message, data: dict[str, Any], fsm: dict[str, An
         sent = await payouts.mark_manual(ctx, int(fsm["payout_id"]), data["user"].id, ref)
     except DealError as exc:
         texts = {
-            "already_sent": "Crypto Pay показывает, что перевод уже прошёл — выплата отмечена отправленной.",
-            "no_reason": "Пришлите ссылку на чек или номер перевода.",
-            "provider": "Crypto Pay не ответил — не могу проверить, что перевод не прошёл. Попробуйте позже.",
+            "already_sent": "История Apirone показывает, что перевод уже прошёл — "
+            "выплата отмечена отправленной.",
+            "no_reason": "Пришлите хеш транзакции или другое подтверждение.",
+            "provider": "Apirone не отдал историю — не могу проверить, что перевод не прошёл. "
+            "Попробуйте позже.",
         }
         await message.answer(texts.get(exc.key, "Эту выплату нельзя отметить вручную."))
         return exc.key != "no_reason"
@@ -915,6 +994,328 @@ async def on_ban(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
     disputed, cancelled = await after_ban(data["ctx"], user_id, data["user"].id)
     note = f"Забанен. Сделок в спор: {len(disputed)}, отменено: {len(cancelled)}"
     await _open_card(call, {**data, "session": session}, deal.id, note)
+
+
+# ------------------------------------------------------------------------------------------ owner decides
+@router.callback_query(F.data.regexp(r"^a:g:r[rk]:\d+$"), RoleFilter("owner"))
+async def on_receipt(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """A payment the bot did not decide itself: back to the buyer, or kept (written down twice, say)."""
+    ctx: AppContext = data["ctx"]
+    parts = _parts(call)
+    refund = parts[2] == "rr"
+    try:
+        receipt, _payout = await deals.decide_receipt(ctx.db, int(parts[3]), data["user"].id, refund=refund)
+    except DealError:
+        await call.answer("Этот платёж уже решён — обновите карточку.", show_alert=True)
+        return
+    note = (
+        "Платёж вернётся покупателю в течение пары минут" if refund else "Платёж оставлен, возврата не будет"
+    )
+    await _open_card(call, {**data, "session": session}, receipt.deal_id, note)
+
+
+def _short_tx(txid: str) -> str:
+    return txid.removeprefix("0x")[:12]
+
+
+def _unknown(runtime: EscrowRuntime, key: str) -> dict[str, Any] | None:
+    return next(
+        (
+            e
+            for e in runtime.unknown_payments
+            if e.get("status") == "open" and _short_tx(e.get("txid", "")) == key
+        ),
+        None,
+    )
+
+
+@router.callback_query(F.data == "a:g:u", RoleFilter("owner"))
+async def on_unknown(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    runtime = await get_settings(session, EscrowRuntime)
+    entries = [e for e in runtime.unknown_payments if e.get("status") == "open"]
+    tz = data["ctx"].config.timezone
+    lines = [
+        "❓ <b>Непонятные переводы</b>",
+        "",
+        "С аккаунта Apirone ушли деньги, которых бот не отправлял (перевод из кабинета Apirone, перевод до "
+        "восстановления из копии). Выплаты на эти адреса ждут, пока вы не скажете, что это было.",
+    ]
+    builder = InlineKeyboardBuilder()
+    for n, entry in enumerate(entries, 1):
+        when = entry.get("date") or ""
+        with contextlib.suppress(ValueError):
+            when = fmt_dt(datetime.fromisoformat(when), tz)
+        txid = entry.get("txid", "")
+        lines.append(
+            f"\n{n}. {money.show_minor(int(entry.get('amount') or 0))} → "
+            f"{h(ledger.where(entry.get('addresses') or []))} · {when} · "
+            f'<a href="{wallets.tx_url(txid)}">транзакция</a>'
+        )
+        key = _short_tx(txid)
+        builder.button(text=f"{n}. 🧾 Это мой перевод", callback_data=f"a:g:uo:{key}")
+        builder.button(text=f"{n}. 🔗 Это выплата по сделке…", callback_data=f"a:g:up:{key}")
+    if not entries:
+        lines.append("\nСейчас таких нет.")
+    builder.adjust(1)
+    await call.answer()
+    assert call.message is not None
+    await show_screen(
+        call.message,
+        "\n".join(lines),
+        reply_markup=back_home(builder, "a:g"),
+        link_preview_options=NO_PREVIEW,
+    )
+
+
+@router.callback_query(F.data.regexp(r"^a:g:uo:[0-9a-f]{1,12}$"), RoleFilter("owner"))
+async def on_unknown_own(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    entry = _unknown(await get_settings(session, EscrowRuntime), _parts(call)[3])
+    if entry is None:
+        await call.answer("Этот перевод уже решён", show_alert=True)
+        return
+    try:
+        await payouts.name_unknown(data["ctx"], entry["txid"], data["user"].id)
+    except DealError:
+        await call.answer("Этот перевод уже решён", show_alert=True)
+        return
+    await on_unknown(call, session, **data)
+
+
+@router.callback_query(F.data.regexp(r"^a:g:up:[0-9a-f]{1,12}$"), RoleFilter("owner"))
+async def on_unknown_pick(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    key = _parts(call)[3]
+    entry = _unknown(await get_settings(session, EscrowRuntime), key)
+    if entry is None:
+        await call.answer("Этот перевод уже решён", show_alert=True)
+        return
+    addresses = [a.lower() for a in entry.get("addresses") or []]
+    candidates = []
+    for payout, deal in (
+        await session.execute(
+            select(DealPayout, Deal)
+            .join(Deal, Deal.id == DealPayout.deal_id)
+            .where(
+                Deal.gateway == GATEWAY,
+                DealPayout.status.in_(("pending", "retry", "failed", "no_address", "unknown")),
+            )
+            .order_by(DealPayout.id)
+        )
+    ).all():
+        target = (payout.address or payouts.address_for(deal, payout) or "").lower()
+        if target in addresses:
+            candidates.append(payout)
+    builder = InlineKeyboardBuilder()
+    for payout in candidates[:20]:
+        builder.button(
+            text=f"#{payout.deal_id} {PURPOSE.get(payout.purpose, '')} {money.show(payout.amount_cents)}",
+            callback_data=f"a:g:ux:{key}:{payout.id}",
+        )
+    builder.adjust(1)
+    await call.answer()
+    assert call.message is not None
+    text = (
+        "Какую выплату сделал этот перевод? Она будет отмечена отправленной и больше не уйдёт."
+        if candidates
+        else "Невыплаченных выплат на этот адрес нет. Если это ваш перевод — отметьте «Это мой перевод»."
+    )
+    await show_screen(call.message, text, reply_markup=back_home(builder, "a:g:u"))
+
+
+@router.callback_query(F.data.regexp(r"^a:g:ux:[0-9a-f]{1,12}:\d+$"), RoleFilter("owner"))
+async def on_unknown_payout(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    parts = _parts(call)
+    entry = _unknown(await get_settings(session, EscrowRuntime), parts[3])
+    if entry is None:
+        await call.answer("Этот перевод уже решён", show_alert=True)
+        return
+    try:
+        await payouts.name_unknown(data["ctx"], entry["txid"], data["user"].id, payout_id=int(parts[4]))
+    except DealError:
+        await call.answer("Эту выплату уже нельзя связать с переводом — обновите экран.", show_alert=True)
+        return
+    await call.answer("Выплата отмечена отправленной этим переводом", show_alert=True)
+    await on_unknown(call, session, **data)
+
+
+# ------------------------------------------------------------------------------------------ withdrawals
+async def _withdraw_screen(ctx: AppContext, session: AsyncSession) -> tuple[str, Any]:
+    from app.services.escrow import withdrawals
+
+    runtime = await get_settings(session, EscrowRuntime)
+    ok, numbers = await ledger.check_balance(ctx)
+    free = await ledger.withdrawable(ctx, numbers) if ok is not None else None
+    last = await session.scalar(select(EscrowWithdrawal).order_by(EscrowWithdrawal.id.desc()).limit(1))
+    lines = ["💵 <b>Вывод дохода</b>", ""]
+    if free is None:
+        lines.append("Apirone не сообщил баланс — вывести сейчас нельзя.")
+    else:
+        lines += [
+            f"На аккаунте: {money.show(numbers['available'])}",
+            f"Обязательства: {money.show(ledger.owed_total(numbers))} "
+            "(в сделках, к выплате, не распределено)",
+        ]
+        if numbers.get("doubtful"):
+            lines.append(f"Переводы с неизвестным исходом: {money.show(numbers['doubtful'])}")
+        lines.append(f"<b>Можно вывести: {money.show(free)}</b>")
+    lines.append("")
+    lines.append(
+        f"Адрес: <code>{h(runtime.withdraw_address)}</code>"
+        if runtime.withdraw_address
+        else "Адрес не задан."
+    )
+    lines.append("Комиссии сети и Apirone вычитаются из выводимой суммы.")
+    if last is not None:
+        state = {
+            "sending": "отправляется",
+            "unknown": "исход неизвестен",
+            "done": "отправлен",
+            "failed": "не прошёл",
+        }
+        lines.append(
+            f"\nПоследний вывод: {money.show(last.amount_cents)} — {state.get(last.status, last.status)}"
+            + (f" · {h(last.last_error)}" if last.last_error and last.status == "failed" else "")
+        )
+    builder = InlineKeyboardBuilder()
+    busy = await withdrawals.in_flight(session) is not None
+    if free and runtime.withdraw_address and not busy:
+        builder.button(
+            text=f"💵 Вывести всё: {money.show(free)}", callback_data="a:g:wd:all", style="success"
+        )
+        builder.button(text="✏️ Другая сумма", callback_data="a:g:wd:sum")
+    builder.button(
+        text="💳 Задать адрес" if not runtime.withdraw_address else "💳 Сменить адрес",
+        callback_data="a:g:wd:addr",
+    )
+    builder.adjust(1)
+    return "\n".join(lines), back_home(builder, "a:g")
+
+
+@router.callback_query(F.data == "a:g:wd", RoleFilter("owner"))
+async def on_withdraw_home(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any
+) -> None:
+    await state.clear()
+    if data["ctx"].get("escrow_pay") is None:
+        await call.answer(NO_ACCOUNT[:200], show_alert=True)
+        return
+    await call.answer()
+    text, markup = await _withdraw_screen(data["ctx"], session)
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "a:g:wd:addr", RoleFilter("owner"))
+async def on_withdraw_address(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    await ask(
+        call,
+        state,
+        "g_withdraw_addr",
+        "Пришлите адрес кошелька для USDT в сети BNB Smart Chain (BEP20), начинается с 0x. "
+        "Проверьте, что кошелёк принимает USDT именно в BEP20.",
+        "a:g:wd",
+    )
+
+
+@input_handler("g_withdraw_addr", role="owner")
+async def input_withdraw_address(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
+    session: AsyncSession = data["session"]
+    try:
+        address = await wallets.check(session, message.text or "")
+    except evm.AddressError as exc:
+        texts = {
+            "format": "Это не адрес BEP20: нужен 0x и ещё 40 символов 0–9, a–f.",
+            "checksum": "В адресе опечатка: не сходится контрольная сумма. Скопируйте его ещё раз.",
+            "forbidden": "На этот адрес выводить нельзя.",
+        }
+        await message.answer(texts.get(exc.code, "Не подходит."))
+        return False
+    await update_settings(session, EscrowRuntime, withdraw_address=address)
+    await audit(session, data["user"].id, "escrow.withdraw_address", data={"address": address})
+    await session.commit()
+    text, markup = await _withdraw_screen(data["ctx"], session)
+    await message.answer(text, reply_markup=markup)
+    return True
+
+
+@router.callback_query(F.data == "a:g:wd:sum", RoleFilter("owner"))
+async def on_withdraw_sum(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    await ask(call, state, "g_withdraw_sum", "Сколько вывести, USDT? Например: 50 или 12.5", "a:g:wd")
+
+
+def _confirm_withdraw(cents: int, address: str) -> tuple[str, Any]:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"💵 Да, вывести {money.show(cents)}", callback_data=f"a:g:wd!:{cents}", style="success"
+    )
+    builder.button(text="⬅️ Нет", callback_data="a:g:wd")
+    builder.adjust(1)
+    text = (
+        f"Вывести <b>{money.show(cents)}</b> на <code>{h(address)}</code>?\n\n"
+        "Комиссии сети и Apirone вычитаются из этой суммы. Перевод в блокчейне не отменить."
+    )
+    return text, builder.as_markup()
+
+
+@input_handler("g_withdraw_sum", role="owner")
+async def input_withdraw_sum(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
+    session: AsyncSession = data["session"]
+    runtime = await get_settings(session, EscrowRuntime)
+    try:
+        cents = money.parse_amount(message.text or "")
+    except money.AmountError:
+        await message.answer("Не похоже на сумму. Например: 50 или 12.5")
+        return False
+    if not runtime.withdraw_address:
+        await message.answer("Сначала задайте адрес.")
+        return True
+    text, markup = _confirm_withdraw(cents, runtime.withdraw_address)
+    await message.answer(text, reply_markup=markup)
+    return True
+
+
+@router.callback_query(F.data == "a:g:wd:all", RoleFilter("owner"))
+async def on_withdraw_all(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    runtime = await get_settings(session, EscrowRuntime)
+    free = await ledger.withdrawable(data["ctx"])
+    if not free or not runtime.withdraw_address:
+        await call.answer("Сейчас выводить нечего", show_alert=True)
+        return
+    await call.answer()
+    text, markup = _confirm_withdraw(free, runtime.withdraw_address)
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup)
+
+
+@router.callback_query(F.data.regexp(r"^a:g:wd!:\d+$"), RoleFilter("owner"))
+async def on_withdraw(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    from app.services.escrow import withdrawals
+
+    ctx: AppContext = data["ctx"]
+    runtime = await get_settings(session, EscrowRuntime)
+    if not runtime.withdraw_address:
+        await call.answer("Сначала задайте адрес", show_alert=True)
+        return
+    try:
+        row = await withdrawals.withdraw(ctx, data["user"].id, runtime.withdraw_address, int(_parts(call)[3]))
+    except DealError as exc:
+        texts = {
+            "provider": "Apirone не сообщил баланс — попробуйте позже.",
+            "paused": "Выплаты на паузе после восстановления или из-за нехватки — "
+            "сначала разберитесь с этим.",
+            "busy": "Прошлый вывод или выплата на этот адрес ещё не завершены.",
+            "too_much": f"Столько вывести нельзя: доступно {money.show(int(exc.params.get('free') or 0))}.",
+        }
+        await call.answer(texts.get(exc.key, "Этот адрес не подходит."), show_alert=True)
+        return
+    notes = {
+        "done": "✅ Вывод отправлен",
+        "unknown": "⏳ Apirone не ответил — бот найдёт перевод в истории, повторно он не уйдёт",
+        "failed": f"✖️ Apirone отказал: {row.last_error or ''}",
+    }
+    await call.answer(notes.get(row.status, row.status)[:200], show_alert=True)
+    text, markup = await _withdraw_screen(ctx, session)
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup)
 
 
 # ------------------------------------------------------------------------------------------ owner's settings
@@ -989,7 +1390,7 @@ async def on_setting(call: CallbackQuery, state: FSMContext, **data: Any) -> Non
     await ask(call, state, "g_setting", f"{title}: пришлите {hint}.", "a:g:set", key=key)
 
 
-MIN_DEAL_CENTS = 200  # with any fee (≤ 20%) the payout of a deal stays at or above Crypto Pay's 1 USDT
+MIN_DEAL_CENTS = 200  # with any fee (≤ 20%) a payout stays at 1 USDT or more: the network fee comes out of it
 MAX_DEAL_CENTS = 100_000_000  # 1 000 000 USDT; amounts are stored as 32-bit cents
 
 
@@ -1001,7 +1402,7 @@ def _parse_setting(key: str, raw: str, settings: Escrow) -> dict[str, Any] | Non
             return {"fee_bps": bps} if 100 <= bps <= 2000 else None
         if key in ("min", "max", "admin_only"):
             cents = 0 if raw == "0" else money.parse_amount(raw)
-            if key == "min":  # 2 USDT at least: after the fee a payout must still reach Crypto Pay's minimum
+            if key == "min":  # 2 USDT at least: after the fee a payout must still carry the network fee
                 return {"min_cents": cents} if MIN_DEAL_CENTS <= cents <= settings.max_cents else None
             if key == "max":
                 return {"max_cents": cents} if settings.min_cents <= cents <= MAX_DEAL_CENTS else None

@@ -2,7 +2,8 @@
 
 Everything anybody writes or edits is logged for the moderator. The bot removes what could trick a side:
 forwarded copies of its own messages (a fake "the money is held"), messages of other bots or on behalf of
-channels, and links to @CryptoBot checks and invoices (the only way to pay is the bot's own button)."""
+channels, and links to payment pages (Apirone's invoices, @CryptoBot checks): the only way to pay is the
+bot's own button. A bare wallet address stays (deals in crypto need them) with a reminder under it."""
 
 from __future__ import annotations
 
@@ -28,8 +29,9 @@ router = Router(name="escrow_chat")
 
 PAYMENT_LINK = re.compile(
     r"(?i)(t\.me/(cryptobot|cryptotestnetbot|send|wallet)\b|telegram\.me/(cryptobot|send|wallet)\b|"
-    r"crypt\.bot|app\.send\.tg|\?start=(cq|iv)\w+)"
+    r"crypt\.bot|app\.send\.tg|\?start=(cq|iv)\w+|apirone\.com/(invoice|pay|checkout)|pay\.apirone\.)"
 )
+WALLET_ADDRESS = re.compile(r"(?i)\b0x[0-9a-f]{40}\b")
 SERVICE_KEYS = (
     "new_chat_members",
     "left_chat_member",
@@ -199,6 +201,10 @@ async def on_message(message: Message, pool: DealChat, session: AsyncSession, **
             data=_media(message),
             tg_date=message.date,
         )
+        if WALLET_ADDRESS.search(message.text or message.caption or "") and role in ("buyer", "seller"):
+            t = await translator_for(ctx, deal.creator_id)
+            with contextlib.suppress(TelegramAPIError):
+                await message.reply(t("g.chat.address_warning"))
         return
     with contextlib.suppress(TelegramAPIError):
         await message.delete()
