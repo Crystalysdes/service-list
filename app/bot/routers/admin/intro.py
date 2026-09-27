@@ -27,6 +27,7 @@ from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.channels import main_channel
 from app.services.media import send_stored
+from app.services.sync import own_links
 from app.services.sync.engine import buttons_markup
 
 router = Router(name="admin_intro")
@@ -185,6 +186,8 @@ async def on_own(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
 async def input_intro(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
     fragment = Fragment.from_message(message).without_auto()
     fragment = Fragment(fragment.text, tuple(e for e in fragment.entities if e.type != "url"))
+    # a link to a post of the channel (e.g. «#навигация») follows that post when it moves
+    fragment = await own_links.symbolize_draft(data["session"], fragment)
     await _offer(message, data["state"], data["session"], data["ctx"], fragment)
     return False  # keep listening: another text replaces the draft until "✅ Опубликовать" or "Отмена"
 

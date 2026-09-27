@@ -30,13 +30,15 @@ from app.bot.i18n import h
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Channel, ChannelPost, MediaFile
-from app.domain.render import measure
+from app.domain.render import SPARE_TEXT, measure
 from app.domain.richtext import Fragment
+from app.domain.symbols import channel_post_base
 from app.services import render_db
 from app.services.media import send_stored
 from app.services.notify import claim_notification, notify_staff
 from app.services.settings import Chats, Runtime, get_settings, update_settings
 from app.services.sync import manual as kept_edits
+from app.services.sync import own_links
 
 log = logging.getLogger(__name__)
 
@@ -226,6 +228,15 @@ class SyncEngine:
         self, channel_id: int, limiter: RateLimiter, result: PassResult
     ) -> None:
         async with self.ctx.db.session() as session:
+            channel = await session.get(Channel, channel_id)
+            # plain links to our posts in texts the admins wrote follow the posts from now on (the old
+            # navigation included), before any post of the channel changes its place
+            if (
+                channel is not None
+                and channel.role == "main"
+                and await own_links.symbolize_stored(session, channel)
+            ):
+                await session.commit()
             desired = await render_db.desired_blocks(session)
             rows = list(
                 (
@@ -301,21 +312,16 @@ class SyncEngine:
             highest = max(((r.message_id or 0) for r in rows if r.kind in ("static", "category")), default=0)
             if highest < nav.message_id:
                 return
-            # a block was sent below the navigation (media post): the old nav message becomes a spare
-            session.add(
-                ChannelPost(
-                    channel_id=channel_id,
-                    kind="spare",
-                    block_id=nav.message_id,
-                    message_id=nav.message_id,
-                    pinned=nav.pinned,
-                    state="ok",
-                )
-            )
-            nav.message_id = None
-            nav.pinned = False
-            nav.sent_hash = None
+            # a block was sent below the navigation (media post): a new navigation goes to the bottom and
+            # the old one is deleted (or, when Telegram does not allow it, becomes a spare)
+            channel = await session.get(Channel, channel_id)
+            if channel is not None and channel.role == "main":
+                await own_links.symbolize_stored(session, channel)
+            old = retire_nav(session, nav)
+            await session.flush()
+            old_id = old.id
             await session.commit()
+        await self._remove_row(old_id, limiter)
         await self._send_new(channel_id, "nav", 0, limiter, result)
 
     async def _remove_row(self, row_id: int, limiter: RateLimiter) -> None:
@@ -330,6 +336,8 @@ class SyncEngine:
             channel = await session.get(Channel, row.channel_id)
             assert channel is not None
             chat_id, message_id = channel.chat_id, row.message_id
+            post_url = channel_post_base(channel.chat_id, channel.username) + str(message_id)
+            old_nav = row.kind == "old_nav"
         await limiter.acquire()
         deleted = False
         try:
@@ -342,19 +350,27 @@ class SyncEngine:
                 return
             if deleted:
                 await session.delete(row)
-            else:
+            else:  # shows a dot from now on and takes the next new category
                 row.kind = "spare"
                 row.block_id = message_id
                 row.sent_hash = None
                 row.state = "ok"
             await session.commit()
-        if not deleted:
-            await self._alert_once(
-                f"spare:{chat_id}:{message_id}",
-                f"🧹 Пост {message_id} в канале больше не нужен, "
-                "но Telegram не даёт боту удалить старые посты. "
-                "Удалите его вручную — до этого бот переиспользует его под новую категорию.",
+        if deleted:
+            return
+        if old_nav:
+            text = (
+                f"🧹 Навигация перенесена вниз, а старую (пост {message_id}) Telegram не даёт боту удалить: "
+                "боты не могут удалять посты старше 48 часов. Бот оставил в ней только ссылку на новую "
+                f"навигацию, все «#навигация» уже ведут туда же. Удалите старую вручную: {post_url}"
             )
+        else:
+            text = (
+                f"🧹 Пост {message_id} в канале больше не нужен, но Telegram не даёт боту удалить его: боты "
+                "не могут удалять посты старше 48 часов. Пока в нём ссылка на навигацию, потом бот займёт "
+                f"это место новой категорией. Можно удалить его вручную: {post_url}"
+            )
+        await self._alert_once(f"spare:{chat_id}:{message_id}", text)
 
     async def _recover_orphans(self, channel_id: int, limiter: RateLimiter) -> None:
         """Adopt posts sent right before a crash.
@@ -456,7 +472,7 @@ class SyncEngine:
                     message = await self._call(
                         bot.send_message(
                             chat_id,
-                            fragment.text or render_db.SPARE_TEXT,
+                            fragment.text or SPARE_TEXT,
                             entities=fragment.to_entities(),
                             parse_mode=None,
                             link_preview_options=WITH_PREVIEW if block.link_preview else NO_PREVIEW,
@@ -579,7 +595,7 @@ class SyncEngine:
                 else:
                     edited = await self._call(
                         bot.edit_message_text(
-                            text=fragment.text or render_db.SPARE_TEXT,
+                            text=fragment.text or SPARE_TEXT,
                             chat_id=chat_id,
                             message_id=message_id,
                             entities=fragment.to_entities(),
@@ -792,6 +808,24 @@ class SyncEngine:
             await session.commit()
         if first:
             await notify_staff(self.ctx, text)
+
+
+def retire_nav(session: AsyncSession, nav: ChannelPost) -> ChannelPost:
+    """The navigation is to be published anew at the bottom: its old message becomes an ``old_nav`` row,
+    which a pass deletes (or turns into a spare when Telegram does not allow deleting an old post)."""
+    old = ChannelPost(
+        channel_id=nav.channel_id,
+        kind="old_nav",
+        block_id=nav.message_id or 0,
+        message_id=nav.message_id,
+        pinned=nav.pinned,
+        state="ok",
+    )
+    session.add(old)
+    nav.message_id = None
+    nav.pinned = False
+    nav.sent_hash = None
+    return old
 
 
 async def mark_all_dirty(session: AsyncSession) -> None:

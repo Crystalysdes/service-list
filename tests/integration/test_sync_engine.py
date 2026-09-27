@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.db.base import utcnow
 from app.db.models import Category, ChannelPost, Service
 from app.domain.richtext import Fragment
-from app.services import catalog, render_db
+from app.services import catalog
 from app.services.selftest import diagnostics, selftest
 from app.services.settings import Runtime, Templates, get_settings, update_settings
 from tests.helpers import MAIN, engine_for, imported_channel
@@ -136,7 +136,11 @@ async def test_retry_after_and_removed_category_becomes_spare(tg, db, ctx):
         vpn.is_visible = False
         await s.commit()
     await engine.run_once(ids["channel_id"])
-    assert _posts(tg)[ids["vpn"]]["text"] == render_db.SPARE_TEXT  # Telegram refuses an invisible "⠀"
+    spare_post = _posts(tg)[ids["vpn"]]  # could not be deleted: until a new category takes it, it leads to
+    assert spare_post["text"] == "#навигация"  # the navigation, like the footer of every category
+    assert [e["url"] for e in spare_post["entities"]] == [f"https://t.me/servicelist/{ids['nav']}"]
+    note = next(m["text"] for m in reversed(tg.bot_messages(1001)) if "🧹" in (m.get("text") or ""))
+    assert f"Можно удалить его вручную: https://t.me/servicelist/{ids['vpn']}" in note
     async with db.session() as s:
         spare = (await s.execute(select(ChannelPost).where(ChannelPost.kind == "spare"))).scalar_one()
         assert spare.message_id == ids["vpn"]

@@ -183,6 +183,16 @@ def test_nav_footer_always_links_to_the_navigation():
     assert links(nav_footer(emoji_only)) == []  # premium emoji cannot sit inside a link
 
 
+def test_a_spare_post_leads_to_the_navigation():
+    from app.domain.render import SPARE_TEXT, render_spare
+
+    ctx = LinkContext(post_base="https://t.me/servicelist/", posts={"nav": 42})
+    spare = render_spare(RenderTemplates(footer=Fragment.plain("⬆️ #навигация")), ctx)
+    assert spare.text == "⬆️ #навигация"
+    assert [(e.offset, e.url) for e in spare.entities] == [(3, "https://t.me/servicelist/42")]
+    assert render_spare(RenderTemplates(), ctx).text == SPARE_TEXT  # no footer template: a dot
+
+
 def test_updated_intro_keeps_the_owner_text_and_formatting():
     from app.domain.intro import updated_intro
     from app.domain.richtext import RichText

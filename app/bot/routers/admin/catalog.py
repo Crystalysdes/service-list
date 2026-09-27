@@ -23,6 +23,7 @@ from app.domain.richtext import Fragment
 from app.services import catalog
 from app.services.audit import audit
 from app.services.render_db import category_services
+from app.services.sync import own_links
 from app.services.timefmt import fmt_dt
 
 router = Router(name="admin_catalog")
@@ -145,6 +146,7 @@ async def input_cat_header(message: Message, data: dict[str, Any], fsm: dict[str
     if not fragment.text or "\n" in fragment.text:
         await message.answer("Нужна одна строка текста.")
         return False
+    fragment = await own_links.symbolize_draft(data["session"], fragment)
     state: FSMContext = data["state"]
     await state.update_data(purpose="cat_new_label", header=fragment.to_json())
     await message.answer("Метка для навигации, например <code>#design</code>:")
@@ -246,7 +248,7 @@ async def input_header(message: Message, data: dict[str, Any], fsm: dict[str, An
     category = await session.get(Category, fsm["category_id"])
     if category is None:
         return True
-    await catalog.set_header(session, category, fragment)
+    await catalog.set_header(session, category, await own_links.symbolize_draft(session, fragment))
     catalog.request_sync(data["ctx"])
     await message.answer("✅ Заголовок обновлён.", reply_markup=back_home(target=f"a:cat:{category.id}"))
     return True

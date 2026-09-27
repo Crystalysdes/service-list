@@ -8,6 +8,7 @@ from sqlalchemy import select
 from app.bot.routers.admin import diagnostics as diagnostics_screen
 from app.db.base import utcnow
 from app.db.models import Category, ChannelPost, Service
+from app.domain.richtext import RichText
 from app.services import catalog, render_db
 from app.services.settings import Runtime, get_settings, update_settings
 from tests.conftest import OWNER_ID
@@ -102,7 +103,9 @@ async def test_manual_post_after_nav_and_manual_edit(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     last = max(tg.messages[MAIN])
     assert tg.messages[MAIN][last]["text"].startswith("Навигационная панель")
-    assert tg.messages[MAIN][ids["nav"]]["text"] == render_db.SPARE_TEXT  # old nav became a spare
+    assert ids["nav"] not in tg.messages[MAIN]  # the old one is deleted: Telegram allows it for 48 hours
+    assert tg.pins[MAIN] == [last]
+    assert not [m for m in tg.bot_messages(OWNER_ID) if "🧹" in (m.get("text") or "")]
 
     edited = dict(tg.messages[MAIN][ids["travel"]])
     edited["text"] = edited["text"].replace("Tripmafia", "Trip mafia")
@@ -121,6 +124,42 @@ async def test_manual_post_after_nav_and_manual_edit(h, tg, db, ctx):
         assert row.sent_hash is None
     await engine.run_once(ids["channel_id"])
     assert "Tripmafia" in tg.messages[MAIN][ids["travel"]]["text"]
+
+
+def _links(message: dict) -> list[str]:
+    entities = message.get("entities") or message.get("caption_entities") or []
+    return [e["url"] for e in entities if e["type"] == "text_link"]
+
+
+async def test_an_old_navigation_becomes_a_dot_and_every_link_follows_the_new_one(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    old_link = f"https://t.me/servicelist/{ids['nav']}"
+    main_post = RichText().text("Service List — все сервисы. ").link("#навигация", old_link).build()
+    async with db.session() as s:  # the owner's own text of the main post links to the navigation plainly
+        (await render_db.intro_post(s)).content = main_post.to_json()
+        await s.commit()
+    tg.tick(49 * 3600)  # the navigation is older than 48 hours: Telegram does not let bots delete it
+    await h.feed({"channel_post": tg._export(tg.post(MAIN, "реклама"))})
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Перенести навигацию вниз")
+    await engine.run_once(ids["channel_id"])
+
+    new_link = f"https://t.me/servicelist/{max(tg.messages[MAIN])}"
+    old_nav = tg.messages[MAIN][ids["nav"]]  # kept by Telegram: only a link to the new navigation is left
+    assert old_nav["text"] == "#навигация" and _links(old_nav) == [new_link]
+    assert tg.pins[MAIN] == [max(tg.messages[MAIN])]
+    note = next(m["text"] for m in reversed(tg.bot_messages(OWNER_ID)) if "🧹" in (m.get("text") or ""))
+    assert "старше 48 часов" in note and f"Удалите старую вручную: {old_link}" in note
+    for key in ("intro", "travel", "vpn", "design"):  # the main post as well as every category
+        assert new_link in _links(tg.messages[MAIN][ids[key]]), key
+    assert old_link not in str(tg.messages[MAIN][ids["intro"]])
+
+    async with db.session() as s:  # a link left from before the update to a post the bot no longer uses
+        (await render_db.intro_post(s)).content = main_post.to_json()
+        await s.commit()
+    await engine.run_once(ids["channel_id"])
+    assert _links(tg.messages[MAIN][ids["intro"]]) == [new_link]
 
 
 async def test_kept_manual_edit_survives_until_the_data_changes(h, tg, db, ctx):

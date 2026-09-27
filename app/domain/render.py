@@ -12,6 +12,9 @@ from app.domain.symbols import LinkContext
 
 MAX_TEXT = 4096
 MAX_CAPTION = 1024
+# the text of a post the channel no longer needs when there is nothing better: Telegram counts invisible
+# fillers like "⠀" or "ㅤ" as an empty text and refuses them
+SPARE_TEXT = "·"
 # a link to a message of a channel: t.me/<username>/<id> or t.me/c/<internal id>/<id>
 POST_URL_RE = re.compile(
     r"^(?:https?://)?(?:t\.me|telegram\.me)/(?:c/\d+|[A-Za-z][A-Za-z0-9_]{3,31})/\d+/?(?:\?.*)?$"
@@ -211,6 +214,15 @@ def render_category(view: CategoryView, tpl: RenderTemplates, ctx: LinkContext) 
         rt.text(tpl.garant_gap if tpl.footer.text else tpl.footer_sep)
         rt.fragment(tpl.garant)
     return rt.build().map_links(lambda url: ctx.resolve(url, slug=view.slug))
+
+
+def render_spare(tpl: RenderTemplates, ctx: LinkContext) -> Fragment:
+    """A post the channel no longer needs (an old navigation, a removed category) until a new category takes
+    its place: the categories' «#навигация», leading to the navigation. Without that template, a dot."""
+    footer = nav_footer(tpl.footer)
+    if not footer.text.strip():
+        return Fragment.plain(SPARE_TEXT)
+    return footer.map_links(ctx.resolve)
 
 
 def render_nav(items: list[NavItem], tpl: RenderTemplates, ctx: LinkContext) -> Fragment:

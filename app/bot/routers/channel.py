@@ -23,6 +23,8 @@ from app.services.channels import remember_chat
 from app.services.notify import claim_notification, close_alert, notify_staff, remember_alert
 from app.services.settings import Runtime, get_settings
 from app.services.sync import manual as kept_edits
+from app.services.sync import own_links
+from app.services.sync.engine import retire_nav
 
 router = Router(name="channel_events")
 
@@ -271,19 +273,9 @@ async def on_nav_down(call: CallbackQuery, session: AsyncSession, **data: Any) -
             await call.message.edit_reply_markup(reply_markup=None)
         return
     nav_row_id = nav.id
-    session.add(
-        ChannelPost(
-            channel_id=channel_id,
-            kind="spare",
-            block_id=nav.message_id,
-            message_id=nav.message_id,
-            pinned=nav.pinned,
-            state="ok",
-        )
-    )
-    nav.message_id = None
-    nav.pinned = False
-    nav.sent_hash = None
+    if channel.role == "main":  # plain links to the old navigation (in the main post too) follow the new one
+        await own_links.symbolize_stored(session, channel)
+    retire_nav(session, nav)  # the next pass deletes the old message, or turns it into a dot if it may not
     await session.flush()
     await audit(session, data["user"].id, "nav.down", "channel", channel_id)
     await session.commit()

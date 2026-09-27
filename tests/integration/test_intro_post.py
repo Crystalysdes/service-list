@@ -81,8 +81,13 @@ async def test_own_text_and_button_toggles(h, tg, db, ctx):
     await h.press(OWNER_ID, h.last(OWNER_ID), "Свой текст")
     await h.say(OWNER_ID, "x" * 1100)
     assert "Не подходит" in h.last(OWNER_ID)["text"]  # a caption holds 1024 characters
-    await h.say(OWNER_ID, "Новый главный пост\n\nChat: t.me/+Nh-HD70XwLRjYjFi")
+    own = RichText().text("Новый главный пост ").link("#навигация", f"https://t.me/servicelist/{ids['nav']}")
+    own = own.text("\n\nChat: t.me/+Nh-HD70XwLRjYjFi").build()
+    await h.send(OWNER_ID, text=own.text, entities=own.to_json()["entities"])
     await h.press(OWNER_ID, h.last(OWNER_ID), "Опубликовать")
+    async with db.session() as s:  # kept as a symbol: it follows the navigation when that moves down
+        intro = (await s.execute(select(StaticPost).where(StaticPost.kind == "intro"))).scalar_one()
+        assert [e["url"] for e in intro.content["entities"] if e["type"] == "text_link"] == ["post:nav"]
     await h.press(OWNER_ID, h.last(OWNER_ID), "Кнопки под постом")
     buttons = h.last(OWNER_ID)
     await h.press(OWNER_ID, buttons, "Добавить свой сервис")  # published with it: now off
