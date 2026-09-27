@@ -396,6 +396,40 @@ async def mark_manual(
 
 
 # ------------------------------------------------------------------------------------------ reconciliation
+TRANSFERS_HINT = (
+    "в приложении гаранта не включены переводы: @CryptoBot → Crypto Pay → My Apps → приложение гаранта → "
+    "Security → Transfers → Enable"
+)
+
+
+def why(exc: BaseException) -> str:
+    """What Crypto Pay said, with the fix when it is a known one."""
+    if not isinstance(exc, CryptoPayError) or outcome_unknown(exc):
+        return "нет ответа (сеть или Crypto Pay недоступен)"
+    kind = _kind(exc.name)
+    if kind == "config" and "UNAUTHORIZED" not in exc.name.upper() and "TOKEN" not in exc.name.upper():
+        return f"{exc.name} — {TRANSFERS_HINT}"
+    if kind == "config":
+        return (
+            f"{exc.name} — проверьте ESCROW_CRYPTOPAY_TOKEN и сеть (основная или тестовая) "
+            "в servicelist config"
+        )
+    return exc.name
+
+
+async def transfers_problem(ctx: AppContext) -> str | None:
+    """Before deals are switched on: can the garant's app read its balance and its transfers?"""
+    pay = provider(ctx)
+    if pay is None:
+        return "не задан ESCROW_CRYPTOPAY_TOKEN (servicelist config)"
+    try:
+        await pay.get_balance()
+        await pay.get_transfers(spend_id="esc-check")
+    except PROVIDER_ERRORS as exc:
+        return why(exc)
+    return None
+
+
 async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str]:
     """Every few minutes: anything Crypto Pay knows that the bot does not (a paid invoice without a row, a
     transfer with a garant spend_id the bot never made), then the balance against what is owed."""
@@ -406,9 +440,9 @@ async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str
     problems: list[str] = []
     try:
         paid = await pay.paid_invoices()
-    except PROVIDER_ERRORS:
+    except PROVIDER_ERRORS as exc:
         paid = None
-        problems.append("Crypto Pay не отдаёт список оплаченных счетов")
+        problems.append(f"Crypto Pay не отдаёт список оплаченных счетов: {why(exc)}")
     if paid:
         async with ctx.db.session() as session:
             rows = {
@@ -433,9 +467,9 @@ async def reconcile(ctx: AppContext, *, now: datetime | None = None) -> list[str
                 await on_funding(ctx, await take_payment(ctx, row.id, invoice))
     try:
         transfers = await pay.get_transfers()
-    except PROVIDER_ERRORS:
+    except PROVIDER_ERRORS as exc:
         transfers = None
-        problems.append("Crypto Pay не отдаёт список переводов")
+        problems.append(f"Crypto Pay не отдаёт список переводов: {why(exc)}")
     if transfers:
         ours = [t for t in transfers if t.spend_id.startswith("esc-")]
         async with ctx.db.session() as session:

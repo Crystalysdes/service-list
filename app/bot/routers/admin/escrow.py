@@ -204,6 +204,11 @@ async def on_toggle(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
             show_alert=True,
         )
         return
+    if not settings.enabled:  # deals that could not be paid out must not start
+        problem = await payouts.transfers_problem(ctx)
+        if problem is not None:
+            await call.answer(f"Пока нельзя: {problem}"[:200], show_alert=True)
+            return
     await update_settings(session, Escrow, enabled=not settings.enabled)
     await audit(session, data["user"].id, "escrow.enabled", data={"enabled": not settings.enabled})
     await session.commit()

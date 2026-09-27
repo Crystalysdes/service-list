@@ -245,6 +245,18 @@ async def test_reconcile_reports_what_the_bot_does_not_know(ctx, pay, tg):
     assert (await _fresh(ctx, deal.id)).status == "funded"
 
 
+async def test_reconcile_names_what_crypto_pay_said_and_how_to_fix_it(ctx, pay):
+    pay.transfers_refused = "METHOD_DISABLED"
+    [problem] = await payouts.reconcile(ctx)
+    assert problem.startswith("Crypto Pay не отдаёт список переводов: METHOD_DISABLED")
+    assert "Security → Transfers" in problem
+    pay.transfers_refused = "UNAUTHORIZED"
+    assert "проверьте ESCROW_CRYPTOPAY_TOKEN" in (await payouts.reconcile(ctx))[0]
+    pay.transfers_refused, pay.fail = None, True
+    lists = [p for p in await payouts.reconcile(ctx) if "список" in p]
+    assert len(lists) == 2 and all(p.endswith("нет ответа (сеть или Crypto Pay недоступен)") for p in lists)
+
+
 async def test_a_paid_dropped_invoice_is_taken_in_by_the_reconciliation(ctx, pay):
     deal = await _accepted(ctx)
     row = await invoices.invoice_for(ctx, deal.id, BUYER)

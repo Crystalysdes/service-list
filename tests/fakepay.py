@@ -25,6 +25,7 @@ class FakeCryptoPay:
         self.transfer_timeouts = 0
         self.transfer_lost_replies = 0
         self.known_users: set[int] | None = None  # None: everyone has used @CryptoBot
+        self.transfers_refused: str | None = None  # the transfers list refused with this error name
 
     async def create_invoice(
         self, *, amount_cents, description, payload, expires_in, accepted_assets, paid_btn_url
@@ -128,6 +129,8 @@ class FakeCryptoPay:
     async def get_transfers(self, *, spend_id=None):
         if self.fail:
             raise OSError("network down")
+        if self.transfers_refused:
+            raise CryptoPayError(self.transfers_refused, 403)
         found = [t for t in self.transfers if spend_id is None or t["spend_id"] == spend_id]
         return [CryptoTransfer.from_api(dict(t)) for t in found]
 

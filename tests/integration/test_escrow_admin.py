@@ -208,6 +208,12 @@ async def test_owner_settings_and_switches(h, tg, db, ctx, pay):
     await h.press(OWNER_ID, h.last(OWNER_ID), "Включить приём сделок")
     assert "ESCROW_CRYPTOPAY_TOKEN" in _alert(tg)
     ctx.services["escrow_pay"] = pay
+    pay.transfers_refused = "METHOD_DISABLED"  # deals that could not be paid out must not start
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Включить приём сделок")
+    assert _alert(tg).startswith("Пока нельзя: METHOD_DISABLED") and "Transfers" in _alert(tg)
+    async with db.session() as s:
+        assert not (await get_settings(s, Escrow)).enabled
+    pay.transfers_refused = None
     await h.press(OWNER_ID, h.last(OWNER_ID), "Включить приём сделок")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Возобновить выплаты")
     async with db.session() as s:
