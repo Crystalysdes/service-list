@@ -586,7 +586,8 @@ class FakeTelegram:
         if chat.get("_description"):
             info["description"] = chat["_description"]
         if chat["type"] in ("group", "supergroup"):
-            info["has_visible_history"] = chat.get("_visible_history", False)
+            if chat.get("_visible_history"):  # like the real Bot API: the flag is only sent when true
+                info["has_visible_history"] = True
             if chat.get("_permissions"):
                 info["permissions"] = chat["_permissions"]
             for key in ("linked_chat_id", "message_auto_delete_time"):

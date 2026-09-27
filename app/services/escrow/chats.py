@@ -120,7 +120,7 @@ async def check_group(ctx: AppContext, chat_id: int) -> GroupCheck:
         result.problems.append("у группы есть @username — сделайте её частной")
     if chat.is_forum:
         result.problems.append("в группе включены темы — выключите их")
-    if chat.has_visible_history is not False:
+    if chat.has_visible_history:  # the Bot API sends the flag only when it is true
         result.problems.append(
             "новым участникам видна история — в настройках группы: "
             "«История чата для новых участников: скрыта»"
