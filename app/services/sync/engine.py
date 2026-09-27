@@ -23,13 +23,13 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
 )
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.i18n import h
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Channel, ChannelPost, MediaFile
+from app.db.models import Channel, ChannelPost, MediaFile, Notification
 from app.domain.render import SPARE_TEXT, measure
 from app.domain.richtext import Fragment
 from app.domain.symbols import channel_post_base
@@ -45,6 +45,14 @@ log = logging.getLogger(__name__)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 WITH_PREVIEW = LinkPreviewOptions(is_disabled=False)
 SELFTEST_MAX_AGE = timedelta(hours=7)
+LEFTOVERS = own_links.LEFTOVERS  # posts of the channel the bot no longer shows anything in
+KEPT = "kept"  # a leftover Telegram refused to delete (older than 48 hours): a pointer, not tried again
+MOVING = "moving"  # the navigation is being published anew at the bottom (its old message still shown)
+STICKY = (KEPT, MOVING)  # an edit of the post does not reset these
+SETTLED = ("ok", KEPT)  # a post in one of these states showing its data is left alone
+OWNER_RANK = {"category": 0, "static": 0, "nav": 1}  # who keeps a message two rows claim; leftovers last
+ORPHAN_WINDOW = 10  # newest messages looked at for a post sent right before a crash
+ALWAYS_SHOWN = ("nav", "spare")  # published without premium emoji rather than held back by the emoji gate
 
 
 class ChannelBroken(Exception):
@@ -87,6 +95,25 @@ class PassResult:
     unchanged: int = 0
     skipped: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Outgoing:
+    """A block rendered and cleared for sending."""
+
+    chat_id: int
+    block: render_db.RenderedBlock
+    fragment: Fragment
+
+    def saved(self, row: ChannelPost, message: Message) -> None:
+        """The row now shows this block in ``message``."""
+        row.message_id = message.message_id
+        row.state = "ok"
+        content_hash = self.block.content_hash()
+        plain = self.fragment is not self.block.fragment
+        row.sent_hash = kept_edits.PLAIN + content_hash if plain else content_hash
+        row.snapshot = self.fragment.to_json()
+        row.dirty = False
 
 
 def emoji_allowed(runtime: Runtime) -> bool:
@@ -148,8 +175,11 @@ class SyncEngine:
         max_delay: float = 15.0,
         idle_interval: float = 60.0,
         per_minute: int = 18,
+        nav_check_every: float = 600.0,
     ) -> None:
         self.ctx = ctx
+        self.nav_check_every = nav_check_every  # seconds between checks that the navigation still exists
+        self._nav_checked: dict[int, float] = {}
         self.debounce = debounce
         self.max_delay = max_delay
         self.idle_interval = idle_interval
@@ -251,11 +281,14 @@ class SyncEngine:
             removed = [r.id for r in rows if (r.kind, r.block_id) not in desired_keys and r.kind != "spare"]
             await session.commit()
 
+        await self._one_owner_per_message(channel_id)
         for row_id in removed:
             await self._remove_row(row_id, limiter)
         await self._recover_orphans(channel_id, limiter)
+        await self._check_nav_alive(channel_id, limiter)
         await self._assign_new_blocks(channel_id, desired, limiter, result)
-        await self._keep_nav_last(channel_id, limiter, result)
+        await self._place_nav(channel_id, limiter, result)
+        await self._clear_leftovers(channel_id, limiter)
         await self._edit_all(channel_id, desired, limiter, result)
         await self._sync_pins(channel_id, limiter)
 
@@ -266,6 +299,7 @@ class SyncEngine:
         for kind, block_id in desired:
             if kind == "nav":
                 continue
+            take_nav = False
             async with self.ctx.db.session() as session:
                 row = await self._row(session, channel_id, kind, block_id)
                 if row is None or row.message_id:
@@ -275,23 +309,19 @@ class SyncEngine:
                     continue
                 if block.media is None:
                     donor = await self._first_spare(session, channel_id)
-                    if donor is None:
-                        nav = await self._row(session, channel_id, "nav", 0)
-                        donor = nav if nav is not None and nav.message_id else None
                     if donor is not None:
                         row.message_id = donor.message_id
                         row.pinned = donor.pinned
                         row.sent_hash = None
                         row.state = "ok"
-                        if donor.kind == "spare":
-                            await session.delete(donor)
-                        else:
-                            donor.message_id = None
-                            donor.pinned = False
-                            donor.sent_hash = None
-                            donor.state = "new"
+                        await session.delete(donor)
                         await session.commit()
                         continue
+                    nav = await self._row(session, channel_id, "nav", 0)
+                    take_nav = nav is not None and bool(nav.message_id)
+            # the block takes the navigation's place once a new navigation is at the bottom
+            if take_nav and await self._move_nav_down(channel_id, limiter, result, give_to=(kind, block_id)):
+                continue
             await self._send_new(channel_id, kind, block_id, limiter, result)
         async with self.ctx.db.session() as session:
             nav = await self._row(session, channel_id, "nav", 0)
@@ -299,7 +329,86 @@ class SyncEngine:
         if need_nav:
             await self._send_new(channel_id, "nav", 0, limiter, result)
 
-    async def _keep_nav_last(self, channel_id: int, limiter: RateLimiter, result: PassResult) -> None:
+    async def _one_owner_per_message(self, channel_id: int) -> None:
+        """Every message of the channel belongs to one row, whatever a crash, a race or an older version left.
+
+        A block (category, static post) wins over the navigation, the navigation over a leftover. A leftover
+        that lost is dropped (the message stays); a navigation or block that lost is published anew; the one
+        that keeps the message is redrawn, as it may show another row's text.
+        """
+        async with self.ctx.db.session() as session:
+            rows = list(
+                (
+                    await session.execute(select(ChannelPost).where(ChannelPost.channel_id == channel_id))
+                ).scalars()
+            )
+            owners: dict[int, list[ChannelPost]] = {}
+            for row in rows:
+                if row.message_id:
+                    owners.setdefault(row.message_id, []).append(row)
+            changed = False
+            for shared in owners.values():
+                if len(shared) < 2:
+                    continue
+                shared.sort(key=lambda r: (OWNER_RANK.get(r.kind, len(OWNER_RANK)), r.id))
+                keeper, *rest = shared
+                for row in rest:
+                    if row.kind in LEFTOVERS:
+                        await session.delete(row)
+                    else:
+                        row.message_id = None
+                        row.pinned = False
+                        row.sent_hash = None
+                        row.state = "missing"
+                keeper.sent_hash = None
+                keeper.pinned = keeper.pinned or any(r.pinned for r in rest)
+                changed = True
+            if changed:
+                await session.commit()
+
+    async def _check_nav_alive(self, channel_id: int, limiter: RateLimiter) -> None:
+        """Telegram does not tell a bot that a post was deleted, so now and then the navigation is probed with
+        an edit that changes nothing. A navigation deleted by hand is published anew at the bottom."""
+        now = time.monotonic()
+        checked = self._nav_checked.get(channel_id)
+        if checked is not None and now - checked < self.nav_check_every:
+            return
+        async with self.ctx.db.session() as session:
+            nav = await self._row(session, channel_id, "nav", 0)
+            channel = await session.get(Channel, channel_id)
+            if nav is None or not nav.message_id or channel is None or self.ctx.bot is None:
+                return
+            chat_id, message_id = channel.chat_id, nav.message_id
+        self._nav_checked[channel_id] = now
+        await limiter.acquire()
+        try:  # not through _call: a probe never marks the channel broken
+            await self.ctx.bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=message_id, reply_markup=None
+            )
+            return
+        except TelegramBadRequest as exc:
+            text = exc.message.lower()
+            if "not found" not in text and "message_id_invalid" not in text:
+                return  # "not modified": it is there
+        except TelegramAPIError:
+            return  # no access: the health check reports that
+        async with self.ctx.db.session() as session:
+            nav = await self._row(session, channel_id, "nav", 0)
+            if nav is None or nav.message_id != message_id:
+                return
+            nav.message_id = None
+            nav.pinned = False
+            nav.sent_hash = None
+            nav.state = "missing"
+            await session.commit()
+        await self._alert_once(
+            f"navgone:{channel_id}:{message_id}",
+            f"♻️ Навигация (пост {message_id}) удалена из канала — бот публикует её заново внизу.",
+        )
+
+    async def _place_nav(self, channel_id: int, limiter: RateLimiter, result: PassResult) -> None:
+        """The navigation is the lowest post of the bot: a block or a leftover below it, or an admin's
+        request, publishes it anew at the bottom."""
         async with self.ctx.db.session() as session:
             rows = list(
                 (
@@ -309,27 +418,143 @@ class SyncEngine:
             nav = next((r for r in rows if r.kind == "nav"), None)
             if nav is None or not nav.message_id:
                 return
-            highest = max(((r.message_id or 0) for r in rows if r.kind in ("static", "category")), default=0)
-            if highest < nav.message_id:
+            below = max(
+                ((r.message_id or 0) for r in rows if r.kind in ("static", "category", "spare")), default=0
+            )
+            if below < nav.message_id and not await nav_move_requested(session, channel_id, nav.message_id):
                 return
-            # a block was sent below the navigation (media post): a new navigation goes to the bottom and
-            # the old one is deleted (or, when Telegram does not allow it, becomes a spare)
+        await self._move_nav_down(channel_id, limiter, result)
+
+    async def _move_nav_down(
+        self,
+        channel_id: int,
+        limiter: RateLimiter,
+        result: PassResult,
+        give_to: tuple[str, int] | None = None,
+    ) -> bool:
+        """The navigation is published anew at the bottom. Only once the new post is saved does its old
+        message go: to ``give_to`` (a new block taking its place) or retired (deleted, or a pointer to the new
+        one when Telegram does not allow deleting it). A failed send leaves the navigation where it was."""
+        async with self.ctx.db.session() as session:
+            nav = await self._row(session, channel_id, "nav", 0)
             channel = await session.get(Channel, channel_id)
-            if channel is not None and channel.role == "main":
+            if nav is None or not nav.message_id or channel is None:
+                return False
+            if channel.role == "main":  # plain links to the old message follow the navigation
                 await own_links.symbolize_stored(session, channel)
-            old = retire_nav(session, nav)
-            await session.flush()
-            old_id = old.id
+            out = await self._prepare(session, channel_id, "nav", 0, result)
+            if out is not None:
+                nav.state = MOVING
             await session.commit()
-        await self._remove_row(old_id, limiter)
-        await self._send_new(channel_id, "nav", 0, limiter, result)
+        if out is None:
+            return False
+        try:
+            message = await self._deliver(channel_id, out, limiter)
+        except TelegramAPIError as exc:  # a broken channel (ChannelBroken) stops the whole pass instead
+            async with self.ctx.db.session() as session:
+                nav = await self._row(session, channel_id, "nav", 0)
+                if nav is not None and nav.state == MOVING:
+                    nav.state = "ok"
+                    await session.commit()
+            result.errors.append(f"nav: {exc.message}")
+            await self._alert_once(
+                f"navmove:{channel_id}:{exc.message[:40]}",
+                f"⚠️ Не удалось опубликовать навигацию внизу: {h(exc.message)}. "
+                "Старая навигация на месте, бот попробует ещё раз.",
+            )
+            return False
+        retire: int | None = None
+        async with self.ctx.db.session() as session:
+            nav = await self._row(session, channel_id, "nav", 0)
+            if nav is None:
+                return False
+            old_message, old_pinned = nav.message_id, nav.pinned
+            out.saved(nav, message)
+            nav.pinned = False
+            nav.manual = None
+            heir = await self._row(session, channel_id, *give_to) if give_to else None
+            if old_message and heir is not None and not heir.message_id:
+                heir.message_id = old_message
+                heir.pinned = old_pinned
+                heir.sent_hash = None
+                heir.state = "ok"
+            elif old_message:
+                retire = await self._retire_message(session, channel_id, old_message, old_pinned)
+            await session.commit()
+        result.sent += 1
+        await self._verify(out.fragment, message, "nav:0")
+        if retire is not None:
+            await self._remove_row(retire, limiter)
+        return True
+
+    async def _retire_message(
+        self, session: AsyncSession, channel_id: int, message_id: int, pinned: bool
+    ) -> int:
+        """An "old_nav" row for the navigation's former message (reused if one is already there)."""
+        existing = (
+            (
+                await session.execute(
+                    select(ChannelPost).where(
+                        ChannelPost.channel_id == channel_id,
+                        ChannelPost.message_id == message_id,
+                        ChannelPost.kind.in_(LEFTOVERS),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            return existing.id
+        old = ChannelPost(
+            channel_id=channel_id,
+            kind="old_nav",
+            block_id=message_id,
+            message_id=message_id,
+            pinned=pinned,
+            state="ok",
+        )
+        session.add(old)
+        await session.flush()
+        return old.id
+
+    async def _clear_leftovers(self, channel_id: int, limiter: RateLimiter) -> None:
+        """Leftover posts above the navigation are deleted while Telegram still allows it (48 hours); the
+        others stay pointers to the navigation ("kept") and are not tried again."""
+        async with self.ctx.db.session() as session:
+            nav = await self._row(session, channel_id, "nav", 0)
+            if nav is None or not nav.message_id:
+                return
+            ids = list(
+                (
+                    await session.execute(
+                        select(ChannelPost.id).where(
+                            ChannelPost.channel_id == channel_id,
+                            ChannelPost.kind == "spare",
+                            ChannelPost.state != KEPT,
+                            ChannelPost.message_id < nav.message_id,
+                        )
+                    )
+                ).scalars()
+            )
+        for row_id in ids:
+            await self._remove_row(row_id, limiter)
 
     async def _remove_row(self, row_id: int, limiter: RateLimiter) -> None:
         async with self.ctx.db.session() as session:
             row = await session.get(ChannelPost, row_id)
             if row is None:
                 return
-            if not row.message_id:
+            shared = row.message_id and await session.scalar(
+                select(func.count())
+                .select_from(ChannelPost)
+                .where(
+                    ChannelPost.channel_id == row.channel_id,
+                    ChannelPost.message_id == row.message_id,
+                    ChannelPost.id != row.id,
+                )
+            )
+            if not row.message_id or shared:  # nothing to delete, or the message is another row's
                 await session.delete(row)
                 await session.commit()
                 return
@@ -348,13 +573,23 @@ class SyncEngine:
             row = await session.get(ChannelPost, row_id)
             if row is None:
                 return
-            if deleted:
+            twin = (
+                await session.execute(
+                    select(ChannelPost.id).where(
+                        ChannelPost.channel_id == row.channel_id,
+                        ChannelPost.kind == "spare",
+                        ChannelPost.block_id == message_id,
+                        ChannelPost.id != row.id,
+                    )
+                )
+            ).first()
+            if deleted or twin is not None:
                 await session.delete(row)
-            else:  # shows a dot from now on and takes the next new category
+            else:  # a pointer to the navigation from now on; takes the next new category
                 row.kind = "spare"
                 row.block_id = message_id
                 row.sent_hash = None
-                row.state = "ok"
+                row.state = KEPT
             await session.commit()
         if deleted:
             return
@@ -375,7 +610,8 @@ class SyncEngine:
     async def _recover_orphans(self, channel_id: int, limiter: RateLimiter) -> None:
         """Adopt posts sent right before a crash.
 
-        A crash between sending a post and saving its id leaves a 'sending' row: find that post and adopt it.
+        A crash between sending a post and saving its id leaves a 'sending' row (or a navigation 'moving' to
+        the bottom): find that post among the newest messages of the channel and adopt it.
         """
         async with self.ctx.db.session() as session:
             orphans = list(
@@ -383,8 +619,10 @@ class SyncEngine:
                     await session.execute(
                         select(ChannelPost).where(
                             ChannelPost.channel_id == channel_id,
-                            ChannelPost.state == "sending",
-                            ChannelPost.message_id.is_(None),
+                            or_(
+                                (ChannelPost.state == "sending") & ChannelPost.message_id.is_(None),
+                                ChannelPost.state == MOVING,
+                            ),
                         )
                     )
                 ).scalars()
@@ -401,17 +639,20 @@ class SyncEngine:
                 if r.message_id
             ]
             start = max(known or [0]) + 1
-            expected = {}
-            for orphan in orphans:
+            expected: dict[int, set[str]] = {}
+            for orphan in orphans:  # what was sent (saved before sending), or what would be sent now
+                texts = {Fragment.from_json(orphan.snapshot).text} if orphan.snapshot else set()
                 block = await self._render(session, channel_id, orphan.kind, orphan.block_id)
                 if block is not None:
-                    expected[orphan.id] = block
+                    texts.add(block.fragment.text)
+                if texts:
+                    expected[orphan.id] = texts
             assert channel is not None
             chat_id = channel.chat_id
         storage = chats.storage_chat_id
         found: dict[int, int] = {}
         if storage and self.ctx.bot is not None:
-            for candidate in range(start, start + 6):
+            for candidate in range(start, start + ORPHAN_WINDOW):
                 await limiter.acquire()
                 try:
                     copy = await self.ctx.bot.forward_message(
@@ -422,81 +663,97 @@ class SyncEngine:
                 with contextlib.suppress(TelegramAPIError):
                     await self.ctx.bot.delete_message(storage, copy.message_id)
                 text = Fragment.from_message(copy).text
-                for orphan_id, block in expected.items():
-                    if orphan_id not in found and block.fragment.text == text:
+                for orphan_id, texts in expected.items():
+                    if orphan_id not in found and text in texts:
                         found[orphan_id] = candidate
                         break
+        retire: list[int] = []
         async with self.ctx.db.session() as session:
             for orphan in orphans:
                 row = await session.get(ChannelPost, orphan.id)
                 if row is None:
                     continue
+                moving = row.state == MOVING
                 if orphan.id in found:
+                    if moving and row.message_id:  # the new navigation was sent: the old message goes
+                        retire.append(
+                            await self._retire_message(session, channel_id, row.message_id, row.pinned)
+                        )
+                        row.pinned = False
                     row.message_id = found[orphan.id]
                     row.state = "ok"
                     row.sent_hash = None
                 else:
-                    row.state = "new"
+                    row.state = "ok" if moving else "new"  # a move is tried again if still needed
             await session.commit()
+        for row_id in retire:
+            await self._remove_row(row_id, limiter)
 
     # ------------------------------------------------------------------ sending / editing
+    async def _prepare(
+        self, session: AsyncSession, channel_id: int, kind: str, block_id: int, result: PassResult
+    ) -> Outgoing | None:
+        """The block rendered for sending; None when there is nothing to send or the emoji gate holds it."""
+        channel = await session.get(Channel, channel_id)
+        assert channel is not None
+        block = await self._render(session, channel_id, kind, block_id)
+        if block is None:
+            return None
+        fragment = await self._gate(
+            session, block.fragment, result, f"{kind}:{block_id}", plain_ok=kind in ALWAYS_SHOWN
+        )
+        if fragment is None:
+            return None
+        return Outgoing(channel.chat_id, block, fragment)
+
+    async def _deliver(self, channel_id: int, out: Outgoing, limiter: RateLimiter) -> Message:
+        bot = self.ctx.bot
+        assert bot is not None
+        block, fragment = out.block, out.fragment
+        while True:
+            await limiter.acquire()
+            try:
+                if block.media is not None:
+                    return await self._send_media(
+                        out.chat_id, block.media, block.media_kind, fragment, buttons_markup(block.buttons)
+                    )
+                return await self._call(
+                    bot.send_message(
+                        out.chat_id,
+                        fragment.text or SPARE_TEXT,
+                        entities=fragment.to_entities(),
+                        parse_mode=None,
+                        link_preview_options=WITH_PREVIEW if block.link_preview else NO_PREVIEW,
+                        disable_notification=True,
+                        reply_markup=buttons_markup(block.buttons),
+                    ),
+                    channel_id,
+                )
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 0.5)
+
     async def _send_new(
         self, channel_id: int, kind: str, block_id: int, limiter: RateLimiter, result: PassResult
     ) -> None:
-        bot = self.ctx.bot
-        assert bot is not None
         async with self.ctx.db.session() as session:
             row = await self._row(session, channel_id, kind, block_id)
             if row is None or row.message_id:
                 return
-            channel = await session.get(Channel, channel_id)
-            assert channel is not None
-            block = await self._render(session, channel_id, kind, block_id)
-            if block is None:
-                return
-            fragment = await self._gate(session, block.fragment, result, f"{kind}:{block_id}")
-            if fragment is None:
+            out = await self._prepare(session, channel_id, kind, block_id, result)
+            if out is None:
                 return
             row.state = "sending"
+            row.snapshot = out.fragment.to_json()  # a crash before the id is saved: matched against this
             await session.commit()
-            chat_id = channel.chat_id
-            media = block.media
-        while True:
-            await limiter.acquire()
-            try:
-                if media is not None:
-                    message = await self._send_media(
-                        chat_id, media, block.media_kind, fragment, buttons_markup(block.buttons)
-                    )
-                else:
-                    message = await self._call(
-                        bot.send_message(
-                            chat_id,
-                            fragment.text or SPARE_TEXT,
-                            entities=fragment.to_entities(),
-                            parse_mode=None,
-                            link_preview_options=WITH_PREVIEW if block.link_preview else NO_PREVIEW,
-                            disable_notification=True,
-                            reply_markup=buttons_markup(block.buttons),
-                        ),
-                        channel_id,
-                    )
-                break
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 0.5)
+        message = await self._deliver(channel_id, out, limiter)
         async with self.ctx.db.session() as session:
             row = await self._row(session, channel_id, kind, block_id)
             if row is None:
                 return
-            row.message_id = message.message_id
-            row.state = "ok"
-            content_hash = block.content_hash()
-            row.sent_hash = content_hash if fragment is block.fragment else kept_edits.PLAIN + content_hash
-            row.snapshot = fragment.to_json()
-            row.dirty = False
+            out.saved(row, message)
             await session.commit()
         result.sent += 1
-        await self._verify(fragment, message, f"{kind}:{block_id}")
+        await self._verify(out.fragment, message, f"{kind}:{block_id}")
 
     async def _send_media(
         self, chat_id: int, media: MediaFile, kind: str | None, fragment: Fragment, reply_markup: Any = None
@@ -550,13 +807,15 @@ class SyncEngine:
             emoji_ok = True
             if row.sent_hash == kept_edits.PLAIN + content_hash:
                 emoji_ok = emoji_allowed(await get_settings(session, Runtime))
-            if row.state == "ok" and kept_edits.up_to_date(row.sent_hash, content_hash, emoji_ok):
+            if row.state in SETTLED and kept_edits.up_to_date(row.sent_hash, content_hash, emoji_ok):
                 if target.manual != row.manual:  # a just kept edit got its data fingerprint
                     row.manual = target.manual
                     await session.commit()
                 result.unchanged += 1
                 return
-            fragment = await self._gate(session, target.fragment, result, f"{kind}:{block_id}")
+            fragment = await self._gate(
+                session, target.fragment, result, f"{kind}:{block_id}", plain_ok=kind in ALWAYS_SHOWN
+            )
             if fragment is None:
                 return
             if fragment is block.fragment:
@@ -629,7 +888,8 @@ class SyncEngine:
                 row.snapshot = fragment.to_json()
                 # the channel shows the bot's version again: a manual edit nobody kept is gone
                 row.manual = target.manual if kept_edits.is_kept(target.manual) else None
-                row.state = "ok"
+                if row.state not in STICKY:  # a pointer stays "kept", a navigation to move stays so
+                    row.state = "ok"
                 row.dirty = False
                 row.last_error = None
             elif status == "missing":
@@ -738,15 +998,24 @@ class SyncEngine:
         return await render_db.render_block(session, kind, block_id, ctx, tpl)
 
     async def _gate(
-        self, session: AsyncSession, fragment: Fragment, result: PassResult, key: str
+        self,
+        session: AsyncSession,
+        fragment: Fragment,
+        result: PassResult,
+        key: str,
+        *,
+        plain_ok: bool = False,
     ) -> Fragment | None:
-        """Posts with premium emoji are only touched while the self-test confirms emoji work."""
+        """Posts with premium emoji are only touched while the self-test confirms emoji work.
+
+        ``plain_ok``: the post goes without them meanwhile (the navigation must never be missing).
+        """
         if not fragment.custom_emoji_count():
             return fragment
         runtime = await get_settings(session, Runtime)
         if emoji_allowed(runtime):
             return fragment
-        if runtime.plain_emoji_fallback:
+        if runtime.plain_emoji_fallback or plain_ok:
             return strip_custom_emoji(fragment)
         result.skipped.append(key)
         return None
@@ -810,22 +1079,29 @@ class SyncEngine:
             await notify_staff(self.ctx, text)
 
 
-def retire_nav(session: AsyncSession, nav: ChannelPost) -> ChannelPost:
-    """The navigation is to be published anew at the bottom: its old message becomes an ``old_nav`` row,
-    which a pass deletes (or turns into a spare when Telegram does not allow deleting an old post)."""
-    old = ChannelPost(
-        channel_id=nav.channel_id,
-        kind="old_nav",
-        block_id=nav.message_id or 0,
-        message_id=nav.message_id,
-        pinned=nav.pinned,
-        state="ok",
-    )
-    session.add(old)
-    nav.message_id = None
-    nav.pinned = False
-    nav.sent_hash = None
-    return old
+def nav_move_key(channel_id: int, message_id: int) -> str:
+    return f"navmove:{channel_id}:{message_id}"
+
+
+async def request_nav_move(session: AsyncSession, channel_id: int, shown: int | None = None) -> str:
+    """An admin wants the navigation below their post: the next pass publishes it anew at the bottom and only
+    then retires the old message. "ok"; "gone" when the navigation (``shown``: the one the admin saw) is not
+    there any more; "again" when this was asked already. The navigation's row is not touched here."""
+    nav = (
+        await session.execute(
+            select(ChannelPost).where(ChannelPost.channel_id == channel_id, ChannelPost.kind == "nav")
+        )
+    ).scalar_one_or_none()
+    if nav is None or not nav.message_id or (shown is not None and nav.message_id != shown):
+        return "gone"
+    if not await claim_notification(session, nav_move_key(channel_id, nav.message_id)):
+        return "again"
+    return "ok"
+
+
+async def nav_move_requested(session: AsyncSession, channel_id: int, message_id: int) -> bool:
+    key = nav_move_key(channel_id, message_id)
+    return bool(await session.scalar(select(Notification.id).where(Notification.dedup_key == key)))
 
 
 async def mark_all_dirty(session: AsyncSession) -> None:

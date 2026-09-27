@@ -20,6 +20,14 @@ TEST_DB_URL = os.environ.get(
 OWNER_ID = 1001
 
 
+@pytest.fixture(autouse=True)
+def no_own_post_grace(monkeypatch):
+    """Channel updates are checked at once: in tests nothing is sent concurrently with them."""
+    from app.bot.routers import channel
+
+    monkeypatch.setattr(channel, "OWN_POST_GRACE", 0)
+
+
 @pytest.fixture(scope="session")
 async def database():
     db = Database(TEST_DB_URL)

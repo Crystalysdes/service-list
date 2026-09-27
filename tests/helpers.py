@@ -58,7 +58,7 @@ async def imported_channel(tg, db, ctx, *, live: bool = True, emoji_ok: bool = T
 
 
 def engine_for(ctx) -> SyncEngine:
-    engine = SyncEngine(ctx, debounce=0, max_delay=0, idle_interval=3600)
+    engine = SyncEngine(ctx, debounce=0, max_delay=0, idle_interval=3600, nav_check_every=0)
     ctx.services["sync"] = engine
     return engine
 

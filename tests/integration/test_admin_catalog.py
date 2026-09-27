@@ -44,6 +44,12 @@ async def test_admin_creates_category_and_manages_service(h, tg, db, ctx):
         cat = (await s.execute(select(Category).where(Category.slug == "proxy"))).scalar_one()
         assert cat.nav_label == "#proxy"
         assert {e["type"] for e in cat.header["entities"]} == {"blockquote", "bold"}
+    await engine_for(ctx).run_once(1)  # the new category is in the navigation, which stays the last post
+    nav_id = max(tg.messages[MAIN])
+    nav_text = tg.messages[MAIN][nav_id]["text"]
+    assert nav_text.startswith("Навигационная панель") and "#proxy" in nav_text
+    proxy_post = next(i for i, m in tg.messages[MAIN].items() if m.get("text", "").startswith("🔐Proxy"))
+    assert proxy_post < nav_id and tg.pins[MAIN] == [nav_id]
 
     await h.press(OWNER_ID, h.last(OWNER_ID), "Назад")
     card = h.last(OWNER_ID)
@@ -100,6 +106,7 @@ async def test_manual_post_after_nav_and_manual_edit(h, tg, db, ctx):
     await h.press(OWNER_ID, alert, "Перенести навигацию вниз")
     alert = tg.messages[OWNER_ID][alert["message_id"]]
     assert "⬇️ Навигация переносится вниз — @owner" in alert["text"] and "reply_markup" not in alert
+    assert tg.messages[MAIN][ids["nav"]]["text"].startswith("Навигационная панель")  # untouched until moved
     await engine.run_once(ids["channel_id"])
     last = max(tg.messages[MAIN])
     assert tg.messages[MAIN][last]["text"].startswith("Навигационная панель")
@@ -160,6 +167,44 @@ async def test_an_old_navigation_becomes_a_dot_and_every_link_follows_the_new_on
         await s.commit()
     await engine.run_once(ids["channel_id"])
     assert _links(tg.messages[MAIN][ids["intro"]]) == [new_link]
+
+
+async def test_the_bots_own_posts_and_pins_raise_no_alert(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    await engine_for(ctx).run_once(ids["channel_id"])
+    await h.feed({"channel_post": tg._export(tg.messages[MAIN][ids["nav"]])})  # the navigation itself
+    below = tg.post(MAIN, "·")["message_id"]  # a post of the bot below the navigation
+    async with db.session() as s:
+        s.add(ChannelPost(channel_id=ids["channel_id"], kind="spare", block_id=below, message_id=below))
+        await s.commit()
+    await h.feed({"channel_post": tg._export(tg.messages[MAIN][below])})
+    pin = dict(tg._export(tg.post(MAIN, "pin")))  # the service message of pinning the navigation
+    pin.pop("text")
+    pin["pinned_message"] = tg._export(tg.messages[MAIN][ids["nav"]])
+    await h.feed({"channel_post": pin})
+    assert not [m for m in tg.bot_messages(OWNER_ID) if "после навигации" in (m.get("text") or "")]
+
+    await h.feed({"channel_post": tg._export(tg.post(MAIN, "реклама"))})  # an admin's post: alert
+    assert "после навигации" in h.last(OWNER_ID)["text"]
+
+
+async def test_channels_screen_shows_the_navigation_and_moves_it_down(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Каналы")
+    screen = h.last(OWNER_ID)
+    assert f"🧭 Навигация: пост {ids['nav']} — последний пост бота ✅" in screen["text"]
+    await h.press(OWNER_ID, screen, "Навигацию вниз заново")
+    assert "будет опубликована внизу заново" in tg.called("answerCallbackQuery")[-1]["text"]
+    assert "⏳ переносится вниз" in tg.messages[OWNER_ID][screen["message_id"]]["text"]
+    await h.press(OWNER_ID, tg.messages[OWNER_ID][screen["message_id"]], "Навигацию вниз заново")
+    assert "уже переносится" in tg.called("answerCallbackQuery")[-1]["text"]
+    await engine.run_once(ids["channel_id"])
+    new = max(tg.messages[MAIN])
+    assert new > ids["nav"] and tg.messages[MAIN][new]["text"].startswith("Навигационная панель")
+    assert ids["nav"] not in tg.messages[MAIN]
 
 
 async def test_kept_manual_edit_survives_until_the_data_changes(h, tg, db, ctx):

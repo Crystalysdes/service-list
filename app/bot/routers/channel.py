@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.enums import ContentType
 from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
@@ -23,10 +25,26 @@ from app.services.channels import remember_chat
 from app.services.notify import claim_notification, close_alert, notify_staff, remember_alert
 from app.services.settings import Runtime, get_settings
 from app.services.sync import manual as kept_edits
-from app.services.sync import own_links
-from app.services.sync.engine import retire_nav
+from app.services.sync.engine import OWNER_RANK, request_nav_move
 
 router = Router(name="channel_events")
+
+# Telegram sends the bot its own channel posts and edits too. By this many seconds later the engine has saved
+# them (the post's id, the edit's snapshot), so they are not taken for somebody else's.
+OWN_POST_GRACE = 3.0
+SERVICE_TYPES = {
+    ContentType.PINNED_MESSAGE,
+    ContentType.NEW_CHAT_TITLE,
+    ContentType.NEW_CHAT_PHOTO,
+    ContentType.DELETE_CHAT_PHOTO,
+    ContentType.MESSAGE_AUTO_DELETE_TIMER_CHANGED,
+    ContentType.VIDEO_CHAT_SCHEDULED,
+    ContentType.VIDEO_CHAT_STARTED,
+    ContentType.VIDEO_CHAT_ENDED,
+    ContentType.VIDEO_CHAT_PARTICIPANTS_INVITED,
+    ContentType.BOOST_ADDED,
+    ContentType.CHAT_BACKGROUND_SET,
+}
 
 
 async def _channel(session: AsyncSession, chat_id: int) -> Channel | None:
@@ -56,8 +74,21 @@ def edit_alert_text(channel: Channel, row: ChannelPost) -> str:
     )
 
 
+async def _owned(session: AsyncSession, channel_id: int, message_id: int) -> bool:
+    """The bot's own post: a row of the channel shows it (a block, the navigation, a leftover)."""
+    rows = await session.execute(
+        select(ChannelPost.message_id, ChannelPost.extra_message_ids).where(
+            ChannelPost.channel_id == channel_id
+        )
+    )
+    return any(own == message_id or message_id in (extra or []) for own, extra in rows.all())
+
+
 @router.channel_post()
 async def on_channel_post(message: Message, session: AsyncSession, **data: Any) -> None:
+    if message.content_type in SERVICE_TYPES:  # a pin and the like is not a post after the navigation
+        return
+    await asyncio.sleep(OWN_POST_GRACE)
     channel = await _channel(session, message.chat.id)
     if channel is None or channel.role not in ("main", "mirror") or channel.status == "retired":
         return
@@ -69,7 +100,9 @@ async def on_channel_post(message: Message, session: AsyncSession, **data: Any) 
             select(ChannelPost).where(ChannelPost.channel_id == channel.id, ChannelPost.kind == "nav")
         )
     ).scalar_one_or_none()
-    if nav is None or not nav.message_id or message.message_id < nav.message_id:
+    if nav is None or not nav.message_id or message.message_id <= nav.message_id:
+        return
+    if await _owned(session, channel.id, message.message_id):  # the bot's own post (a new block)
         return
     if not await claim_notification(session, f"after_nav:{channel.id}:{nav.message_id}"):
         return
@@ -85,16 +118,19 @@ async def on_channel_post(message: Message, session: AsyncSession, **data: Any) 
 
 @router.edited_channel_post()
 async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) -> None:
+    await asyncio.sleep(OWN_POST_GRACE)  # the bot's own edit matches the saved snapshot by then
     channel = await _channel(session, message.chat.id)
     if channel is None:
         return
-    row = (
+    owners = (
         await session.execute(
             select(ChannelPost).where(
                 ChannelPost.channel_id == channel.id, ChannelPost.message_id == message.message_id
             )
         )
-    ).scalar_one_or_none()
+    ).scalars()
+    # the row that shows the post (a block before the navigation before a leftover)
+    row = min(owners, key=lambda r: (OWNER_RANK.get(r.kind, len(OWNER_RANK)), r.id), default=None)
     if row is None or row.snapshot is None:
         return
     edited = Fragment.from_message(message)
@@ -260,23 +296,23 @@ async def on_my_member(update: ChatMemberUpdated, session: AsyncSession, **data:
 async def on_nav_down(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     parts = (call.data or "").split(":")
     channel_id = int(parts[2])
-    alert_nav = int(parts[3]) if len(parts) > 3 else None
+    alert_nav = int(parts[3]) if len(parts) > 3 else 0  # a button of an old version: stale
     channel = await session.get(Channel, channel_id)
-    nav = (
-        await session.execute(
-            select(ChannelPost).where(ChannelPost.channel_id == channel_id, ChannelPost.kind == "nav")
-        )
-    ).scalar_one_or_none()
-    if nav is None or channel is None or not nav.message_id or (alert_nav and nav.message_id != alert_nav):
+    # the next pass publishes a new navigation at the bottom first and only then retires the old one
+    asked = await request_nav_move(session, channel_id, alert_nav) if channel is not None else "gone"
+    if asked == "again":
+        await call.answer("Навигация уже переносится — через минуту она будет внизу.", show_alert=True)
+        return
+    if asked != "ok" or channel is None:
         await call.answer("Навигация уже перенесена.", show_alert=True)
         if isinstance(call.message, Message):
             await call.message.edit_reply_markup(reply_markup=None)
         return
-    nav_row_id = nav.id
-    if channel.role == "main":  # plain links to the old navigation (in the main post too) follow the new one
-        await own_links.symbolize_stored(session, channel)
-    retire_nav(session, nav)  # the next pass deletes the old message, or turns it into a dot if it may not
-    await session.flush()
+    nav_row_id = (
+        await session.execute(
+            select(ChannelPost.id).where(ChannelPost.channel_id == channel_id, ChannelPost.kind == "nav")
+        )
+    ).scalar_one()
     await audit(session, data["user"].id, "nav.down", "channel", channel_id)
     await session.commit()
     request_sync(data["ctx"])

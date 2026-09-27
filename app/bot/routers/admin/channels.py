@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, LinkPreviewOptions, Message, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import RoleFilter
 from app.bot.i18n import h
 from app.bot.routers.admin.panel import back_home
 from app.bot.states import ChannelConnect
+from app.db.models import Channel, ChannelPost
+from app.domain.symbols import channel_post_base
 from app.services.audit import audit
+from app.services.catalog import request_sync
 from app.services.channels import (
     GROUP_ROLES,
     REQUEST_IDS,
@@ -26,13 +32,16 @@ from app.services.channels import (
     ensure_invite_link,
     inspect_chat,
     known_chats,
+    main_channel,
     missing_rights,
     request_chat_keyboard,
     save_channel,
 )
 from app.services.settings import Chats, Limits, Runtime, get_settings, save_settings
+from app.services.sync.engine import KEPT, nav_move_requested, request_nav_move
 
 router = Router(name="admin_channels")
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)  # the screen links to the navigation post
 router.message.filter(RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
@@ -69,6 +78,8 @@ async def channels_text(session: AsyncSession) -> str:
             lines.append(
                 f"<b>{ROLE_TITLES[role].capitalize()}:</b> {h(c.title or '')} ({h(name)}) — {c.status}"
             )
+            if role == "main":
+                lines += await nav_lines(session, c)
     lines.append(f"<b>Служебный:</b> {chats.storage_chat_id if chats.storage_chat_id else 'не подключён'}")
     if chats.moderation_chat_id:
         topics = [
@@ -96,10 +107,40 @@ async def channels_text(session: AsyncSession) -> str:
     return "\n".join(lines)
 
 
+async def nav_lines(session: AsyncSession, channel: Channel) -> list[str]:
+    """Where the navigation is, and posts the bot could not delete (older than 48 hours)."""
+    rows = list(
+        (await session.execute(select(ChannelPost).where(ChannelPost.channel_id == channel.id))).scalars()
+    )
+    base = channel_post_base(channel.chat_id, channel.username)
+    nav = next((r for r in rows if r.kind == "nav"), None)
+    if nav is None or not nav.message_id:
+        lines = ["🧭 <b>Навигация:</b> ещё не опубликована — бот выложит её при синхронизации."]
+    else:
+        last = nav.message_id >= max(r.message_id or 0 for r in rows)
+        if await nav_move_requested(session, channel.id, nav.message_id):
+            place = "⏳ переносится вниз"
+        elif last:
+            place = "последний пост бота ✅"
+        else:
+            place = "⚠️ ниже есть посты бота — нажмите «⬇️ Навигацию вниз заново»"
+        lines = [f'🧭 <b>Навигация:</b> <a href="{base}{nav.message_id}">пост {nav.message_id}</a> — {place}']
+    kept = [r.message_id for r in rows if r.kind == "spare" and r.state == KEPT and r.message_id]
+    if kept:
+        links = ", ".join(f'<a href="{base}{m}">{m}</a>' for m in sorted(kept)[:15])
+        lines.append(
+            f"🧹 Старые посты-указатели (Telegram не даёт боту удалять посты старше 48 часов, удалите их "
+            f"вручную): {links}"
+        )
+    return lines
+
+
 def channels_keyboard(has_main: bool, has_scam: bool) -> Any:
     builder = InlineKeyboardBuilder()
     if not has_main:
         builder.button(text="➕ Основной канал", callback_data="a:ch:add:main")
+    else:
+        builder.button(text="⬇️ Навигацию вниз заново", callback_data="a:ch:navdown")
     if not has_scam:
         builder.button(text="➕ Канал Scam list", callback_data="a:ch:add:scam")
     builder.button(text="➕ Зеркало", callback_data="a:ch:add:mirror")
@@ -122,7 +163,32 @@ async def on_channels(call: CallbackQuery, state: FSMContext, session: AsyncSess
     await call.answer()
     text, markup = await _channels_screen(session)
     assert call.message is not None
-    await call.message.edit_text(text, reply_markup=markup)
+    await call.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+
+@router.callback_query(F.data == "a:ch:navdown")
+async def on_nav_again(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """The navigation published anew at the bottom (e.g. below an admin's post the bot did not hear about)."""
+    channel = await main_channel(session)
+    asked = await request_nav_move(session, channel.id) if channel is not None else "gone"
+    if asked == "again":
+        await call.answer("Навигация уже переносится — через минуту она будет внизу.", show_alert=True)
+        return
+    if asked != "ok" or channel is None:
+        await call.answer("Навигация ещё не опубликована — бот выложит её сам.", show_alert=True)
+        return
+    await audit(session, data["user"].id, "nav.down", "channel", channel.id)
+    await session.commit()
+    request_sync(data["ctx"])
+    await call.answer(
+        "Навигация будет опубликована внизу заново в течение минуты. Старую бот удалит, а если ей больше "
+        "48 часов — пришлёт ссылку, чтобы удалить её вручную.",
+        show_alert=True,
+    )
+    text, markup = await _channels_screen(session)
+    assert call.message is not None
+    with contextlib.suppress(TelegramBadRequest):  # "not modified"
+        await call.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
 
 
 async def connect_screen(session: AsyncSession, role: str) -> tuple[str, Any]:
@@ -181,7 +247,7 @@ async def on_add_channel(call: CallbackQuery, state: FSMContext, session: AsyncS
     await call.answer()
     assert call.message is not None
     text, markup = await connect_screen(session, role)
-    await call.message.edit_text(text, reply_markup=markup)
+    await call.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
     await call.message.answer(
         "👇 Кнопка выбора — внизу экрана.", reply_markup=request_chat_keyboard(role, REQUEST_IDS[role])
     )
@@ -253,7 +319,7 @@ async def connect(
         await engine.wake_all()
     await target.answer(note, reply_markup=ReplyKeyboardRemove())
     text, markup = await _channels_screen(session)
-    await target.answer(text, reply_markup=markup)
+    await target.answer(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
 
 
 @router.message(ChannelConnect.waiting, F.chat.type == "private")
