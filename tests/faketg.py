@@ -628,14 +628,15 @@ class FakeTelegram:
         chat = self._chat(params["chat_id"])
         self._require(chat, "can_invite_users")
         link = {
-            "invite_link": f"https://t.me/+deal{abs(chat['id'])}x{next(self._ids)}",
+            "invite_link": f"https://t.me/+inv{abs(chat['id'])}x{next(self._ids)}",
             "creator": dict(self.bot_user),
             "creates_join_request": bool(params.get("creates_join_request")),
             "is_primary": False,
             "is_revoked": False,
         }
-        if params.get("name"):
-            link["name"] = params["name"]
+        for key in ("name", "expire_date", "member_limit"):
+            if params.get(key) is not None:
+                link[key] = params[key]
         chat.setdefault("_links", {})[link["invite_link"]] = link
         return dict(link)
 

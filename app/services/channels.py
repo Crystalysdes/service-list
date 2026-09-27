@@ -37,10 +37,12 @@ REQUIRED_RIGHTS: dict[str, tuple[str, ...]] = {
     "mirror": ("can_post_messages", "can_edit_messages", "can_delete_messages", "can_invite_users"),
     "scam": ("can_post_messages", "can_edit_messages", "can_delete_messages", "can_invite_users"),
     "storage": ("can_post_messages", "can_edit_messages", "can_delete_messages"),
+    "community": ("can_invite_users",),  # personal links into the chat for the bot's menu
 }
 ROLE_TITLES = {"main": "основной", "mirror": "зеркало", "scam": "Scam list", "storage": "служебный"}
 # request_id of the "choose a chat" keyboard button per purpose (any int32; tells the answers apart)
-REQUEST_IDS = {"main": 101, "scam": 102, "mirror": 103, "storage": 104, "moderation": 105}
+REQUEST_IDS = {"main": 101, "scam": 102, "mirror": 103, "storage": 104, "moderation": 105, "community": 106}
+GROUP_ROLES = ("moderation", "community")
 RIGHT_FLAGS = (
     "can_manage_chat",
     "can_post_messages",
@@ -95,7 +97,7 @@ async def inspect_chat(bot: Bot, ref: int | str, role: str) -> ChatCheck:
     except TelegramAPIError as exc:
         check.error = f"Не удалось открыть чат: {exc.message}"
         return check
-    if role == "moderation":
+    if role in GROUP_ROLES:
         if check.chat.type not in ("group", "supergroup"):
             check.error = "Это не группа."
             return check
@@ -240,7 +242,7 @@ def _admin_rights(flags: tuple[str, ...]) -> ChatAdministratorRights:
 
 def request_chat_keyboard(role: str, request_id: int) -> ReplyKeyboardMarkup:
     """Telegram's own chat picker: lists the admin's channels / groups and adds the bot with the rights."""
-    is_channel = role != "moderation"
+    is_channel = role not in GROUP_ROLES
     rights = _admin_rights(REQUIRED_RIGHTS.get(role, ()))
     button = KeyboardButton(
         text="📋 Выбрать канал" if is_channel else "👥 Выбрать группу",

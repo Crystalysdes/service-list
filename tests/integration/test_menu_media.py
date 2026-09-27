@@ -50,10 +50,11 @@ async def test_text_menu_layout_and_structure(h, tg, db):
     await h.say(USER, "/menu")
     menu = h.last(USER)
     assert menu["text"].startswith("📋 Service List") and "Что здесь можно" in menu["text"]
-    assert _rows(menu) == [1, 2, 2, 2]
+    assert _rows(menu) == [1, 1, 2, 2, 2]
     texts = [b["text"] for b in h.buttons(menu)]
     assert texts == [
         "📋 Service List",
+        "🛡 Auto-garant",  # always there: while deals are off it says they start soon
         "➕ Add service",
         "🗂 My services",
         "🚫 Scam list",
@@ -68,7 +69,7 @@ async def test_admin_sets_a_menu_video_and_users_see_it(h, tg, db, ctx):
     assert "Заставка сохранена" in note["text"]
     preview = tg.bot_messages(OWNER_ID)[-2]
     assert preview["video"]["file_id"] == "vid1" and preview["caption"].startswith("📋 Service List")
-    assert _rows(preview) == [1, 2, 2, 2]
+    assert _rows(preview) == [1, 1, 2, 2, 2]
     async with db.session() as s:
         settings = await get_settings(s, MenuMedia)
         media = await s.get(MediaFile, settings.media_id)
@@ -88,7 +89,7 @@ async def test_admin_sets_a_menu_video_and_users_see_it(h, tg, db, ctx):
     await h.press(USER, help_screen, "Меню")
     menu = tg.messages[USER][help_screen["message_id"]]  # the same message turned into the video menu
     assert menu["video"]["file_id"] == "vid1" and "text" not in menu
-    assert _rows(menu) == [1, 2, 2, 2]
+    assert _rows(menu) == [1, 1, 2, 2, 2]
 
     await h.press(USER, menu, "My services")
     assert "Ваши сервисы" in h.last(USER)["text"]

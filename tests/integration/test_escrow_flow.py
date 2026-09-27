@@ -215,7 +215,7 @@ async def test_garant_link_opens_the_wizard_and_respects_the_pause(h, tg, db, pa
         await s.commit()
     await h.say(BUYER, "/start garant")
     home = h.last(BUYER)
-    assert "приостановлен" in _text(home)
+    assert "новые сделки не принимаются" in _text(home)
     assert not [b for b in h.buttons(home) if "Создать" in b["text"]]
     await h.say(BUYER, "/start deal_nosuchcode")
     assert "Сделка не найдена" in _text(h.last(BUYER))

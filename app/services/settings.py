@@ -87,6 +87,7 @@ class Limits(SettingsGroup):
     owner_reply_hours: int = 48
     waitlist_hold_hours: int = 24
     allow_own_emoji: bool = False
+    invite_link_ttl_sec: int = 60  # personal links behind «Service List» and «Chat» in the bot's menu
 
 
 class Reminders(SettingsGroup):
@@ -149,6 +150,7 @@ class Chats(SettingsGroup):
     topic_deals: int | None = None  # Auto-garant disputes
     appeal_contact: str | None = None  # shown to banned owners, e.g. "@support"
     community_url: str | None = None  # the community chat ("💬 Chat" in the menu); None: from the main post
+    community_chat_id: int | None = None  # connected in 📡 Каналы: the menu gives personal links into it
 
 
 class Escrow(SettingsGroup):

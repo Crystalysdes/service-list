@@ -34,6 +34,7 @@ NUMBERS: dict[str, tuple[type, str, str, int, int]] = {
     "cooldown": (Limits, "submission_cooldown_sec", "Пауза между заявками, сек", 0, 3600),
     "ttl": (Limits, "approval_ttl_days", "Дней на оплату одобренной заявки", 1, 60),
     "hold": (Limits, "waitlist_hold_hours", "Часов брони освободившегося топа для очереди", 1, 168),
+    "invite": (Limits, "invite_link_ttl_sec", "Личные ссылки в меню (канал, чат) живут, сек", 30, 3600),
 }
 
 

@@ -38,8 +38,9 @@ async def test_new_user_captcha_language_menu(h, tg, db):
     await h.press(USER, msg, "Русский")
     menu = h.last(USER)
     texts = [b["text"] for b in h.buttons(menu)]
-    assert texts[:5] == [
+    assert texts[:6] == [
         "📋 Service List",
+        "🛡 Auto-garant",
         "➕ Add service",
         "🗂 My services",
         "🚫 Scam list",

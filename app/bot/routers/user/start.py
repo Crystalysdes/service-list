@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -11,6 +13,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.bot.flows.start import (
     captcha_required,
     continue_after_gate,
+    links_for,
+    menu_parts,
     send_captcha,
     send_language_choice,
     send_menu,
@@ -19,6 +23,7 @@ from app.bot.flows.start import (
 from app.bot.i18n import LANGS, Translator
 from app.db.base import utcnow
 from app.domain.captcha import check, is_blocked, new_challenge
+from app.services.invites import ttl_text
 from app.services.settings import Captcha, get_settings
 
 router = Router(name="user_start")
@@ -162,6 +167,22 @@ async def on_lang_menu(call: CallbackQuery, **data: Any) -> None:
 @router.callback_query(F.data == "m:nochan")
 async def on_no_channel(call: CallbackQuery, **data: Any) -> None:
     await call.answer(data["t"]("menu.channel_not_ready"), show_alert=True)
+
+
+@router.callback_query(F.data == "m:links")
+async def on_refresh_links(call: CallbackQuery, **data: Any) -> None:
+    """🔄 (or a link Telegram refused a moment ago): new personal links under the same menu message."""
+    t: Translator = data["t"]
+    links = await links_for(data)
+    _text, markup = await menu_parts(data["session"], t, links)
+    if isinstance(call.message, Message):
+        with contextlib.suppress(TelegramBadRequest):  # "not modified": the links were fresh already
+            await call.message.edit_reply_markup(reply_markup=markup)
+    retry = any(link is not None and link.retry for link in (links.main, links.chat))
+    if retry:
+        await call.answer(t("menu.links_failed"), show_alert=True)
+    else:
+        await call.answer(t("menu.links_fresh", ttl=ttl_text(links.ttl, t.lang)))
 
 
 def _back_to_menu(t: Translator) -> Any:

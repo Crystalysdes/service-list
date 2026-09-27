@@ -17,6 +17,7 @@ from app.bot.routers.admin.panel import back_home
 from app.bot.states import ChannelConnect
 from app.services.audit import audit
 from app.services.channels import (
+    GROUP_ROLES,
     REQUEST_IDS,
     RIGHT_NAMES,
     ROLE_TITLES,
@@ -29,13 +30,13 @@ from app.services.channels import (
     request_chat_keyboard,
     save_channel,
 )
-from app.services.settings import Chats, Runtime, get_settings, save_settings
+from app.services.settings import Chats, Limits, Runtime, get_settings, save_settings
 
 router = Router(name="admin_channels")
 router.message.filter(RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
-CONNECT_ROLES = (*ROLE_TITLES, "moderation")
+CONNECT_ROLES = (*ROLE_TITLES, "moderation", "community")
 CONNECT_HELP = (
     "Бот должен быть администратором канала с правами: публикация, редактирование и удаление сообщений, "
     "приглашение пользователей."
@@ -48,7 +49,11 @@ BIND_HINT = (
 
 
 def _what(role: str) -> str:
-    return "группа модерации" if role == "moderation" else f"{ROLE_TITLES[role]} канал"
+    if role == "moderation":
+        return "группа модерации"
+    if role == "community":
+        return "чат сообщества (кнопка «💬 Chat» в меню)"
+    return f"{ROLE_TITLES[role]} канал"
 
 
 async def channels_text(session: AsyncSession) -> str:
@@ -78,6 +83,16 @@ async def channels_text(session: AsyncSession) -> str:
         )
     else:
         lines.append("<b>Группа модерации:</b> не подключена — кнопка «👥 Группа модерации» ниже.")
+    if chats.community_chat_id:
+        lines.append(
+            f"<b>Чат сообщества:</b> {chats.community_chat_id} — в меню у каждого своя ссылка на "
+            f"{(await get_settings(session, Limits)).invite_link_ttl_sec} с"
+        )
+    else:
+        lines.append(
+            "<b>Чат сообщества:</b> не подключён — в меню постоянная ссылка. Подключите его кнопкой "
+            "«💬 Чат сообщества», и каждый будет получать свою ссылку на минуту."
+        )
     return "\n".join(lines)
 
 
@@ -90,6 +105,7 @@ def channels_keyboard(has_main: bool, has_scam: bool) -> Any:
     builder.button(text="➕ Зеркало", callback_data="a:ch:add:mirror")
     builder.button(text="🗄 Служебный канал", callback_data="a:ch:add:storage")
     builder.button(text="👥 Группа модерации", callback_data="a:ch:add:moderation")
+    builder.button(text="💬 Чат сообщества", callback_data="a:ch:add:community")
     builder.button(text="🚚 Переезд / пересборка", callback_data="a:mig")
     builder.adjust(1)
     return back_home(builder)
@@ -111,7 +127,7 @@ async def on_channels(call: CallbackQuery, state: FSMContext, session: AsyncSess
 
 async def connect_screen(session: AsyncSession, role: str) -> tuple[str, Any]:
     """Known chats as buttons + how to use Telegram's own picker (sent separately, it is a reply keyboard)."""
-    kind = "group" if role == "moderation" else "channel"
+    kind = "group" if role in GROUP_ROLES else "channel"
     chats = await known_chats(session, kind)
     builder = InlineKeyboardBuilder()
     for chat in chats:
@@ -192,11 +208,17 @@ async def connect(
         return
     chat = check.chat
     user_id = data["user"].id
-    if role in ("storage", "moderation"):
+    if role in ("storage", "moderation", "community"):
         chats = await get_settings(session, Chats)
         if role == "storage":
             chats.storage_chat_id = chat.id
             note = f"✅ Служебный канал подключён: {h(chat.title or chat.id)}"
+        elif role == "community":
+            chats.community_chat_id = chat.id
+            note = (
+                f"✅ Чат сообщества подключён: {h(chat.title or chat.id)}\n\n"
+                "Теперь кнопка «💬 Chat» в меню бота даёт каждому свою ссылку на минуту и на один вход."
+            )
         else:
             if chats.moderation_chat_id != chat.id:
                 chats.topic_applications = chats.topic_reports = chats.topic_log = chats.topic_deals = None
@@ -227,7 +249,7 @@ async def connect(
     await state.clear()
     await session.commit()
     engine = data["ctx"].get("sync")
-    if engine is not None and role not in ("storage", "moderation"):
+    if engine is not None and role not in ("storage", *GROUP_ROLES):
         await engine.wake_all()
     await target.answer(note, reply_markup=ReplyKeyboardRemove())
     text, markup = await _channels_screen(session)
@@ -244,7 +266,7 @@ async def on_channel_ref(
         await message.answer(
             "Не понял, какая это группа. Выберите её в списке или кнопкой внизу экрана либо пришлите "
             "@username / ID группы."
-            if role == "moderation"
+            if role in GROUP_ROLES
             else "Не понял, какой это канал. Выберите его в списке или кнопкой внизу экрана, перешлите "
             "из него пост или пришлите @username / ID."
         )

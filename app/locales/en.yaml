@@ -32,6 +32,10 @@ menu:
   language: "🌐 Language"
   help: "ℹ️ Help"
   channel_not_ready: "The channel is not connected yet, please check back later."
+  refresh: "🔄"
+  links_note: "\n\n🔐 The channel and chat links are personal and valid for {ttl}. Expired? Tap 🔄 or /start."
+  links_fresh: "🔄 New links — valid for {ttl}"
+  links_failed: "Could not issue a link — please try again in a minute."
 help:
   text: "<b>How it works</b>\n\n➕ <b>Add service</b> — describe your service and send its link. After a moderator approves it, the bot sends an invoice; once paid, the service appears in its branch of the channel.\n\n🗂 <b>My services</b> — your services: top 1/2/3, a premium emoji before the name, a name made of animated emoji, renewals and stats.\n\n⚠️ <b>Report service</b> — report a service (screenshots and a detailed description are required).\n\n🚫 <b>Scam list</b> — services found to be scams."
 add:
@@ -253,7 +257,7 @@ lnk:
 g:
   open_deal: "📂 Deal #{n}"
   home: "🛡 <b>Auto-garant</b> — a deal through the garant\n\n💰 The buyer pays the bot and the money is <b>held</b>: the seller gets it only after the buyer confirms.\n⚖️ If the sides cannot agree, a moderator decides.\n💸 The garant's fee is {fee}%, you choose who pays it.\n💵 Payment in USDT via @CryptoBot."
-  home_off: "⏸ New deals are paused for now. Open deals go on as usual."
+  home_off: "⏸ New deals are not taken right now — coming soon. Open deals go on as usual."
   how: "📖 <b>How Auto-garant works</b>\n\n1️⃣ One side creates a deal: what is sold, the terms, the amount, the deadline — and sends the other an invitation link.\n2️⃣ The other side sees the terms and the creator's record and accepts them.\n3️⃣ The buyer pays the invoice in @CryptoBot — the money is held by the garant.\n4️⃣ The seller delivers and taps «📦 Delivered».\n5️⃣ The buyer checks and taps «✅ Release the money» — the seller is paid in @CryptoBot at once.\n\n⏱ If the buyer stays silent for {release_hours} h after «Delivered», the money goes to the seller automatically. If the seller misses the deadline, a dispute opens after {grace_hours} h.\n⚖️ A moderator decides disputes: to the seller, back to the buyer, or split.\n🤝 A paid deal can be cancelled only if both sides agree.\n💸 Once paid, the {fee}% fee is not returned in any outcome.\n\n🔒 The bot always shows the sides' Telegram IDs and takes money only through its own «Pay» button. Never pay by links from a chat."
   share_text: "A deal through Auto-garant: {title}"
   rules: "📌 <b>Rules</b>\n• The buyer's money is held by the garant until the buyer confirms.\n• If the buyer stays silent for {release_hours} h after «Delivered», the money goes to the seller.\n• If the seller misses the deadline, a dispute opens after {grace_hours} h.\n• A moderator decides disputes; a paid deal is cancelled only if both sides agree.\n• Once paid, the fee of {fee} is not returned in any outcome."
