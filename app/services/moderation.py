@@ -22,7 +22,7 @@ from app.domain.richtext import Fragment, RichText
 from app.services import billing, render_db
 from app.services.audit import audit
 from app.services.notify import send_to_staff
-from app.services.settings import Limits, Prices, get_settings
+from app.services.settings import Chats, Limits, Prices, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -190,7 +190,9 @@ KIND_TITLES = {
 }
 
 
-async def card_fragment(ctx: AppContext, session: AsyncSession, request: ModerationRequest) -> Fragment:
+async def card_fragment(
+    ctx: AppContext, session: AsyncSession, request: ModerationRequest, *, link_timeout: float = 15
+) -> Fragment:
     service = await session.get(Service, request.service_id)
     assert service is not None
     category = await session.get(Category, service.category_id)
@@ -225,7 +227,7 @@ async def card_fragment(ctx: AppContext, session: AsyncSession, request: Moderat
     checker = ctx.get("linkcheck")
     url = payload.get("url") or service.url
     if checker is not None and request.kind in ("new", "edit") and url:
-        verdict = await checker.quick_verdict(url)
+        verdict = await checker.quick_verdict(url, link_timeout)
         field(
             "Проверка ссылки",
             {"alive": "✅ живая", "dead": "❌ не открывается", "unknown": "⚠️ не удалось проверить"}.get(
@@ -268,10 +270,12 @@ def card_keyboard(request: ModerationRequest) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-async def safe_card_fragment(ctx: AppContext, session: AsyncSession, request: ModerationRequest) -> Fragment:
+async def safe_card_fragment(
+    ctx: AppContext, session: AsyncSession, request: ModerationRequest, *, link_timeout: float = 15
+) -> Fragment:
     """The card, or a short one when it cannot be built: a request never goes unseen because of its card."""
     try:
-        return await card_fragment(ctx, session, request)
+        return await card_fragment(ctx, session, request, link_timeout=link_timeout)
     except Exception:
         log.exception("moderation card of request %s cannot be built", request.id)
         service = await session.get(Service, request.service_id)
@@ -284,49 +288,60 @@ async def safe_card_fragment(ctx: AppContext, session: AsyncSession, request: Mo
 
 def _entity_problem(exc: TelegramAPIError) -> bool:
     text = (getattr(exc, "message", None) or str(exc)).lower()
-    return any(word in text for word in ("entit", "emoji", "document_invalid"))
+    return any(word in text for word in ("entit", "emoji", "document_invalid", "url"))
 
 
-async def post_card(ctx: AppContext, request_id: int) -> None:
+async def send_card(
+    bot: Any,
+    chat_id: int,
+    thread_id: int | None,
+    fragment: Fragment,
+    markup: InlineKeyboardMarkup,
+) -> Message:
+    """A card with its formatting; one whose formatting a chat refuses (premium emoji, a link Telegram
+    does not take) goes without the premium emoji, then as plain text: it always arrives."""
+    entities = fragment.to_entities()
+    tries = [entities, [e for e in entities if e.type != "custom_emoji"], []]
+    for index, attempt in enumerate(tries):
+        if index and attempt == tries[index - 1]:
+            continue
+        try:
+            return await bot.send_message(
+                chat_id,
+                fragment.text,
+                entities=attempt or None,
+                parse_mode=None,
+                message_thread_id=thread_id,
+                reply_markup=markup,
+                link_preview_options=NO_PREVIEW,
+            )
+        except TelegramBadRequest as exc:
+            if not attempt or not _entity_problem(exc):
+                raise
+            log.warning("a card to %s with less formatting: %s", chat_id, exc)
+    raise AssertionError("unreachable")
+
+
+async def post_card(ctx: AppContext, request_id: int, *, group_only: bool = False) -> int:
     """The request's card for the moderators (see :func:`notify.send_to_staff`: a group that refuses never
-    swallows it). A card with premium emoji that a chat does not take goes without them."""
+    swallows it). ``group_only``: only to the moderation group (nothing when there is none). Returns how
+    many copies went out."""
     bot = ctx.bot
     assert bot is not None
     async with ctx.db.session() as session:
         request = await session.get(ModerationRequest, request_id)
         if request is None:
-            return
+            return 0
+        if group_only and not (await get_settings(session, Chats)).moderation_chat_id:
+            return 0
         fragment = await safe_card_fragment(ctx, session, request)
         markup = card_keyboard(request)
 
         async def send(chat_id: int, thread_id: int | None) -> Message:
-            assert bot is not None
-            entities = fragment.to_entities()
-            try:
-                return await bot.send_message(
-                    chat_id,
-                    fragment.text,
-                    entities=entities,
-                    parse_mode=None,
-                    message_thread_id=thread_id,
-                    reply_markup=markup,
-                    link_preview_options=NO_PREVIEW,
-                )
-            except TelegramBadRequest as exc:
-                if not entities or not _entity_problem(exc):
-                    raise
-                log.warning("moderation card %s without premium emoji: %s", request_id, exc)
-                return await bot.send_message(
-                    chat_id,
-                    fragment.text,
-                    entities=[e for e in entities if e.type != "custom_emoji"],
-                    parse_mode=None,
-                    message_thread_id=thread_id,
-                    reply_markup=markup,
-                    link_preview_options=NO_PREVIEW,
-                )
+            return await send_card(bot, chat_id, thread_id, fragment, markup)
 
-        for message in await send_to_staff(ctx, "applications", send, session=session):
+        sent = await send_to_staff(ctx, "applications", send, session=session, fallback=not group_only)
+        for message in sent:
             session.add(
                 ModerationCard(
                     ref_type="request",
@@ -336,6 +351,51 @@ async def post_card(ctx: AppContext, request_id: int) -> None:
                 )
             )
         await session.commit()
+        return len(sent)
+
+
+async def in_group(session: AsyncSession, request_id: int) -> bool:
+    """Does the moderation group have a card of this request (True when there is no group)?"""
+    group = (await get_settings(session, Chats)).moderation_chat_id
+    if not group:
+        return True
+    found = await session.scalar(
+        select(func.count())
+        .select_from(ModerationCard)
+        .where(
+            ModerationCard.ref_type == "request",
+            ModerationCard.ref_id == request_id,
+            ModerationCard.chat_id == group,
+        )
+    )
+    return bool(found)
+
+
+async def repost_missing(ctx: AppContext, *, now: Any = None) -> int:
+    """Pending requests whose card never reached anyone (Telegram refused it, the bot stopped midway) get
+    it again. Returns how many."""
+    now = now or utcnow()
+    async with ctx.db.session() as session:
+        carded = select(ModerationCard.ref_id).where(ModerationCard.ref_type == "request")
+        ids = list(
+            (
+                await session.execute(
+                    select(ModerationRequest.id)
+                    .where(
+                        ModerationRequest.status == "pending",
+                        ModerationRequest.created_at <= now - timedelta(minutes=2),
+                        ModerationRequest.id.not_in(carded),
+                    )
+                    .order_by(ModerationRequest.id)
+                    .limit(20)
+                )
+            ).scalars()
+        )
+    done = 0
+    for request_id in ids:
+        if await post_card(ctx, request_id):
+            done += 1
+    return done
 
 
 async def close_cards(ctx: AppContext, ref_type: str, ref_id: int, line: str) -> None:

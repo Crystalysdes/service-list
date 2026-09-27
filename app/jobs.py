@@ -111,6 +111,12 @@ async def job_announce(ctx: AppContext) -> None:
     await job(ctx)
 
 
+async def job_moderation_cards(ctx: AppContext) -> None:
+    from app.services.moderation import repost_missing
+
+    await repost_missing(ctx)
+
+
 async def job_escrow_poll(ctx: AppContext) -> None:
     if ctx.get("escrow_pay") is not None:
         from app.services.escrow.sweep import poll_job
@@ -147,6 +153,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_announce, IntervalTrigger(seconds=10)),
         (job_publish_watch, IntervalTrigger(minutes=2)),
         (job_glow, IntervalTrigger(seconds=15)),
+        (job_moderation_cards, IntervalTrigger(minutes=5, jitter=30)),
         (job_escrow_poll, IntervalTrigger(seconds=20)),
         (job_escrow_sweep, IntervalTrigger(minutes=1)),
         (job_escrow_reconcile, IntervalTrigger(minutes=10, jitter=30)),

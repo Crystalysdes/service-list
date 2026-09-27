@@ -74,13 +74,42 @@ async def _tell_owners_once(ctx: AppContext, key: str, text: str) -> None:
             log.warning("cannot tell owner %s about the staff chat", owner_id, exc_info=True)
 
 
+def _chat_refuses(exc: TelegramAPIError) -> bool:
+    """The chat does not take the bot's messages (as opposed to a message Telegram finds wrong)."""
+    if isinstance(exc, TelegramForbiddenError):
+        return True
+    text = _why(exc).lower()
+    return (
+        any(
+            word in text
+            for word in (
+                "chat not found",
+                "rights",
+                "forbidden",
+                "thread",
+                "topic",
+                "kicked",
+                "not a member",
+                "write",
+            )
+        )
+        or "migrate" in type(exc).__name__.lower()
+    )
+
+
 async def send_to_staff(
-    ctx: AppContext, topic: str, send: Send, *, session: AsyncSession | None = None
+    ctx: AppContext,
+    topic: str,
+    send: Send,
+    *,
+    session: AsyncSession | None = None,
+    fallback: bool = True,
 ) -> list[Message]:
     """One message to the staff of a topic: the topic of the moderation group, or staff in private when
     there is no group. A group that refuses never swallows it: without its topic (deleted or closed) the
     message goes to the group itself, and when the group refuses too (the bot removed or without rights,
-    the group moved to a new id) it goes to the staff in private. The owners learn why."""
+    the group moved to a new id) it goes to the staff in private (unless ``fallback`` is off). The owners
+    learn why."""
     if ctx.bot is None:
         return []
     if session is None:
@@ -113,14 +142,19 @@ async def send_to_staff(
                     f"тему, отправьте в ней <code>/bind {topic}</code>.",
                 )
                 return sent
-        await _tell_owners_once(
-            ctx,
-            f"staffchat:{group}:{type(error).__name__}",
-            f"⚠️ Группа модерации не принимает сообщения бота: {escape(_why(error))}.\n\n"
-            "Пока это так, заявки, жалобы и уведомления для персонала приходят вам в личку. Проверьте, что "
-            "бот в группе и может писать, или подключите группу заново: /admin → 📡 Каналы → "
-            "«👥 Группа модерации».",
-        )
+        if _chat_refuses(error):
+            await _tell_owners_once(
+                ctx,
+                f"staffchat:{group}:{type(error).__name__}",
+                f"⚠️ Группа модерации не принимает сообщения бота: {escape(_why(error))}.\n\n"
+                "Пока это так, заявки, жалобы и уведомления для персонала приходят вам в личку. "
+                "Проверьте, что бот в группе и может писать, или подключите группу заново: "
+                "/admin → 📡 Каналы → «👥 Группа модерации».",
+            )
+        else:  # the message itself: the group is fine
+            log.error("staff message refused by Telegram: %s", _why(error))
+        if not fallback:
+            return []
     for user_id in private:
         try:
             sent.append(await send(user_id, None))

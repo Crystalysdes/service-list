@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -464,22 +465,29 @@ async def on_queue(call: CallbackQuery, state: FSMContext, session: AsyncSession
 
 @router.callback_query(F.data.regexp(r"^a:mod:\d+$"))
 async def on_queue_item(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """The request's card here, at once (the press is answered before the link is checked: Telegram gives a
+    press only seconds), and in the moderation group too when it never got there."""
     request = await _load(session, call, data, decide=False)
     if request is None:
         return
+    await call.answer("Открываю заявку…")
     ctx: AppContext = data["ctx"]
-    fragment = await moderation.safe_card_fragment(ctx, session, request)
-    await call.answer()
     assert call.message is not None
-    sent = await call.message.answer(
-        fragment.text,
-        entities=fragment.to_entities(),
-        parse_mode=None,
-        reply_markup=moderation.card_keyboard(request),
-        link_preview_options=moderation.NO_PREVIEW,
-    )
+    fragment = await moderation.safe_card_fragment(ctx, session, request, link_timeout=6)
+    try:
+        sent = await moderation.send_card(
+            data["bot"], call.message.chat.id, None, fragment, moderation.card_keyboard(request)
+        )
+    except TelegramAPIError as exc:
+        await call.message.answer(f"Не удалось показать заявку #{request.id}: {h(str(exc))[:300]}")
+        return
     session.add(
         moderation.ModerationCard(
             ref_type="request", ref_id=request.id, chat_id=sent.chat.id, message_id=sent.message_id
         )
     )
+    await session.commit()
+    if not await moderation.in_group(session, request.id) and await moderation.post_card(
+        ctx, request.id, group_only=True
+    ):
+        await call.message.answer(f"📤 Заявка #{request.id} отправлена и в группу модерации.")

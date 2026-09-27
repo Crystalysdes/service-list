@@ -90,3 +90,10 @@ def test_map_links_and_strip():
 def test_without_auto_detected():
     frag = Fragment("#tag x", (Entity("hashtag", 0, 4), Entity("bold", 5, 1)))
     assert [e.type for e in frag.without_auto().entities] == ["bold"]
+
+
+def test_a_link_without_an_address_is_plain_text():
+    from app.domain.richtext import RichText
+
+    fragment = RichText().link("Crystalys", "", "bold").build()
+    assert fragment.text == "Crystalys" and [e.type for e in fragment.entities] == ["bold"]

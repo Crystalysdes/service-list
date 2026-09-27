@@ -300,6 +300,8 @@ class RichText:
     def link(self, value: str, url: str, *styles: str) -> RichText:
         if not value:
             return self
+        if not url:  # a link without an address is refused by Telegram: the text alone
+            return self.text(value, *styles)
         start = self._length
         self.text(value, *styles)
         self._entities.append(Entity("text_link", start, self._length - start, url=url))

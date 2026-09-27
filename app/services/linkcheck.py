@@ -317,10 +317,10 @@ class LinkChecker:
         # HEAD is often refused or answered wrongly: GET decides
         return http_verdict(await self.fetcher.fetch(url, "GET"))
 
-    async def quick_verdict(self, url: str) -> str:
-        """For moderation cards: one check with a short overall timeout."""
+    async def quick_verdict(self, url: str, limit: float = 15) -> str:
+        """For moderation cards: one check with a short overall timeout (``limit``, seconds)."""
         try:
-            verdict = await asyncio.wait_for(self.check(url), 15)
+            verdict = await asyncio.wait_for(self.check(url), limit)
         except TimeoutError:
             return UNKNOWN
         return verdict.usable

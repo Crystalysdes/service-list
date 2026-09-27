@@ -354,3 +354,47 @@ async def test_a_card_that_cannot_be_built_still_reaches_the_moderators(h, tg, d
     await _submit(h, tg, name="Four", url="@four_service")
     card = h.last(GROUP)
     assert "Новая заявка" in card["text"] and "Four" in card["text"] and h.button(card, "Одобрить")
+
+
+async def test_a_request_the_group_never_got_reaches_it_later(h, tg, db, ctx):
+    """The owner opens a request from /admin → 📥 Заявки: the card comes at once, and it goes to the
+    moderation group too when it never got there; a request nobody got a card of is posted again by itself."""
+    from datetime import timedelta
+
+    from app.db.models import ModerationCard
+    from app.services import moderation
+
+    await _setup(tg, db, ctx)
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    tg.inject("sendMessage", 400, "Bad Request: chat not found", chat_id=GROUP)
+    await _submit(h, tg, name="Lost", url="@lost_service")  # the group refused: it went to the owner
+    assert not [m for m in tg.bot_messages(GROUP) if "Lost" in m.get("text", "")]
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Заявки")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Lost")
+    assert "Открываю заявку" in tg.called("answerCallbackQuery")[-1]["text"]
+    card = next(m for m in reversed(tg.bot_messages(OWNER_ID)) if "Новая заявка" in m.get("text", ""))
+    assert "Lost" in card["text"] and h.button(card, "Одобрить")
+    assert "отправлена и в группу модерации" in h.last(OWNER_ID)["text"]
+    [in_group] = [m for m in tg.bot_messages(GROUP) if "Lost" in m.get("text", "")]
+    assert h.button(in_group, "Одобрить")
+
+    async with db.session() as s:  # a request whose card never reached anyone (the bot stopped midway)
+        request = (
+            (await s.execute(select(ModerationRequest).order_by(ModerationRequest.id))).scalars().first()
+        )
+        await s.execute(ModerationCard.__table__.delete())
+        await s.commit()
+    assert await moderation.repost_missing(ctx) == 0  # not before two minutes
+    assert await moderation.repost_missing(ctx, now=utcnow() + timedelta(minutes=3)) == 1
+    assert "Lost" in h.last(GROUP)["text"]
+    assert await moderation.repost_missing(ctx, now=utcnow() + timedelta(minutes=3)) == 0  # once
+    assert request is not None
+
+
+async def test_a_card_with_formatting_telegram_refuses_goes_as_plain_text(h, tg, db, ctx):
+    await _setup(tg, db, ctx)
+    tg.inject("sendMessage", 400, "Bad Request: can't parse entities: wrong URL host", chat_id=GROUP)
+    await _submit(h, tg, name="Plain", url="@plain_service")
+    card = h.last(GROUP)
+    assert "Plain" in card["text"] and not card.get("entities") and h.button(card, "Одобрить")
