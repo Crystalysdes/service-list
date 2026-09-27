@@ -20,11 +20,11 @@ lang:
   choose: "🌐 Выберите язык / Choose your language"
   set: "Language: English 🇬🇧"
 menu:
-  title: "<b>📋 Service List</b>\nTrusted services in one place.\n\n<b>What you can do:</b>\n➕ <b>Add service</b> — list your service\n🗂 <b>My services</b> — requests, payment, renewal\n🚫 <b>Scam list</b> — services caught scamming\n⚠️ <b>Report service</b> — report a scammer"
+  title: "<b>📋 Service List</b>\nTrusted services in one place."
+  hint: "\n\n👇 Pick what you need below. How it all works — in «ℹ️ Help»."
   service_list: "📋 Service List"
   chat: "💬 Chat"
   garant: "🛡 Auto-garant"
-  garant_line: "\n🛡 <b>Auto-garant</b> — a deal through the escrow: the money is held until both sides confirm"
   add_service: "➕ Add service"
   my_services: "🗂 My services"
   scam_list: "🚫 Scam list"
@@ -33,11 +33,11 @@ menu:
   help: "ℹ️ Help"
   channel_not_ready: "The channel is not connected yet, please check back later."
   refresh: "🔄"
-  links_note: "\n\n🔐 The channel and chat links are personal and valid for {ttl}. Expired? Tap 🔄 or /start."
+  links_note: "\n\n🔐 The channel and chat links are personal and live {ttl}. Expired — 🔄 or /start."
   links_fresh: "🔄 New links — valid for {ttl}"
   links_failed: "Could not issue a link — please try again in a minute."
 help:
-  text: "<b>How it works</b>\n\n➕ <b>Add service</b> — describe your service and send its link. After a moderator approves it, the bot sends an invoice; once paid, the service appears in its branch of the channel.\n\n🗂 <b>My services</b> — your services: top 1/2/3, a premium emoji before the name, a name made of animated emoji, renewals and stats.\n\n⚠️ <b>Report service</b> — report a service (screenshots and a detailed description are required).\n\n🚫 <b>Scam list</b> — services found to be scams."
+  text: "<b>How it works</b>\n\n➕ <b>Add service</b> — describe your service and send its link. After a moderator approves it, the bot sends an invoice; once paid, the service appears in its branch of the channel.\n\n🗂 <b>My services</b> — your services: top 1/2/3, a premium emoji before the name, a name made of animated emoji, renewals and stats.\n\n⚠️ <b>Report service</b> — report a service (screenshots and a detailed description are required).\n\n🚫 <b>Scam list</b> — services found to be scams.\n\n🛡 <b>Auto-garant</b> — a deal through the escrow: the money is held until both sides confirm."
 news:
   title: "🆕 New service in «{category}»"
   open: "🔗 Open"

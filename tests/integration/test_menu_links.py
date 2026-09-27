@@ -75,7 +75,7 @@ async def test_a_private_channel_gives_each_person_a_link_of_their_own(h, tg, db
     assert h.button(ann, "🔄")["callback_data"] == "m:links"
     assert _url(h, ann, "Service List").startswith("https://t.me/+inv")
     assert _url(h, ann, "Service List") != _url(h, bob, "Service List")
-    assert "личные и действуют 1 мин" in ann["text"]
+    assert ann["text"].endswith("🔐 Ссылки на канал и чат личные и живут 1 мин. Истекли — 🔄 или /start.")
     made = tg.called("createChatInviteLink")
     assert [p["name"] for p in made] == [f"u{ANN}", f"u{BOB}"]
     assert all(p["chat_id"] == PRIVATE and p["member_limit"] == 1 for p in made)

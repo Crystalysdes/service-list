@@ -23,7 +23,7 @@ from app.domain.symbols import channel_url
 from app.services.channels import INACTIVE_STATUSES
 from app.services.invites import Link, MenuLinks, menu_links, ttl_text
 from app.services.media import edit_to_stored, send_stored
-from app.services.settings import Captcha, Escrow, MenuMedia, get_settings
+from app.services.settings import Captcha, MenuMedia, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -186,12 +186,11 @@ def menu_keyboard(t: Translator, links: MenuLinks, scam_url: str | None) -> Inli
 async def menu_parts(
     session: AsyncSession, t: Translator, links: MenuLinks
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """The menu text and keyboard as they are right now (personal links, chat, whether deals are on)."""
+    """The menu: the title and one short line (how long the personal links live, or where to read more);
+    what every button does is in ℹ️ Помощь."""
     _main_url, scam_url = await channel_links(session)
-    garant = (await get_settings(session, Escrow)).enabled
-    text = t("menu.title") + (t("menu.garant_line") if garant else "")
-    if links.personal:
-        text += t("menu.links_note", ttl=ttl_text(links.ttl, t.lang))
+    text = t("menu.title")
+    text += t("menu.links_note", ttl=ttl_text(links.ttl, t.lang)) if links.personal else t("menu.hint")
     return text, menu_keyboard(t, links, scam_url)
 
 

@@ -116,7 +116,7 @@ async def test_menu_has_the_chat_next_to_the_garant(h, tg, db, ctx):
     await h.say(USER, "/menu")
     menu = h.last(USER)
     rows = menu["reply_markup"]["inline_keyboard"]
-    assert rows[1][1]["url"] == "https://t.me/servicelist_chat" and "Auto-garant" in menu["text"]
+    assert rows[1][1]["url"] == "https://t.me/servicelist_chat"
 
 
 async def test_category_posts_link_to_the_garant_while_it_takes_deals(h, tg, db, ctx):

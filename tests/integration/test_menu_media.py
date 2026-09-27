@@ -49,7 +49,10 @@ async def test_text_menu_layout_and_structure(h, tg, db):
     await _ready_user(tg, db)
     await h.say(USER, "/menu")
     menu = h.last(USER)
-    assert menu["text"].startswith("📋 Service List") and "Что здесь можно" in menu["text"]
+    assert menu["text"] == (  # the title and one short line: what the buttons do is in Help
+        "📋 Service List\nПроверенные сервисы в одном месте.\n\n"
+        "👇 Выберите нужное ниже. Как всё устроено — в «ℹ️ Помощь»."
+    )
     assert _rows(menu) == [1, 1, 2, 2, 2]
     texts = [b["text"] for b in h.buttons(menu)]
     assert texts == [
@@ -79,7 +82,7 @@ async def test_admin_sets_a_menu_video_and_users_see_it(h, tg, db, ctx):
     await _ready_user(tg, db)
     await h.say(USER, "/menu")
     menu = h.last(USER)
-    assert menu["video"]["file_id"] == "vid1" and "Что здесь можно" in menu["caption"]
+    assert menu["video"]["file_id"] == "vid1" and "Проверенные сервисы" in menu["caption"]
 
     # a text screen cannot be made from a video: the menu is replaced, and "🏠 Меню" brings the video back
     await h.press(USER, menu, "Помощь")
@@ -105,7 +108,7 @@ async def test_admin_sets_a_menu_video_and_users_see_it(h, tg, db, ctx):
     assert "Выберите язык" in choose["text"]
     await h.press(USER, choose, "English")
     menu = tg.messages[USER][choose["message_id"]]
-    assert menu["video"]["file_id"] == "vid1" and "What you can do" in menu["caption"]
+    assert menu["video"]["file_id"] == "vid1" and "Trusted services in one place" in menu["caption"]
 
 
 async def test_menu_video_survives_a_bot_change_and_can_be_removed(h, tg, db, ctx):
@@ -130,7 +133,7 @@ async def test_menu_video_survives_a_bot_change_and_can_be_removed(h, tg, db, ct
     await h.press(OWNER_ID, h.last(OWNER_ID), "Заставка меню")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Убрать заставку")
     await h.say(USER, "/menu")
-    assert "Что здесь можно" in h.last(USER)["text"]
+    assert "Проверенные сервисы" in h.last(USER)["text"]
 
 
 async def test_menu_rejects_other_files_and_accepts_a_video_sent_as_file(h, tg, db, ctx):
