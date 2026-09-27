@@ -26,6 +26,7 @@ from app.services.notify import claim_notification, close_alert, notify_staff, r
 from app.services.settings import Runtime, get_settings
 from app.services.sync import manual as kept_edits
 from app.services.sync.engine import OWNER_RANK, request_nav_move
+from app.services.sync.foreign import OWN_POSTS, remember_album, remember_pin
 
 router = Router(name="channel_events")
 
@@ -87,8 +88,14 @@ async def _owned(session: AsyncSession, channel_id: int, message_id: int) -> boo
 @router.channel_post()
 async def on_channel_post(message: Message, session: AsyncSession, **data: Any) -> None:
     if message.content_type in SERVICE_TYPES:  # a pin and the like is not a post after the navigation
+        if message.pinned_message is not None:  # an admin's pinned post keeps its pin when it is moved
+            await remember_pin(session, message.chat.id, message.pinned_message.message_id)
         return
+    if message.media_group_id:  # an album is moved as one (a forward of one photo does not tell)
+        await remember_album(session, message.chat.id, message.message_id, message.media_group_id)
     await asyncio.sleep(OWN_POST_GRACE)
+    if message.message_id in data["ctx"].services.get(OWN_POSTS, set()):  # a copy the bot just made
+        return
     channel = await _channel(session, message.chat.id)
     if channel is None or channel.role not in ("main", "mirror") or channel.status == "retired":
         return

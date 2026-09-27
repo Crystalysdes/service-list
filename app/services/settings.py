@@ -148,6 +148,21 @@ class Announce(SettingsGroup):
     new_services: bool = True
 
 
+class ChannelLayout(SettingsGroup):
+    """The admins' own posts (ads) below the main channel's last category when a new one comes: moved below
+    it (app/services/sync/foreign.py)."""
+
+    KEY: ClassVar[str] = "channel_layout"
+
+    move_foreign: bool = True  # copied under the new category, the originals deleted
+    tidy: bool = False  # an admin asked: the posts between the categories go below them (on the next pass)
+    # channel chat id → the admins' posts the bot saw being pinned, newest last (a copy is pinned again)
+    pins: dict[str, list[int]] = Field(default_factory=dict)
+    # channel chat id → {message id: album id} of the admins' albums (a forward of one photo does not tell)
+    albums: dict[str, dict[str, str]] = Field(default_factory=dict)
+    move: dict[str, Any] = Field(default_factory=dict)  # the move under way, step by step (after a restart)
+
+
 class Chats(SettingsGroup):
     KEY: ClassVar[str] = "chats"
 

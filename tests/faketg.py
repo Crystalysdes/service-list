@@ -157,8 +157,12 @@ class FakeTelegram:
         caption: str | None = None,
         caption_entities: list[dict] | None = None,
         service: bool = False,
+        forwarded_from: dict[str, Any] | None = None,
+        reply_markup: dict[str, Any] | None = None,
+        media_group_id: str | None = None,
     ) -> dict[str, Any]:
-        """A post created by a human admin in a channel."""
+        """A post created by a human admin in a channel (``forwarded_from``: a channel's public chat it was
+        forwarded from; ``media_group_id``: part of an album)."""
         chat = self.public_chat(chat_id)
         mid = self._new_id(chat_id)
         msg: dict[str, Any] = {
@@ -167,6 +171,17 @@ class FakeTelegram:
             "chat": chat,
             "sender_chat": chat,
         }
+        if forwarded_from is not None:
+            msg["forward_origin"] = {
+                "type": "channel",
+                "chat": forwarded_from,
+                "message_id": 1,
+                "date": (date or self.clock) - 60,
+            }
+        if reply_markup is not None:
+            msg["reply_markup"] = reply_markup
+        if media_group_id is not None:
+            msg["media_group_id"] = media_group_id
         if service:
             msg["new_chat_title"] = chat.get("title", "")
         elif photo:
@@ -545,7 +560,11 @@ class FakeTelegram:
         ):
             if key in source:
                 msg[key] = json.loads(json.dumps(source[key]))
-        if source_chat["type"] == "channel":
+        if "reply_markup" in source:  # link buttons stay on a forward
+            msg["reply_markup"] = json.loads(json.dumps(source["reply_markup"]))
+        if "forward_origin" in source:  # a forward of a forward shows where it came from first
+            msg["forward_origin"] = json.loads(json.dumps(source["forward_origin"]))
+        elif source_chat["type"] == "channel":
             msg["forward_origin"] = {
                 "type": "channel",
                 "chat": self.public_chat(source_chat["id"]),
@@ -563,9 +582,31 @@ class FakeTelegram:
 
     def m_copyMessage(self, params: dict, files: dict) -> dict:
         forwarded = self.m_forwardMessage(params, files)
-        stored = self.messages[int(params["chat_id"])][forwarded["message_id"]]
+        stored = self.messages[self._chat(params["chat_id"])["id"]][forwarded["message_id"]]
         stored.pop("forward_origin", None)
+        stored.pop("reply_markup", None)
+        if params.get("reply_markup"):
+            stored["reply_markup"] = params["reply_markup"]
         return {"message_id": forwarded["message_id"]}
+
+    def _album(self, method: Any, params: dict, files: dict) -> list[dict]:
+        ids = params["message_ids"]
+        if isinstance(ids, str):
+            ids = json.loads(ids)
+        group = f"mg{self._new_id(-777)}"
+        result = []
+        for mid in ids:
+            one = method({**params, "message_id": mid}, files)
+            stored = self.messages[self._chat(params["chat_id"])["id"]][one["message_id"]]
+            stored["media_group_id"] = group
+            result.append({"message_id": one["message_id"]})
+        return result
+
+    def m_copyMessages(self, params: dict, files: dict) -> list[dict]:
+        return self._album(self.m_copyMessage, params, files)
+
+    def m_forwardMessages(self, params: dict, files: dict) -> list[dict]:
+        return self._album(self.m_forwardMessage, params, files)
 
     def m_pinChatMessage(self, params: dict, files: dict) -> bool:
         chat = self._chat(params["chat_id"])

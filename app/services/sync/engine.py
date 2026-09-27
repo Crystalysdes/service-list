@@ -36,9 +36,9 @@ from app.domain.symbols import channel_post_base
 from app.services import render_db
 from app.services.media import send_stored
 from app.services.notify import claim_notification, notify_staff
-from app.services.settings import Chats, Runtime, get_settings, update_settings
+from app.services.settings import ChannelLayout, Chats, Runtime, get_settings, update_settings
+from app.services.sync import foreign, own_links
 from app.services.sync import manual as kept_edits
-from app.services.sync import own_links
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +285,8 @@ class SyncEngine:
         for row_id in removed:
             await self._remove_row(row_id, limiter)
         await self._recover_orphans(channel_id, limiter)
+        await self._finish_move(channel_id, limiter)  # a move of the admins' posts cut off by a restart
+        await self._tidy(channel_id, limiter, result)
         await self._check_nav_alive(channel_id, limiter)
         await self._assign_new_blocks(channel_id, desired, limiter, result)
         await self._place_nav(channel_id, limiter, result)
@@ -313,7 +315,15 @@ class SyncEngine:
                 block = await self._render(session, channel_id, kind, block_id)
                 if block is None:
                     continue
-                if block.media is None:
+                text_block = block.media is None
+            # the admins' posts under the last block go below it first (sync/foreign.py)
+            if text_block and await self._place_under_last(channel_id, kind, block_id, limiter, result):
+                continue
+            async with self.ctx.db.session() as session:
+                row = await self._row(session, channel_id, kind, block_id)
+                if row is None or row.message_id:
+                    continue
+                if text_block:
                     donor = await self._first_spare(session, channel_id)
                     if donor is not None:
                         row.message_id = donor.message_id
@@ -334,6 +344,294 @@ class SyncEngine:
             need_nav = nav is not None and not nav.message_id
         if need_nav:
             await self._send_new(channel_id, "nav", 0, limiter, result)
+
+    async def _move_setup(self, channel_id: int, result: PassResult) -> dict[str, Any] | None:
+        """What a move of the admins' posts needs (the main channel, the storage channel to read posts
+        through, the bot's blocks and messages); None when it cannot be done now."""
+        bot = self.ctx.bot
+        async with self.ctx.db.session() as session:
+            channel = await session.get(Channel, channel_id)
+            layout = await get_settings(session, ChannelLayout)
+            storage = (await get_settings(session, Chats)).storage_chat_id
+            if bot is None or channel is None or channel.role != "main":
+                return None
+            rows = list(
+                (
+                    await session.execute(select(ChannelPost).where(ChannelPost.channel_id == channel_id))
+                ).scalars()
+            )
+        nav = next((r for r in rows if r.kind == "nav"), None)
+        blocks = sorted(r.message_id for r in rows if r.kind in ("static", "category") and r.message_id)
+        if nav is None or not nav.message_id or not blocks:
+            return None
+        if not storage:  # the admins' posts cannot be read without it
+            if nav.message_id > blocks[-1] + 1:
+                await self._alert_once(
+                    f"nostorage:{channel_id}",
+                    "📦 Чтобы новая категория вставала сразу за последней (над рекламой), боту нужен "
+                    "служебный канал: /admin → 📡 Каналы → 🗄 Служебный канал. Пока новые категории "
+                    "встают в конец.",
+                )
+            return None
+        owned = {r.message_id for r in rows if r.message_id} | {
+            m for r in rows for m in (r.extra_message_ids or [])
+        }
+        return {
+            "chat_id": channel.chat_id,
+            "storage": storage,
+            "layout": layout,
+            "blocks": blocks,
+            "owned": owned,
+        }
+
+    async def _scan_foreign(
+        self, setup: dict[str, Any], start: int, limiter: RateLimiter, result: PassResult
+    ) -> list[dict[str, Any]] | None:
+        """The admins' posts from ``start`` on (None: they cannot be read now; the owner is told why)."""
+        chat_id, layout, owned = setup["chat_id"], setup["layout"], setup["owned"]
+        top = max(owned | {int(m) for m in layout.pins.get(str(chat_id), [])})
+        try:
+            return await foreign.scan(
+                self.ctx.bot,  # type: ignore[arg-type]
+                chat_id,
+                setup["storage"],
+                start,
+                top,
+                owned,
+                limiter,
+                layout.albums.get(str(chat_id)),
+            )
+        except TelegramAPIError as exc:  # the storage channel is gone, or Telegram does not answer
+            result.errors.append(f"scan: {exc.message}")
+        except foreign.Protected:
+            await self._alert_once(
+                f"protected:{chat_id}",
+                "📦 В канале включена защита от копирования, поэтому бот не может перенести рекламу под "
+                "новую категорию: она встанет в конец. Выключите «Запретить копирование», чтобы перенос "
+                "работал.",
+            )
+        return None
+
+    async def _place_under_last(
+        self, channel_id: int, kind: str, block_id: int, limiter: RateLimiter, result: PassResult
+    ) -> bool:
+        """A new text block of the main channel comes right under the last block even when the admins posted
+        there (ads): their posts are copied below first, the block takes the bot's first message under the
+        last block (a leftover, or the navigation's, published anew below the copies), the originals go.
+        False: nothing of theirs is there, or moving is off: the usual way."""
+        setup = await self._move_setup(channel_id, result)
+        if setup is None or not setup["layout"].move_foreign:
+            return False
+        layout, last = setup["layout"], setup["blocks"][-1]
+        move = layout.move if layout.move.get("key") == [channel_id, kind, block_id] else None
+        if move is None:
+            items = await self._scan_foreign(setup, last + 1, limiter, result)
+            if not items:
+                return False
+            if len(items) > foreign.MAX_ITEMS:
+                async with self.ctx.db.session() as session:
+                    title = await self._block_title(session, kind, block_id)
+                await self._alert_once(
+                    f"toomany:{channel_id}:{last}",
+                    f"📦 Под последней категорией {len(items)} чужих постов — слишком много, чтобы "
+                    f"переносить их автоматически: новая категория «{h(title)}» встанет в конец.",
+                )
+                return False
+            move = {"key": [channel_id, kind, block_id], "last": last, "items": items, "stage": "copying"}
+            await self._save_move(move)
+        await self._run_move(channel_id, move, (kind, block_id), limiter, result)
+        return True
+
+    async def _tidy(self, channel_id: int, limiter: RateLimiter, result: PassResult) -> None:
+        """«📦 Поднять категории над рекламой»: the admins' posts between the bot's blocks go below the last
+        one, so the blocks are together again (a move cut off by a restart goes on here too)."""
+        async with self.ctx.db.session() as session:
+            layout = await get_settings(session, ChannelLayout)
+        key = [channel_id, "tidy", 0]
+        if layout.move.get("key") == key and layout.move.get("stage") == "copying":
+            await self._run_move(channel_id, layout.move, None, limiter, result)
+            return
+        if not layout.tidy or layout.move:
+            return
+        async with self.ctx.db.session() as session:
+            await update_settings(session, ChannelLayout, tidy=False)
+            await session.commit()
+        setup = await self._move_setup(channel_id, result)
+        if setup is None:
+            return
+        blocks = setup["blocks"]
+        items = await self._scan_foreign(setup, blocks[0] + 1, limiter, result)
+        if items is None:
+            return
+        between = [i for i in items if i["ids"][0] < blocks[-1]]
+        if not between:
+            await self._alert_once(
+                f"tidy_none:{channel_id}:{blocks[-1]}",
+                "📦 Категории и так идут подряд — между ними нет чужих постов.",
+            )
+            return
+        after = max(b for b in blocks if b < between[0]["ids"][0])
+        chosen = [i for i in items if i["ids"][0] > after]  # the later ones too: their order stays
+        if len(chosen) > foreign.MAX_ITEMS:
+            await self._alert_once(
+                f"toomany_tidy:{channel_id}:{after}",
+                f"📦 Между категориями и под ними {len(chosen)} чужих постов — слишком много, чтобы "
+                "переносить их автоматически.",
+            )
+            return
+        move = {"key": key, "last": after, "items": chosen, "stage": "copying"}
+        await self._save_move(move)
+        await self._run_move(channel_id, move, None, limiter, result)
+
+    async def _run_move(
+        self,
+        channel_id: int,
+        move: dict[str, Any],
+        place: tuple[str, int] | None,
+        limiter: RateLimiter,
+        result: PassResult,
+    ) -> None:
+        """Copies of the admins' posts at the bottom (resumed where a failure stopped them), then the block
+        (``place``) right under the last one and the navigation below the copies, then the originals go."""
+        bot = self.ctx.bot
+        async with self.ctx.db.session() as session:
+            channel = await session.get(Channel, channel_id)
+        if bot is None or channel is None:
+            return
+        chat_id = channel.chat_id
+        own_posts = self.ctx.services.setdefault(foreign.OWN_POSTS, set())
+        for item in move["items"]:  # 1. the copies, below everything
+            if item["copies"] or item.get("skipped"):
+                continue
+            try:
+                item["copies"] = await foreign.copy(bot, chat_id, item, limiter)
+            except TelegramBadRequest as exc:  # this post cannot be copied (a poll, paid media): forwarded,
+                if item["forward"]:  # or, when that fails too, left where it is
+                    item["skipped"] = exc.message[:200]
+                else:
+                    item["forward"] = True
+                    try:
+                        item["copies"] = await foreign.copy(bot, chat_id, item, limiter)
+                    except TelegramBadRequest as again:
+                        item["skipped"] = again.message[:200]
+                    except TelegramAPIError as again:
+                        result.errors.append(f"move: {again.message}")
+                        await self._save_move(move)
+                        return
+            except TelegramAPIError as exc:  # Telegram did not answer: the next pass goes on from here
+                result.errors.append(f"move: {exc.message}")
+                await self._save_move(move)
+                return
+            own_posts.update(item["copies"])
+            if len(own_posts) > 2000:
+                for old_id in sorted(own_posts)[:1000]:
+                    own_posts.discard(old_id)
+            await self._save_move(move)
+        took = False
+        if place is not None:  # 2. the block right under the last block
+            async with self.ctx.db.session() as session:
+                row = await self._row(session, channel_id, *place)
+                donor = (
+                    await session.execute(
+                        select(ChannelPost)
+                        .where(
+                            ChannelPost.channel_id == channel_id,
+                            ChannelPost.kind.in_(LEFTOVERS),
+                            ChannelPost.message_id > move["last"],
+                        )
+                        .order_by(ChannelPost.message_id)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if row is not None and not row.message_id and donor is not None:
+                    row.message_id = donor.message_id
+                    row.pinned = donor.pinned
+                    row.sent_hash = None
+                    row.state = "ok"
+                    await session.delete(donor)
+                    await session.commit()
+                    took = True
+        if place is None or took:  # the navigation goes below the copies (its old message is retired)
+            await self._move_nav_down(channel_id, limiter, result)
+        elif not await self._move_nav_down(channel_id, limiter, result, give_to=place):
+            return  # the navigation could not be sent: tried again on the next pass
+        move["stage"] = "placed"
+        await self._save_move(move)
+        await self._finish_move(channel_id, limiter)
+
+    async def _finish_move(self, channel_id: int, limiter: RateLimiter) -> None:
+        """Once the copies are there and the block is placed, the originals that have their copies are
+        deleted, the pins follow, the admin is told. Also on the pass after a restart between the two."""
+        bot = self.ctx.bot
+        async with self.ctx.db.session() as session:
+            move = (await get_settings(session, ChannelLayout)).move
+            channel = await session.get(Channel, channel_id)
+            if (
+                bot is None
+                or channel is None
+                or not move
+                or move["key"][0] != channel_id
+                or move.get("stage") != "placed"
+            ):
+                return
+            _cid, kind, block_id = move["key"]
+            chat_id, base = channel.chat_id, channel_post_base(channel.chat_id, channel.username)
+            title = await self._block_title(session, kind, block_id)
+        kept: list[int] = []
+        for item in move["items"]:
+            if item["deleted"] or not item["copies"]:
+                continue
+            kept += await foreign.delete(bot, chat_id, item["ids"], limiter)
+            item["deleted"] = True
+            await self._save_move(move)
+        top_pin = None
+        with contextlib.suppress(TelegramAPIError):
+            chat = await bot.get_chat(chat_id)
+            top_pin = chat.pinned_message.message_id if chat.pinned_message else None
+        async with self.ctx.db.session() as session:
+            pinned = await foreign.pin_copies(bot, session, chat_id, move["items"], top_pin)
+        await self._save_move({})
+        moved = sum(len(item["ids"]) for item in move["items"] if item["copies"])
+        left = [m for item in move["items"] if item.get("skipped") for m in item["ids"]]
+        if kind == "tidy":
+            text = (
+                f"📦 Категории снова идут подряд: чужие посты между ними (реклама, {moved} шт.) "
+                "перенесены ниже — бот опубликовал их копии и удалил старые. Просмотры и реакции у копий "
+                "начинаются с нуля."
+            )
+        else:
+            text = (
+                f"📦 Новая категория «{h(title)}» встала сразу под последней категорией. Посты под ней "
+                f"(реклама, {moved} шт.) перенесены ниже: бот опубликовал их копии и удалил старые. "
+                "Просмотры и реакции у копий начинаются с нуля."
+            )
+        if pinned:
+            text += "\n📌 Закрепы перенесены на копии: " + ", ".join(
+                f'<a href="{base}{m}">{m}</a>' for m in pinned
+            )
+        if left:
+            text += "\n⚠️ Эти посты Telegram не даёт скопировать — они остались на месте: " + ", ".join(
+                f'<a href="{base}{m}">{m}</a>' for m in left
+            )
+        if kept:
+            text += (
+                "\n⚠️ Эти старые посты Telegram не даёт боту удалить (им больше 48 часов) — удалите их "
+                "вручную, копии уже на месте: " + ", ".join(f'<a href="{base}{m}">{m}</a>' for m in kept)
+            )
+        await self._alert_once(f"moved:{chat_id}:{kind}:{block_id}:{move['last']}", text)
+
+    async def _save_move(self, move: dict[str, Any]) -> None:
+        async with self.ctx.db.session() as session:
+            await update_settings(session, ChannelLayout, move=move)
+            await session.commit()
+
+    async def _block_title(self, session: AsyncSession, kind: str, block_id: int) -> str:
+        if kind == "category":
+            from app.db.models import Category
+
+            category = await session.get(Category, block_id)
+            return category.title if category is not None else "?"
+        return "пост"
 
     async def _one_owner_per_message(self, channel_id: int) -> None:
         """Every message of the channel belongs to one row, whatever a crash, a race or an older version left.

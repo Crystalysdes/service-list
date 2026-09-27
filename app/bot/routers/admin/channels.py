@@ -37,7 +37,15 @@ from app.services.channels import (
     request_chat_keyboard,
     save_channel,
 )
-from app.services.settings import Chats, Limits, Runtime, get_settings, save_settings
+from app.services.settings import (
+    ChannelLayout,
+    Chats,
+    Limits,
+    Runtime,
+    get_settings,
+    save_settings,
+    update_settings,
+)
 from app.services.sync.engine import KEPT, nav_move_requested, request_nav_move
 
 router = Router(name="admin_channels")
@@ -125,6 +133,15 @@ async def nav_lines(session: AsyncSession, channel: Channel) -> list[str]:
         else:
             place = "⚠️ ниже есть посты бота — нажмите «⬇️ Навигацию вниз заново»"
         lines = [f'🧭 <b>Навигация:</b> <a href="{base}{nav.message_id}">пост {nav.message_id}</a> — {place}']
+    moving = (await get_settings(session, ChannelLayout)).move_foreign
+    lines.append(
+        "📦 <b>Реклама под новыми категориями:</b> "
+        + (
+            "переносится ниже — новая категория встаёт сразу за последней"
+            if moving
+            else "остаётся на месте — новая категория встаёт в конец"
+        )
+    )
     kept = [r.message_id for r in rows if r.kind == "spare" and r.state == KEPT and r.message_id]
     if kept:
         links = ", ".join(f'<a href="{base}{m}">{m}</a>' for m in sorted(kept)[:15])
@@ -135,12 +152,17 @@ async def nav_lines(session: AsyncSession, channel: Channel) -> list[str]:
     return lines
 
 
-def channels_keyboard(has_main: bool, has_scam: bool) -> Any:
+def channels_keyboard(has_main: bool, has_scam: bool, move_foreign: bool = True) -> Any:
     builder = InlineKeyboardBuilder()
     if not has_main:
         builder.button(text="➕ Основной канал", callback_data="a:ch:add:main")
     else:
         builder.button(text="⬇️ Навигацию вниз заново", callback_data="a:ch:navdown")
+        builder.button(
+            text="📦 Не переносить рекламу" if move_foreign else "📦 Переносить рекламу под категории",
+            callback_data="a:ch:movead",
+        )
+        builder.button(text="📦 Поднять категории над рекламой", callback_data="a:ch:tidy")
     if not has_scam:
         builder.button(text="➕ Канал Scam list", callback_data="a:ch:add:scam")
     builder.button(text="➕ Зеркало", callback_data="a:ch:add:mirror")
@@ -154,7 +176,44 @@ def channels_keyboard(has_main: bool, has_scam: bool) -> Any:
 
 async def _channels_screen(session: AsyncSession) -> tuple[str, Any]:
     roles = {c.role for c in await active_channels(session, ("main", "scam"))}
-    return await channels_text(session), channels_keyboard("main" in roles, "scam" in roles)
+    moving = (await get_settings(session, ChannelLayout)).move_foreign
+    return await channels_text(session), channels_keyboard("main" in roles, "scam" in roles, moving)
+
+
+@router.callback_query(F.data == "a:ch:tidy")
+async def on_tidy(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """Once: the admins' posts that ended up between the categories go below the last one."""
+    if (await get_settings(session, ChannelLayout)).move:
+        await call.answer("Бот уже переносит посты — итог придёт сюда.", show_alert=True)
+        return
+    await update_settings(session, ChannelLayout, tidy=True)
+    await audit(session, data["user"].id, "channel.tidy")
+    await session.commit()
+    request_sync(data["ctx"])
+    await call.answer(
+        "Бот перенесёт чужие посты, оказавшиеся между категориями (рекламу), под последнюю категорию: "
+        "опубликует их копии и удалит старые. Это займёт минуту-две, итог придёт сюда.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data == "a:ch:movead")
+async def on_move_foreign(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """Whether the admins' posts under the last category are moved below a new category."""
+    layout = await get_settings(session, ChannelLayout)
+    await update_settings(session, ChannelLayout, move_foreign=not layout.move_foreign)
+    await audit(session, data["user"].id, "channel.move_foreign", data={"enabled": not layout.move_foreign})
+    await session.commit()
+    await call.answer(
+        "Реклама под новыми категориями больше не переносится"
+        if layout.move_foreign
+        else "Теперь реклама переносится под новую категорию",
+        show_alert=True,
+    )
+    text, markup = await _channels_screen(session)
+    assert call.message is not None
+    with contextlib.suppress(TelegramBadRequest):
+        await call.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
 
 
 @router.callback_query(F.data == "a:ch")
