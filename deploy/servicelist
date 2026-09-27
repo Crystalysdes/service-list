@@ -20,8 +20,11 @@ SL_LOCK="${SL_LOCK:-/run/lock/servicelist-deploy.lock}"
 DEFAULT_BRANCH="claude/amazing-pasteur-j0islp"
 KEY_COMMENT="github-actions-deploy"
 ENV_FILE="$SL_DIR/.env"
-MANAGED_KEYS=(BOT_TOKEN OWNER_IDS POSTGRES_PASSWORD CRYPTOPAY_TOKEN CRYPTOPAY_TESTNET ESCROW_CRYPTOPAY_TOKEN
-    ESCROW_CRYPTOPAY_TESTNET TIMEZONE BACKUP_PASSPHRASE BACKUP_PASSPHRASE_OLD LOG_LEVEL)
+# written by "servicelist config"; the garant's retired Crypto Pay keys are listed so a rewrite drops them
+MANAGED_KEYS=(BOT_TOKEN OWNER_IDS POSTGRES_PASSWORD CRYPTOPAY_TOKEN CRYPTOPAY_TESTNET ESCROW_APIRONE_ACCOUNT
+    ESCROW_APIRONE_TRANSFER_KEY ESCROW_CRYPTOPAY_TOKEN ESCROW_CRYPTOPAY_TESTNET TIMEZONE BACKUP_PASSPHRASE
+    BACKUP_PASSPHRASE_OLD LOG_LEVEL)
+APIRONE="${SL_APIRONE:-https://apirone.com/api}"
 
 if [[ -t 1 ]]; then
     B=$'\033[1m' G=$'\033[32m' Y=$'\033[33m' R=$'\033[31m' C=$'\033[36m' N=$'\033[0m'
@@ -155,22 +158,51 @@ check_cryptopay() {  # $1 token, $2 true|false (testnet); prints the app name; e
     return 2
 }
 
-check_transfers() {  # $1 token, $2 true|false (testnet); prints Crypto Pay's error; 0 ok, 1 refused, 2 unknown
-    [[ "${SL_SKIP_CHECKS:-}" == 1 ]] && return 0
-    local host=pay.crypt.bot body code
-    [[ "$2" == true ]] && host=testnet-pay.crypt.bot
+apirone() {  # $1 output file, $2 method, $3 URL: status code (000 no answer). The URL holds secrets (the
+    # account, the transfer key): it reaches curl on stdin, never in its arguments (ps shows those)
+    printf 'url = "%s"\n' "$3" | curl -sS -o "$1" -w '%{http_code}' --max-time 30 -X "$2" \
+        -H 'Content-Type: application/json' -K - 2>/dev/null || true
+}
+
+json_field() {  # $1 file, $2 key: the string value of "key" in a JSON reply
+    sed -n "s/.*\"$2\" *: *\"\([^\"]*\)\".*/\1/p" "$1" | head -n1
+}
+
+create_apirone_account() {  # prints "account transfer-key"; 1 when Apirone did not make one
+    local body code account key
     body=$(mktemp)
-    code=$(http_get "$body" -H "Crypto-Pay-API-Token: $1" "https://$host/api/getTransfers?count=1")
-    if [[ "$code" == 200 ]] && grep -q '"ok":true' "$body"; then
+    code=$(apirone "$body" POST "$APIRONE/v2/accounts")
+    account=$(json_field "$body" account)
+    key=$(json_field "$body" transfer-key)
+    rm -f "$body"
+    [[ "$code" == 200 && -n "$account" && -n "$key" ]] || return 1
+    printf '%s %s\n' "$account" "$key"
+}
+
+check_apirone() {  # $1 account, $2 transfer key; prints what is wrong; 0 ok, 1 refused, 2 could not check
+    [[ "${SL_SKIP_CHECKS:-}" == 1 ]] && return 0
+    local body code
+    body=$(mktemp)
+    code=$(apirone "$body" GET "$APIRONE/v2/accounts/$1")
+    if [[ "$code" == 404 || "$code" == 400 ]]; then
         rm -f "$body"
-        return 0
-    fi
-    if grep -q '"ok":false' "$body" 2>/dev/null; then
-        sed -n 's/.*"name":"\([^"]*\)".*/\1/p' "$body"
-        rm -f "$body"
+        printf 'аккаунт не найден'
         return 1
     fi
+    if [[ "$code" != 200 ]]; then
+        rm -f "$body"
+        return 2
+    fi
+    if grep -Eq '"destinations" *: *\[ *\{' "$body"; then
+        warn "В аккаунте включена пересылка поступлений на другой адрес — бот не включит гарант, пока она есть."
+    fi
+    code=$(apirone "$body" GET "$APIRONE/v2/accounts/$1/invoices?limit=1&transfer-key=$2")  # needs the key
     rm -f "$body"
+    [[ "$code" == 200 ]] && return 0
+    if [[ "$code" == 401 || "$code" == 403 ]]; then
+        printf 'transfer-key не подходит к аккаунту'
+        return 1
+    fi
     return 2
 }
 
@@ -206,14 +238,14 @@ write_env() {  # KEY=VALUE pairs; other lines of the existing file are kept
 
 cmd_config() {
     need_dir
-    local bot_token owner_ids pay_token pay_testnet escrow_token escrow_testnet timezone passphrase pg_password log_level
-    local username status reply new_passphrase="" old_passphrase
+    local bot_token owner_ids pay_token pay_testnet escrow_account escrow_key timezone passphrase pg_password log_level
+    local username status reply new_passphrase="" old_passphrase new_escrow_key="" created
     bot_token=$(env_get BOT_TOKEN)
     owner_ids=$(env_get OWNER_IDS)
     pay_token=$(env_get CRYPTOPAY_TOKEN)
     pay_testnet=$(env_get CRYPTOPAY_TESTNET)
-    escrow_token=$(env_get ESCROW_CRYPTOPAY_TOKEN)
-    escrow_testnet=$(env_get ESCROW_CRYPTOPAY_TESTNET)
+    escrow_account=$(env_get ESCROW_APIRONE_ACCOUNT)
+    escrow_key=$(env_get ESCROW_APIRONE_TRANSFER_KEY)
     timezone=$(env_get TIMEZONE)
     passphrase=$(env_get BACKUP_PASSPHRASE)
     old_passphrase=$(env_get BACKUP_PASSPHRASE_OLD)
@@ -289,52 +321,56 @@ cmd_config() {
     done
     [[ -n "$pay_testnet" ]] || pay_testnet=false
 
-    # --- Auto-garant: a Crypto Pay app of its own, so deal money never mixes with listing payments
+    # --- Auto-garant: an Apirone account of its own (USDT on BNB Smart Chain, BEP20)
+    printf '\n%sАвто-гарант%s: деньги сделок живут на отдельном аккаунте Apirone (USDT в сети BNB Smart Chain, BEP20).\n' "$B" "$N"
     while true; do
-        ask escrow_token "Токен Crypto Pay для гаранта — отдельное приложение, в его Security включите Transfers (Enter — пропустить, «-» — убрать)" "$escrow_token" secret
-        if [[ -z "$escrow_token" || "$escrow_token" == "-" ]]; then
-            escrow_token=""
-            info "Без этого токена гарант не принимает сделки — остальное работает."
-            break
-        fi
-        if [[ "$escrow_token" == "$pay_token" ]]; then
-            warn "Это токен приложения для размещений. Гаранту нужно отдельное приложение, чтобы деньги сделок не смешивались."
-            escrow_token=""
-            continue
-        fi
-        if [[ ! "$escrow_token" =~ ^[0-9]+:[A-Za-z0-9_-]{10,}$ ]]; then
-            warn "Не похоже на токен Crypto Pay (вид: 12345:AAz…)."
-            escrow_token=""
-            continue
-        fi
-        if yes_no "Это токен тестовой сети (@CryptoTestnetBot)?" "$([[ "$escrow_testnet" == true ]] && echo y || echo n)"; then
-            escrow_testnet=true
+        if [[ -z "$escrow_account" ]] && yes_no "Создать новый аккаунт Apirone для гаранта?" n; then
+            if ! created=$(create_apirone_account); then
+                warn "Apirone не создал аккаунт (нет связи с apirone.com?). Попробуйте ещё раз или введите готовый."
+                continue
+            fi
+            escrow_account=${created%% *}
+            escrow_key=${created#* }
+            new_escrow_key=$escrow_key
+            ok "Аккаунт создан"
         else
-            escrow_testnet=false
+            ask escrow_account "Номер аккаунта Apirone для гаранта (apr-…; Enter — пропустить, «-» — убрать)" "$escrow_account" secret
+            if [[ -z "$escrow_account" || "$escrow_account" == "-" ]]; then
+                escrow_account=""
+                escrow_key=""
+                info "Без аккаунта Apirone гарант не принимает сделки — остальное работает."
+                break
+            fi
+            if [[ ! "$escrow_account" =~ ^apr-[A-Za-z0-9]{8,}$ ]]; then
+                warn "Не похоже на номер аккаунта Apirone (вид: apr-0123456789abcdef…)."
+                escrow_account=""
+                continue
+            fi
+            ask escrow_key "Transfer-key этого аккаунта" "$escrow_key" secret
+            if [[ ! "$escrow_key" =~ ^[A-Za-z0-9_-]{16,}$ ]]; then
+                warn "Не похоже на transfer-key (длинная строка из букв и цифр)."
+                escrow_key=""
+                continue
+            fi
         fi
         status=0
-        reply=$(check_cryptopay "$escrow_token" "$escrow_testnet") || status=$?
+        reply=$(check_apirone "$escrow_account" "$escrow_key") || status=$?
         if ((status == 0)); then
-            [[ -n "$reply" ]] && ok "Crypto Pay гаранта: приложение «$reply»"
-            status=0
-            reply=$(check_transfers "$escrow_token" "$escrow_testnet") || status=$?
-            if ((status == 1)); then
-                warn "Crypto Pay не отдаёт переводы этого приложения (${reply:-ошибка}): гарант не сможет платить."
-                warn "Включите: @CryptoBot → Crypto Pay → My Apps → приложение гаранта → Security → Transfers → Enable."
-            elif ((status == 2)); then
-                warn "Не удалось проверить, включены ли переводы (Transfers) — проверьте в настройках приложения."
-            fi
+            ok "Apirone: аккаунт отвечает, transfer-key подходит"
             break
         elif ((status == 1)); then
-            warn "Crypto Pay не принял токен (проверьте и сеть: основная или тестовая)."
-            escrow_token=""
+            warn "Apirone: ${reply:-отказ}."
+            escrow_account=""
+            escrow_key=""
+            new_escrow_key=""
         else
-            warn "Не удалось проверить токен Crypto Pay."
+            warn "Не удалось проверить аккаунт Apirone (нет связи с apirone.com)."
             yes_no "Оставить без проверки?" n && break
-            escrow_token=""
+            escrow_account=""
+            escrow_key=""
+            new_escrow_key=""
         fi
     done
-    [[ -n "$escrow_testnet" ]] || escrow_testnet=false
 
     # --- timezone
     while true; do
@@ -380,13 +416,20 @@ cmd_config() {
         "POSTGRES_PASSWORD=$pg_password" \
         "CRYPTOPAY_TOKEN=$pay_token" \
         "CRYPTOPAY_TESTNET=$pay_testnet" \
-        "ESCROW_CRYPTOPAY_TOKEN=$escrow_token" \
-        "ESCROW_CRYPTOPAY_TESTNET=$escrow_testnet" \
+        "ESCROW_APIRONE_ACCOUNT=$escrow_account" \
+        "ESCROW_APIRONE_TRANSFER_KEY=$escrow_key" \
         "TIMEZONE=$timezone" \
         "BACKUP_PASSPHRASE=$passphrase" \
         "BACKUP_PASSPHRASE_OLD=$old_passphrase" \
         "LOG_LEVEL=$log_level"
     ok "Настройки сохранены в $ENV_FILE (доступ только у root)"
+
+    if [[ -n "$new_escrow_key" ]]; then
+        printf '\n%s%s════ СОХРАНИТЕ АККАУНТ И TRANSFER-KEY ГАРАНТА ════%s\n' "$B" "$Y" "$N"
+        printf 'Аккаунт Apirone: %s%s%s\nTransfer-key:    %s%s%s\n' "$B" "$escrow_account" "$N" "$B" "$new_escrow_key" "$N"
+        printf 'Без transfer-key деньги с аккаунта не вывести, а Apirone его не восстанавливает. Запишите оба в менеджер\n'
+        printf 'паролей, не только на этот сервер, и никому не показывайте: номер аккаунта открывает его историю.\n\n'
+    fi
 
     if [[ -n "$new_passphrase" ]]; then
         printf '\n%s%s════ СОХРАНИТЕ ПАРОЛЬ БЭКАПОВ ════%s\n' "$B" "$Y" "$N"
