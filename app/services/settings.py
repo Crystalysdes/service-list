@@ -139,6 +139,14 @@ class MenuMedia(SettingsGroup):
     kind: str | None = None  # video / animation / photo
 
 
+class Announce(SettingsGroup):
+    """Messages to everyone in the bot about a new service in the list (⚙️ Настройки)."""
+
+    KEY: ClassVar[str] = "announce"
+
+    new_services: bool = True
+
+
 class Chats(SettingsGroup):
     KEY: ClassVar[str] = "chats"
 

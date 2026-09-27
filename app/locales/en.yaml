@@ -38,6 +38,15 @@ menu:
   links_failed: "Could not issue a link — please try again in a minute."
 help:
   text: "<b>How it works</b>\n\n➕ <b>Add service</b> — describe your service and send its link. After a moderator approves it, the bot sends an invoice; once paid, the service appears in its branch of the channel.\n\n🗂 <b>My services</b> — your services: top 1/2/3, a premium emoji before the name, a name made of animated emoji, renewals and stats.\n\n⚠️ <b>Report service</b> — report a service (screenshots and a detailed description are required).\n\n🚫 <b>Scam list</b> — services found to be scams."
+news:
+  title: "🆕 New service in «{category}»"
+  open: "🔗 Open"
+  mute: "🔕 Mute"
+  muted: "🔕 No more new services. To get them again: ℹ️ Help → 🔔"
+  help_off: "🔕 Stop sending new services"
+  help_on: "🔔 Send me new services"
+  switched_on: "🔔 New services will come here again"
+  switched_off: "🔕 No more new services"
 add:
   choose_category: "➕ <b>Add a service</b>\n\nChoose a branch:"
   no_categories: "No branches are open for submissions right now."

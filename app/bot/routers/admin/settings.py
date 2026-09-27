@@ -19,7 +19,7 @@ from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.services.audit import audit
-from app.services.settings import Captcha, Chats, Limits, get_settings, update_settings
+from app.services.settings import Announce, Captcha, Chats, Limits, get_settings, update_settings
 
 router = Router(name="admin_settings")
 router.callback_query.filter(RoleFilter("admin"))
@@ -42,6 +42,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     chats = await get_settings(session, Chats)
     captcha = await get_settings(session, Captcha)
     limits = await get_settings(session, Limits)
+    announce = await get_settings(session, Announce)
     lines = [
         "⚙️ <b>Настройки</b>",
         "",
@@ -49,6 +50,8 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         "Ссылка на чат (кнопка «💬 Chat» в меню): "
         + h(chats.community_url or "не задана — берётся из строки «Chat:» главного поста"),
         f"Капча при входе: {'включена' if captcha.enabled else 'выключена'}",
+        "Рассылка в боте о новых сервисах (после одобрения и публикации): "
+        + ("включена" if announce.new_services else "выключена"),
         "Свои премиум-эмодзи от пользователей (через модерацию): "
         + ("да" if limits.allow_own_emoji else "нет"),
     ]
@@ -65,6 +68,12 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     builder.button(text="💬 Ссылка на чат", callback_data="a:set:chat")
     builder.button(
         text="🔕 Выключить капчу" if captcha.enabled else "🤖 Включить капчу", callback_data="a:set:captcha"
+    )
+    builder.button(
+        text="📣 Выключить рассылку о новых сервисах"
+        if announce.new_services
+        else "📣 Включить рассылку о новых сервисах",
+        callback_data="a:set:announce",
     )
     builder.button(
         text="😀 Запретить свои эмодзи" if limits.allow_own_emoji else "😀 Разрешить свои эмодзи",
@@ -97,6 +106,18 @@ async def on_captcha(call: CallbackQuery, session: AsyncSession, **data: Any) ->
     await audit(session, data["user"].id, "settings.captcha", data={"enabled": not captcha.enabled})
     await session.commit()
     await call.answer("Капча " + ("выключена" if captcha.enabled else "включена"))
+    await _show(call, session, data["ctx"])
+
+
+@router.callback_query(F.data == "a:set:announce")
+async def on_announce(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    announce = await get_settings(session, Announce)
+    await update_settings(session, Announce, new_services=not announce.new_services)
+    await audit(session, data["user"].id, "settings.announce", data={"enabled": not announce.new_services})
+    await session.commit()
+    await call.answer(
+        "Рассылка о новых сервисах " + ("выключена" if announce.new_services else "включена"), show_alert=True
+    )
     await _show(call, session, data["ctx"])
 
 

@@ -3,7 +3,16 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import BlacklistEntry, Category, ModerationRequest, Order, Service, Staff, User
+from app.db.models import (
+    BlacklistEntry,
+    Broadcast,
+    Category,
+    ModerationRequest,
+    Order,
+    Service,
+    Staff,
+    User,
+)
 from app.jobs import job_poll_invoices
 from app.services import billing
 from app.services.settings import Chats, get_settings, save_settings
@@ -77,6 +86,9 @@ async def test_submit_approve_pay_publish(h, tg, db, ctx):
     await job_poll_invoices(ctx)
     done = h.last(USER)
     assert "опубликован" in done["text"]
+    async with db.session() as s:  # published for the first time: everyone in the bot will hear about it
+        [news] = (await s.execute(select(Broadcast))).scalars().all()
+        assert (news.kind, news.status) == ("new_service", "pending")
     await job_poll_invoices(ctx)  # idempotent: no second notification
     assert h.last(USER)["message_id"] == done["message_id"]
 

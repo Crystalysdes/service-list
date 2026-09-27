@@ -95,6 +95,12 @@ async def job_backup(ctx: AppContext) -> None:
         await notify_staff(ctx, "🚨 Ежедневная резервная копия не создана — подробности в логе бота.")
 
 
+async def job_announce(ctx: AppContext) -> None:
+    from app.services.announce import job
+
+    await job(ctx)
+
+
 async def job_escrow_poll(ctx: AppContext) -> None:
     if ctx.get("escrow_pay") is not None:
         from app.services.escrow.sweep import poll_job
@@ -127,6 +133,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_linkcheck, IntervalTrigger(minutes=15, jitter=60)),
         (job_health, IntervalTrigger(minutes=15, jitter=60)),
         (job_backup, CronTrigger(hour=4, minute=0, timezone=ctx.config.timezone)),
+        (job_announce, IntervalTrigger(seconds=10)),
         (job_escrow_poll, IntervalTrigger(seconds=20)),
         (job_escrow_sweep, IntervalTrigger(minutes=1)),
         (job_escrow_reconcile, IntervalTrigger(minutes=10, jitter=30)),

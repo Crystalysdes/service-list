@@ -295,6 +295,7 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
     if order.kind == "listing":
         prices = await get_settings(session, Prices)
         was_active = service.status == "active"
+        first_time = service.published_at is None  # a submitted service, never shown before
         service.status = "active"
         service.hidden_reason = None
         service.published_at = service.published_at or now
@@ -302,6 +303,10 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
             from app.services.catalog import next_position
 
             service.position = await next_position(session, service.category_id)
+            if first_time:  # everyone in the bot hears about it (app/services/announce.py)
+                from app.services.announce import enqueue_new_service
+
+                await enqueue_new_service(session, service)
         days = int(order.params.get("days", prices.listing_days) or 0)
         if days:
             base = (

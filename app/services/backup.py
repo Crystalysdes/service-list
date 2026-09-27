@@ -417,6 +417,9 @@ async def restore_archive(
     async with db.session() as session:
         # the new server must prove premium emoji work again before posts with them are touched
         await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
+        from app.services.announce import cancel_unfinished
+
+        await cancel_unfinished(session)  # the archive may predate announcements sent since
         # the archive may predate payouts made since: garant payouts wait until the owner has checked
         if await session.scalar(select(func.count()).select_from(Deal)):
             await update_settings(

@@ -7,7 +7,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot.flows.start import (
@@ -23,6 +23,7 @@ from app.bot.flows.start import (
 from app.bot.i18n import LANGS, Translator
 from app.db.base import utcnow
 from app.domain.captcha import check, is_blocked, new_challenge
+from app.services import announce
 from app.services.invites import ttl_text
 from app.services.settings import Captcha, get_settings
 
@@ -65,7 +66,7 @@ async def cmd_menu(message: Message, state: FSMContext, **data: Any) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message, **data: Any) -> None:
     t: Translator = data["t"]
-    await message.answer(t("help.text"), reply_markup=_back_to_menu(t))
+    await message.answer(t("help.text"), reply_markup=_help_keyboard(t, data["user"]))
 
 
 @router.callback_query(F.data.startswith("cap:"))
@@ -155,7 +156,37 @@ async def on_help(call: CallbackQuery, **data: Any) -> None:
     t: Translator = data["t"]
     await call.answer()
     assert call.message is not None
-    await show_screen(call.message, t("help.text"), reply_markup=_back_to_menu(t))
+    await show_screen(call.message, t("help.text"), reply_markup=_help_keyboard(t, data["user"]))
+
+
+@router.callback_query(F.data == "h:news")
+async def on_news_switch(call: CallbackQuery, **data: Any) -> None:
+    """🔔 / 🔕 on the help screen: messages about new services in the list."""
+    t: Translator = data["t"]
+    user = data["user"]
+    user.news_off = not user.news_off
+    await call.answer(t("news.switched_off") if user.news_off else t("news.switched_on"))
+    if isinstance(call.message, Message):
+        with contextlib.suppress(TelegramBadRequest):
+            await call.message.edit_reply_markup(reply_markup=_help_keyboard(t, user))
+
+
+@router.callback_query(F.data == announce.MUTE)
+async def on_news_mute(call: CallbackQuery, **data: Any) -> None:
+    """🔕 under a message about a new service: no more such messages; its link stays."""
+    t: Translator = data["t"]
+    data["user"].news_off = True
+    await call.answer(t("news.muted"), show_alert=True)
+    message = call.message
+    if isinstance(message, Message) and message.reply_markup is not None:
+        rows = [
+            [b for b in row if b.callback_data != announce.MUTE]
+            for row in message.reply_markup.inline_keyboard
+        ]
+        with contextlib.suppress(TelegramBadRequest):
+            await message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[r for r in rows if r])
+            )
 
 
 @router.callback_query(F.data == "m:lang")
@@ -186,7 +217,10 @@ async def on_refresh_links(call: CallbackQuery, **data: Any) -> None:
         await call.answer(t("menu.links_fresh", ttl=ttl_text(links.ttl, t.lang)))
 
 
-def _back_to_menu(t: Translator) -> Any:
+def _help_keyboard(t: Translator, user: Any) -> Any:
     builder = InlineKeyboardBuilder()
+    muted = user is not None and user.news_off
+    builder.button(text=t("news.help_on") if muted else t("news.help_off"), callback_data="h:news")
     builder.button(text=t("common.menu"), callback_data="m:menu")
+    builder.adjust(1)
     return builder.as_markup()

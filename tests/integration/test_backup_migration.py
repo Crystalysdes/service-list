@@ -8,7 +8,7 @@ from pydantic import SecretStr
 from sqlalchemy import func, select, text
 
 from app.db.base import Base, utcnow
-from app.db.models import Backup, Category, Channel, ChannelPost, MediaFile, Order, Service, User
+from app.db.models import Backup, Broadcast, Category, Channel, ChannelPost, MediaFile, Order, Service, User
 from app.services import migration
 from app.services.backup import (
     BackupError,
@@ -65,6 +65,9 @@ async def test_backup_restore_roundtrip(h, tg, db, ctx):
     ids = await imported_channel(tg, db, ctx)
     engine = engine_for(ctx)
     await engine.run_once(ids["channel_id"])
+    async with db.session() as s:  # an announcement of a new service still going out
+        s.add(Broadcast(kind="new_service", ref_id=1, status="sending", cursor=5))
+        await s.commit()
     before = await _counts(db)
     travel_before = tg.messages[MAIN][ids["travel"]]["text"]
     record, result = await make_backup(ctx, "manual")
@@ -83,6 +86,8 @@ async def test_backup_restore_roundtrip(h, tg, db, ctx):
     assert restored.tables["services"] == before["services"]
     assert await _counts(db) == before
     async with db.session() as s:
+        # the archive may predate messages sent since: the announcement does not resume
+        assert (await s.execute(select(Broadcast))).scalar_one().status == "cancelled"
         media = (await s.execute(select(MediaFile))).scalar_one()
         assert media.local_path and (ctx.config.media_dir / media.local_path.rsplit("/", 1)[1]).exists()
         s.add(Service(category_id=1, name="New", url="https://t.me/new_one", status="pending"))

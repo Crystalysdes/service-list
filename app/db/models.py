@@ -38,6 +38,8 @@ class User(TimestampMixin, Base):
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     report_banned: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     blocked_bot: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # 🔕 under a message about a new service: no more such messages
+    news_off: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -450,6 +452,29 @@ class Notification(Base):
     dedup_key: Mapped[str] = mapped_column(String(160), unique=True)
     user_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Broadcast(CreatedMixin, Base):
+    """A message to every user of the bot (now: a new service in the list), sent in the background.
+
+    ``cursor`` is the last user id it went to (users are taken in id order), moved after every message: a
+    restart goes on from there and nobody gets it twice.
+    """
+
+    __tablename__ = "broadcasts"
+    __table_args__ = (UniqueConstraint("kind", "ref_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(24))  # new_service
+    ref_id: Mapped[int] = mapped_column(Integer)  # the service
+    # pending / sending / done / cancelled
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    cursor: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))
+    sent: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    blocked: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))  # blocked the bot
+    failed: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditLog(Base):
