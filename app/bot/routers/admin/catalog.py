@@ -432,12 +432,23 @@ async def _service_card(session: AsyncSession, service: Service, tz: str) -> tup
         builder.button(text="👁 Вернуть в канал", callback_data=f"a:svc:{sid}:show")
     builder.button(text="💎 Опции", callback_data=f"a:svc:{sid}:feat")
     builder.button(text="🗑 Удалить", callback_data=f"a:svc:{sid}:del")
-    termed = listing_renewable(service) and service.status != "approved"
-    if termed:  # a listing with a term: a month for free, or no term any more
+    kept = 3 if service.status in ("active", "hidden", "removed") else 2
+    gifts = 0
+    if service.status == "approved":  # approved, not paid: staff put it in the channel for a term they choose
+        builder.button(text="✅ Разместить без оплаты", callback_data=f"a:svc:{sid}:lp")
+        gifts = 1
+    elif listing_renewable(service):  # a listing with a term: days for free, or no term any more
         builder.button(text="🎁 +30 дней", callback_data=f"a:svc:{sid}:lx:30")
         builder.button(text="♾ Бессрочно", callback_data=f"a:svc:{sid}:lx:0")
-    builder.adjust(2, 2, 2, 2, 2 if termed else 1, 1)
+        builder.button(text="📅 Другой срок", callback_data=f"a:svc:{sid}:lp")
+        gifts = 3
+    builder.adjust(2, 2, 2, *_rows(kept), *_rows(gifts))
     return "\n".join(lines), back_home(builder, target=f"a:svc:c:{service.category_id}:0")
+
+
+def _rows(count: int) -> list[int]:
+    """Buttons two by two, the odd one alone."""
+    return [2] * (count // 2) + [1] * (count % 2)
 
 
 def _term_line(service: Service, tz: str, grace_days: int) -> str:
@@ -606,25 +617,109 @@ async def on_service_action(
     await _show_service(call, session, service.id, _tz(data))
 
 
-@router.callback_query(F.data.regexp(r"^a:svc:\d+:lx:(30|0)$"))
+MAX_GIFT_DAYS = 3650
+
+
+@router.callback_query(F.data.regexp(r"^a:svc:\d+:lp$"))
+async def on_listing_terms(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """For how long staff place a service without payment: the terms owners pay for, no term, or any
+    number of days."""
+    service = await session.get(Service, int((call.data or "").split(":")[2]))
+    if service is None or not listing_renewable(service):
+        await call.answer("Этому сервису срок размещения не выдать", show_alert=True)
+        return
+    prices = await get_settings(session, Prices)
+    sid = service.id
+    builder = InlineKeyboardBuilder()
+    months = sorted({m for m in prices.periods if m >= 1}) if prices.listing_days else []
+    for count in months:
+        days = prices.listing_days * count
+        builder.button(text=f"{count} мес. ({days} дн.)", callback_data=f"a:svc:{sid}:lx:{days}")
+    builder.button(text="♾ Бессрочно", callback_data=f"a:svc:{sid}:lx:0")
+    builder.button(text="✍️ Своё число дней", callback_data=f"a:svc:{sid}:ld")
+    builder.adjust(*_rows(len(months)), 1, 1)
+    if service.status == "approved":
+        text = (
+            f"✅ <b>{h(service.name)}</b> — разместить без оплаты. На какой срок?\n\n"
+            "Сервис сразу встанет в канал, владелец получит сообщение, как после оплаты. "
+            "Неоплаченный счёт владельца закроется."
+        )
+    else:
+        grace = prices.listing_grace_days
+        text = (
+            f"📅 <b>{h(service.name)}</b> — сколько добавить к размещению?\n"
+            f"Сейчас: {_term_line(service, _tz(data), grace)}"
+        )
+    await call.answer()
+    assert call.message is not None
+    await call.message.edit_text(text, reply_markup=back_home(builder, target=f"a:svc:{sid}"))
+
+
+@router.callback_query(F.data.regexp(r"^a:svc:\d+:ld$"))
+async def on_listing_days(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    sid = int((call.data or "").split(":")[2])
+    await ask(
+        call,
+        state,
+        "svc_listing_days",
+        f"Сколько дней размещения? Число от 1 до {MAX_GIFT_DAYS}:",
+        back=f"a:svc:{sid}",
+        service_id=sid,
+    )
+
+
+@input_handler("svc_listing_days")
+async def input_listing_days(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= MAX_GIFT_DAYS:
+        await message.answer(f"Нужно число дней от 1 до {MAX_GIFT_DAYS}.")
+        return False
+    session: AsyncSession = data["session"]
+    service = await session.get(Service, fsm["service_id"])
+    if service is None:
+        return True
+    problem = await _gift(session, service, data, int(raw))
+    await message.answer(f"Не получилось: {h(problem)}" if problem else h(_gift_done(service, _tz(data))))
+    await _show_service(message, session, service.id, _tz(data))
+    return True
+
+
+async def _gift(session: AsyncSession, service: Service, data: dict[str, Any], days: int) -> str | None:
+    """``days`` of listing without payment (0: no term); why it cannot be, when it cannot."""
+    try:
+        async with session.begin_nested():  # a refusal leaves nothing behind
+            await billing.gift_listing(session, service, data["user"].id, days, utcnow())
+    except billing.FulfilError as exc:
+        return str(exc)
+    await session.commit()
+    catalog.request_sync(data["ctx"])
+    return None
+
+
+def _gift_done(service: Service, tz: str) -> str:
+    expires = service.listing_expires_at
+    return f"✅ «{service.name}»: размещение " + (f"до {fmt_dt(expires, tz)}" if expires else "бессрочно")
+
+
+@router.callback_query(F.data.regexp(r"^a:svc:\d+:lx:\d{1,4}$"))
 async def on_listing_gift(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    """A month of listing for free, or no term any more; a service hidden because its term ran out comes
-    back (its owner hears "added" once the channel shows it)."""
+    """Days of listing for free, or no term any more: an approved service not paid for comes into the
+    channel, so does one hidden because its term ran out (its owner hears "added" once the channel shows
+    it)."""
     parts = (call.data or "").split(":")
     service = await session.get(Service, int(parts[2]))
     if service is None:
         await call.answer("Не найдено")
         return
     days = int(parts[4])
-    try:
-        async with session.begin_nested():  # a refusal leaves nothing behind
-            await billing.gift_listing(session, service, data["user"].id, days, utcnow())
-    except billing.FulfilError as exc:
-        await call.answer(f"Не получилось: {exc}", show_alert=True)
+    if days > MAX_GIFT_DAYS:
+        await call.answer()
         return
-    await session.commit()
-    catalog.request_sync(data["ctx"])
-    await call.answer("Добавлено 30 дней размещения" if days else "Размещение теперь бессрочное")
+    problem = await _gift(session, service, data, days)
+    if problem:
+        await call.answer(f"Не получилось: {problem}", show_alert=True)
+        return
+    await call.answer(_gift_done(service, _tz(data)))
     await _show_service(call, session, service.id, _tz(data))
 
 

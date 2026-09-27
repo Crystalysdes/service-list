@@ -272,3 +272,59 @@ async def test_a_refunded_listing_gives_its_days_back(h, tg, db, ctx):
     await h.click(OWNER_ID, panel, f"a:ord:{order_id}:refundyes")
     left = (await _service(db, "Refund One")).listing_expires_at - utcnow()
     assert timedelta(days=4, hours=23) < left <= timedelta(days=5)
+
+
+async def test_staff_place_an_approved_service_without_payment_for_the_term_they_choose(h, tg, db, ctx):
+    ids, pay, engine = await _setup(tg, db, ctx)
+    await _submit(h, tg)
+    await _approve(h, tg)
+    await h.press(USER, h.last(USER), "1 мес.")  # the owner opened an invoice and never paid it
+    service = await _service(db, "Fly Cheap")
+    assert service.status == "approved" and pay.invoices
+    panel = await h.say(OWNER_ID, "/admin")
+    await h.click(OWNER_ID, panel, f"a:svc:{service.id}")
+    card = tg.messages[OWNER_ID][panel["message_id"]]
+    assert "Размещение: —" in card["text"] and not [b for b in h.buttons(card) if "+30" in b["text"]]
+    await h.press(OWNER_ID, card, "Разместить без оплаты")
+    menu = tg.messages[OWNER_ID][panel["message_id"]]
+    assert [b["text"] for b in h.buttons(menu)] == [
+        "1 мес. (30 дн.)",
+        "3 мес. (90 дн.)",
+        "6 мес. (180 дн.)",
+        "♾ Бессрочно",
+        "✍️ Своё число дней",
+        "⬅️ Назад",
+    ]
+    await h.press(OWNER_ID, menu, "Своё число дней")
+    await h.say(OWNER_ID, "0")
+    assert "от 1 до 3650" in h.last(OWNER_ID)["text"]
+    await h.say(OWNER_ID, "45")
+    service = await _service(db, "Fly Cheap")
+    assert service.status == "active"
+    assert 44.9 < (service.listing_expires_at - utcnow()).total_seconds() / 86400 <= 45
+    assert any("«Fly Cheap»: размещение до" in t for t in _texts(tg, OWNER_ID))
+    async with db.session() as s:
+        orders = (await s.execute(select(Order).where(Order.service_id == service.id))).scalars().all()
+        assert sorted((o.provider, o.status) for o in orders) == [
+            ("cryptobot", "cancelled"),  # nothing left to pay: its invoice is withdrawn
+            ("free", "fulfilled"),
+        ]
+    await job_poll_invoices(ctx)
+    assert not pay.invoices
+    await engine.run_once(ids["channel_id"])
+    assert "«Fly Cheap» добавлен" in h.last(USER)["text"]  # the owner hears it like after a payment
+
+    card = h.last(OWNER_ID)  # later: more days for a listing with a term
+    assert [b["text"] for b in h.buttons(card)][-4:] == [
+        "🎁 +30 дней",
+        "♾ Бессрочно",
+        "📅 Другой срок",
+        "⬅️ Назад",
+    ]
+    ends = service.listing_expires_at
+    await h.press(OWNER_ID, card, "Другой срок")
+    menu = h.last(OWNER_ID)
+    assert "Сейчас: до" in menu["text"]
+    await h.press(OWNER_ID, menu, "3 мес.")
+    service = await _service(db, "Fly Cheap")
+    assert service.listing_expires_at == ends + timedelta(days=90)

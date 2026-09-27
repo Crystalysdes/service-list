@@ -58,14 +58,17 @@ def service_state(service: Service) -> str:
     return words
 
 
-async def cancel_open_orders(session: AsyncSession, service_id: int, note: str) -> int:
-    """The service was banned, removed or hidden: its unpaid orders are closed (the poller withdraws their
-    invoices at Crypto Pay; one paid after all goes to staff instead of being fulfilled)."""
+async def cancel_open_orders(
+    session: AsyncSession, service_id: int, note: str, *, kind: str | None = None
+) -> int:
+    """The service was banned, removed or hidden (or staff gave what the owner was paying for: ``kind``): its
+    unpaid orders are closed (the poller withdraws their invoices at Crypto Pay; one paid after all goes to
+    staff instead of being fulfilled)."""
+    where = [Order.service_id == service_id, Order.status.in_(OPEN_ORDER)]
+    if kind is not None:
+        where.append(Order.kind == kind)
     rows = await session.execute(
-        update(Order)
-        .where(Order.service_id == service_id, Order.status.in_(OPEN_ORDER))
-        .values(status="cancelled", note=note[:250])
-        .returning(Order.id)
+        update(Order).where(*where).values(status="cancelled", note=note[:250]).returning(Order.id)
     )
     return len(rows.all())
 
@@ -491,10 +494,14 @@ async def gift_listing(
     session: AsyncSession, service: Service, staff_id: int, days: int, now: datetime
 ) -> Order:
     """Staff give ``days`` of listing (0: no term any more) without payment, carried out like a paid
-    renewal (a hidden service whose term ran out comes back). FulfilError when it cannot be."""
+    renewal: an approved service not paid for comes into the channel, so does a hidden one whose term ran
+    out. What the owner was about to pay for then is not needed any more: their listing invoice is withdrawn.
+    FulfilError when it cannot be."""
     refusal = await listing_refusal(session, service, days=days, payer_id=None)
     if refusal:
         raise FulfilError(refusal)
+    if service.status != "active" or not days:
+        await cancel_open_orders(session, service.id, "размещение выдано администрацией", kind="listing")
     order = Order(
         user_id=service.owner_id or staff_id,
         service_id=service.id,
