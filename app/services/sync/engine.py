@@ -126,6 +126,29 @@ def strip_custom_emoji(fragment: Fragment) -> Fragment:
     return fragment.without({"custom_emoji"})
 
 
+def _missing_text(kind: str, title: str, message_id: int) -> str:
+    if kind == "category":
+        return (
+            f"♻️ Категория «{h(title)}» (пост {message_id}) удалена из канала — бот возвращает её на прежнее "
+            "место и напишет, когда она снова будет в канале."
+        )
+    return (
+        f"♻️ Пост {message_id} удалён из канала — бот публикует его заново и напишет, когда он снова будет "
+        "в канале."
+    )
+
+
+def _held_text(kind: str, title: str) -> str:
+    what, where, it = (
+        (f"Категория «{h(title)}»", "в ней", "её") if kind == "category" else ("Пост", "в нём", "его")
+    )
+    return (
+        f"⏸ {what} ждёт публикации: {where} премиум-эмодзи, а бот сейчас не может их ставить "
+        f"(🩺 Диагностика → самопроверка). Пока это так, бот {it} не трогает, чтобы в канале не появились "
+        "лишние посты. Опубликовать без них: 🩺 Диагностика → «🔤 Разрешить обычные эмодзи вместо премиум»."
+    )
+
+
 class ChannelWorker:
     def __init__(self, engine: SyncEngine, channel_id: int) -> None:
         self.engine = engine
@@ -180,6 +203,7 @@ class SyncEngine:
         self.ctx = ctx
         self.nav_check_every = nav_check_every  # seconds between checks that the navigation still exists
         self._nav_checked: dict[int, float] = {}
+        self._restoring: set[tuple[int, str, int]] = set()  # posts deleted by hand, until they show again
         self.debounce = debounce
         self.max_delay = max_delay
         self.idle_interval = idle_interval
@@ -316,6 +340,17 @@ class SyncEngine:
                 if block is None:
                     continue
                 text_block = block.media is None
+                held = await self._gate(
+                    session, block.fragment, PassResult(), "", plain_ok=kind in ALWAYS_SHOWN
+                )
+                title = await self._block_title(session, kind, block_id)
+            if held is None:  # nothing is moved for a post that could not be written now
+                result.skipped.append(f"{kind}:{block_id}")
+                await self._alert_once(f"held:{channel_id}:{kind}:{block_id}", _held_text(kind, title))
+                continue
+            # back into its place when blocks follow it: each of them moves one post down
+            if text_block and await self._shift_into_place(channel_id, kind, block_id, desired):
+                continue
             # the admins' posts under the last block go below it first (sync/foreign.py)
             if text_block and await self._place_under_last(channel_id, kind, block_id, limiter, result):
                 continue
@@ -344,6 +379,58 @@ class SyncEngine:
             need_nav = nav is not None and not nav.message_id
         if need_nav:
             await self._send_new(channel_id, "nav", 0, limiter, result)
+
+    async def _shift_into_place(
+        self, channel_id: int, kind: str, block_id: int, desired: list[tuple[str, int]]
+    ) -> bool:
+        """A block without a post (deleted from the channel, shown again, or new in the middle of the order)
+        takes the post of the block after it, that one the next one's, and so on; the blocks left without a
+        post are placed after the last one, in their order. So it comes back into its place, as Telegram
+        cannot put a post between two others. Only among text posts in the channel's order; False: no block
+        with a post follows it."""
+        at = desired.index((kind, block_id))
+        group = [(kind, block_id), *(key for key in desired[at + 1 :] if key[0] != "nav")]
+        async with self.ctx.db.session() as session:
+            rows = {
+                (r.kind, r.block_id): r
+                for r in (
+                    await session.execute(select(ChannelPost).where(ChannelPost.channel_id == channel_id))
+                ).scalars()
+            }
+            members = [rows.get(key) for key in group]
+            if any(r is None for r in members):
+                return False
+            ids = [r.message_id for r in members[1:] if r is not None and r.message_id]
+            if not ids:
+                return False
+            for key in group:  # a caption cannot become a text; a held post would not be written
+                block = await self._render(session, channel_id, *key)
+                if block is None or block.media is not None:
+                    return False
+                held = await self._gate(
+                    session, block.fragment, PassResult(), "", plain_ok=key[0] in ALWAYS_SHOWN
+                )
+                if held is None:
+                    return False
+            before = [rows[key].message_id for key in desired[:at] if key in rows and rows[key].message_id]
+            if ids != sorted(ids) or (before and max(before) > ids[0]):
+                return False  # the channel's order is not the blocks' order: left to the usual way
+            pinned = {r.message_id: r.pinned for r in members if r is not None and r.message_id}
+            for index, row in enumerate(members):
+                assert row is not None
+                message_id = ids[index] if index < len(ids) else None
+                had = bool(row.message_id)
+                row.message_id = message_id
+                row.pinned = pinned.get(message_id, False) if message_id else False
+                row.sent_hash = None
+                row.snapshot = None
+                row.manual = None
+                if message_id:
+                    row.state = "ok"
+                elif had:
+                    row.state = "missing"  # placed after the last one, as a post that was there before
+            await session.commit()
+        return True
 
     async def _move_setup(self, channel_id: int, result: PassResult) -> dict[str, Any] | None:
         """What a move of the admins' posts needs (the main channel, the storage channel to read posts
@@ -437,7 +524,16 @@ class SyncEngine:
                     f"переносить их автоматически: новая категория «{h(title)}» встанет в конец.",
                 )
                 return False
-            move = {"key": [channel_id, kind, block_id], "last": last, "items": items, "stage": "copying"}
+            async with self.ctx.db.session() as session:
+                row = await self._row(session, channel_id, kind, block_id)
+                fresh = row is not None and row.state == "new"
+            move = {
+                "key": [channel_id, kind, block_id],
+                "last": last,
+                "items": items,
+                "stage": "copying",
+                "fresh": fresh,
+            }
             await self._save_move(move)
         await self._run_move(channel_id, move, (kind, block_id), limiter, result)
         return True
@@ -600,8 +696,9 @@ class SyncEngine:
                 "начинаются с нуля."
             )
         else:
+            what = "Новая категория" if move.get("fresh", True) else "Категория"
             text = (
-                f"📦 Новая категория «{h(title)}» встала сразу под последней категорией. Посты под ней "
+                f"📦 {what} «{h(title)}» встала сразу под последней категорией. Посты под ней "
                 f"(реклама, {moved} шт.) перенесены ниже: бот опубликовал их копии и удалил старые. "
                 "Просмотры и реакции у копий начинаются с нуля."
             )
@@ -1087,6 +1184,22 @@ class SyncEngine:
             await session.commit()
         result.sent += 1
         await self._verify(out.fragment, message, f"{kind}:{block_id}")
+        async with self.ctx.db.session() as session:
+            channel = await session.get(Channel, channel_id)
+            base = channel_post_base(out.chat_id, channel.username if channel else None)
+        await self._restored(channel_id, kind, block_id, base + str(message.message_id))
+
+    async def _restored(self, channel_id: int, kind: str, block_id: int, url: str) -> None:
+        """A post that was deleted from the channel shows again: the owner hears where."""
+        if (channel_id, kind, block_id) not in self._restoring:
+            return
+        self._restoring.discard((channel_id, kind, block_id))
+        async with self.ctx.db.session() as session:
+            title = await self._block_title(session, kind, block_id)
+        what = f"Категория «{h(title)}»" if kind == "category" else "Пост"
+        await self._alert_once(
+            f"restored:{channel_id}:{kind}:{block_id}:{url}", f"✅ {what} снова в канале: {url}"
+        )
 
     async def _send_media(
         self, chat_id: int, media: MediaFile, kind: str | None, fragment: Fragment, reply_markup: Any = None
@@ -1246,13 +1359,15 @@ class SyncEngine:
             result.edited += 1
             if message is not None:
                 await self._verify(fragment, message, f"{kind}:{block_id}")
+            await self._restored(channel_id, kind, block_id, post_url)
         elif status == "unchanged":
             result.unchanged += 1
         elif status == "missing" and kind != "spare":
+            async with self.ctx.db.session() as session:
+                title = await self._block_title(session, kind, block_id)
+            self._restoring.add((channel_id, kind, block_id))
             await self._alert_once(
-                f"missing:{channel_id}:{kind}:{block_id}:{message_id}",
-                f"♻️ Пост {kind} #{block_id} (сообщение {message_id}) удалён из канала — "
-                "бот публикует его заново.",
+                f"missing:{channel_id}:{kind}:{block_id}:{message_id}", _missing_text(kind, title, message_id)
             )
             self.wake(channel_id)
         elif status.startswith("error:"):

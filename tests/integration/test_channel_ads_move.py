@@ -228,3 +228,48 @@ async def test_categories_are_brought_together_again_on_the_admins_request(h, tg
     assert "снова идут подряд" in alert and "4 шт." in alert
     await engine.run_once(ids["channel_id"])  # asked once: nothing more happens
     assert _order(tg) == order
+
+
+async def test_a_deleted_category_comes_back_into_its_place_above_the_ads(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    ads = await _ads(h, tg, ids)
+    await engine.run_once(ids["channel_id"])
+    del tg.messages[MAIN][ids["vpn"]]  # deleted by hand
+    async with db.session() as s:
+        from app.db.models import ChannelPost
+
+        row = (await s.execute(select(ChannelPost).where(ChannelPost.message_id == ids["vpn"]))).scalar_one()
+        row.sent_hash = None  # its data changed: the bot edits it and finds it gone
+        await s.commit()
+    await engine.run_once(ids["channel_id"])
+    await engine.run_once(ids["channel_id"])
+    order = _order(tg)
+    texts = [_text(tg.messages[MAIN][m]) for m in order]
+    travel = order.index(ids["travel"])
+    assert texts[travel + 1].startswith("✏️VPN") and texts[travel + 2].startswith("✏️Design")  # in order
+    assert texts[travel + 3] == "Реклама: магазин" and texts[-1].startswith("Навигационная")
+    assert all(original not in tg.messages[MAIN] for original in ads.values())
+    notes = [m.get("text") or "" for m in tg.bot_messages(OWNER_ID)]
+    assert any("снова в канале" in n and "VPN" in n for n in notes)
+    assert any("📦 Категория «✏️Design [Дизайн]» встала" in n for n in notes)  # not "new": it was there
+
+
+async def test_a_category_that_cannot_be_written_now_moves_nothing(h, tg, db, ctx):
+    from app.domain.richtext import RichText
+
+    ids = await imported_channel(tg, db, ctx, emoji_ok=False)  # the bot cannot post premium emoji now
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    before = _order(tg)
+    async with db.session() as s:
+        header = RichText().emoji("5368324170671202286", "🔥").text(" Premium [Премиум]").build()
+        await catalog.create_category(s, header, "#premium")
+        await s.commit()
+    await engine.run_once(ids["channel_id"])
+    assert _order(tg) == before  # no navigation published for a post that would not be written
+    held = [
+        m.get("text") or "" for m in tg.bot_messages(OWNER_ID) if "ждёт публикации" in (m.get("text") or "")
+    ]
+    assert len(held) == 1 and "Premium" in held[0] and "Разрешить обычные эмодзи" in held[0]

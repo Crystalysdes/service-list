@@ -101,11 +101,17 @@ async def test_deleted_post_is_restored(tg, db, ctx):
         row.sent_hash = None  # force an edit attempt
         await s.commit()
     await engine.run_once(ids["channel_id"])  # edit -> not found -> marked missing
-    await engine.run_once(ids["channel_id"])  # missing block takes the nav slot, nav re-sent
-    assert _posts(tg)[ids["nav"]]["text"].startswith("✏️VPN")
+    await engine.run_once(ids["channel_id"])  # back into its place: the blocks after it move one post down
+    assert _posts(tg)[ids["design"]]["text"].startswith("✏️VPN")  # right after Travel again
+    assert _posts(tg)[ids["nav"]]["text"].startswith("✏️Design")  # the last one took the navigation's place
     last = max(_posts(tg))
     assert _posts(tg)[last]["text"].startswith("Навигационная панель")
     assert tg.pins[MAIN] == [last]
+    notes = [m.get("text") or "" for m in tg.bot_messages(1001)]
+    assert any("Категория «✏️VPN [Впн]»" in n and "удалена из канала" in n for n in notes)
+    assert any(
+        n.startswith("✅ Категория «✏️VPN [Впн]» снова в канале") and f"/{ids['design']}" in n for n in notes
+    )
 
 
 async def test_a_post_telegram_refuses_does_not_stop_the_channel(tg, db, ctx):
@@ -126,14 +132,25 @@ async def test_a_post_telegram_refuses_does_not_stop_the_channel(tg, db, ctx):
     assert "New Trip" in _posts(tg)[ids["travel"]]["text"]  # the rest of the channel was still updated
     assert any("message is too long" in error for error in result.errors)
     async with db.session() as s:
-        row = (await s.execute(select(ChannelPost).where(ChannelPost.id == row.id))).scalar_one()
-    assert (row.message_id, row.state, row.last_error) == (None, "new", "Bad Request: message is too long")
+        vpn = (await s.execute(select(ChannelPost).where(ChannelPost.id == row.id))).scalar_one()
+        design = (
+            await s.execute(
+                select(ChannelPost).where(ChannelPost.kind == "category", ChannelPost.block_id == 3)
+            )
+        ).scalar_one()
+    assert vpn.message_id == ids["design"]  # back into its place; Design needs a new post
+    assert (design.message_id, design.state, design.last_error) == (
+        None,
+        "new",
+        "Bad Request: message is too long",
+    )
     assert _posts(tg)[ids["nav"]]["text"].startswith("Навигационная панель") and tg.pins[MAIN] == [ids["nav"]]
     notes = [m["text"] for m in tg.bot_messages(1001) if "Не удалось опубликовать пост" in m.get("text", "")]
     assert len(notes) == 1 and "message is too long" in notes[0]
 
     await engine.run_once(ids["channel_id"])  # accepted now: published in the navigation's place
-    assert _posts(tg)[ids["nav"]]["text"].startswith("✏️VPN")
+    assert _posts(tg)[ids["design"]]["text"].startswith("✏️VPN")
+    assert _posts(tg)[ids["nav"]]["text"].startswith("✏️Design")
     assert _posts(tg)[max(_posts(tg))]["text"].startswith("Навигационная панель")
 
 
@@ -259,3 +276,28 @@ async def test_a_probe_that_does_not_go_out_changes_nothing(tg, db, ctx):
     async with db.session() as s:
         runtime = await get_settings(s, Runtime)
     assert runtime.selftest_emoji_ok and not runtime.safe_mode  # the channel keeps its posts' emoji
+
+
+async def test_two_deleted_categories_come_back_in_their_order(tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    for key in ("travel", "design"):
+        del tg.messages[MAIN][ids[key]]
+    async with db.session() as s:
+        for key in ("travel", "design"):
+            row = (
+                await s.execute(select(ChannelPost).where(ChannelPost.message_id == ids[key]))
+            ).scalar_one()
+            row.sent_hash = None
+        await s.commit()
+    for _ in range(3):
+        await engine.run_once(ids["channel_id"])
+    order = sorted(_posts(tg))
+    texts = [_posts(tg)[m]["text"] for m in order if m != ids["intro"]]
+    assert [t.split("\n")[0] for t in texts[:3]] == [
+        "🗺️Travel [путешествия]",
+        "✏️VPN [Впн]",
+        "✏️Design [Дизайн]",
+    ]
+    assert texts[-1].startswith("Навигационная панель") and len(texts) == 4
