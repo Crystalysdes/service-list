@@ -43,7 +43,7 @@ async def pay(ctx, tg, db):
             s.add(User(id=uid, username=username, first_name=name, lang="ru", captcha_passed_at=utcnow()))
             tg.add_user(uid, name, username)
         s.add_all([Staff(user_id=MOD, role="moderator"), Staff(user_id=ADMIN, role="admin")])
-        await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, cleanup_minutes=60)
+        await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, cleanup_minutes=60, fee_bps=500)
         await update_settings(s, EscrowRuntime, pool_creators=[KEEPER])  # the owner vouched for it
         await s.commit()
     for chat_id, title in ((G1, "Pool 1"), (G2, "Pool 2")):

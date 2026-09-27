@@ -401,6 +401,49 @@ cmd_config() {
 }
 
 # ------------------------------------------------------------------------------------------ deploy
+# A release that changes how money is kept can refuse to go live while the running bot still holds work of
+# the old kind. Every deploy/gates/*.sql the target commit adds (compared with what runs now) is run on the
+# live database and returns one line per blocker; any line stops the deploy and the running version stays.
+# A "-- hint: …" line of the file says what to do. A fresh install (no "deals" table) has nothing to check.
+db_query() {  # SQL on stdin → rows, tab-separated
+    docker compose exec -T db psql -U servicelist -d servicelist -At -v ON_ERROR_STOP=1 -F $'\t'
+}
+
+db_ready() {
+    local deadline=$((SECONDS + 60))
+    docker compose up -d db >/dev/null 2>&1 || return 1
+    until docker compose exec -T db pg_isready -U servicelist -d servicelist >/dev/null 2>&1; do
+        ((SECONDS < deadline)) || return 1
+        sleep 2
+    done
+}
+
+run_gates() {  # $1: the commit about to be deployed
+    local target=$1 gates gate out hint="" found=""
+    gates=$(git diff --name-only --diff-filter=A HEAD "$target" -- deploy/gates | grep '\.sql$' || true)
+    [[ -n "$gates" ]] || return 0
+    if [[ "${SL_DRY_RUN:-}" == 1 ]]; then
+        info "DRY: проверки перед обновлением пропущены: $gates"
+        return 0
+    fi
+    db_ready || die "База данных не отвечает — проверки перед обновлением не выполнить, обновление отменено"
+    out=$(printf "SELECT to_regclass('public.deals') IS NOT NULL;\n" | db_query) ||
+        die "Не удалось проверить базу перед обновлением"
+    [[ "$out" == t ]] || return 0
+    while IFS= read -r gate; do
+        info "Проверка перед обновлением: $gate"
+        out=$(git show "$target:$gate" | db_query) || die "Проверка $gate не выполнилась (ошибка выше)"
+        if [[ -n "$out" ]]; then
+            found+="$out"$'\n'
+            hint+=$(git show "$target:$gate" | sed -n 's/^-- hint: //p')$'\n'
+        fi
+    done <<<"$gates"
+    [[ -z "$found" ]] && return 0
+    printf '%s' "$found" | sed 's/^/  • /' >&2
+    printf '%s' "$hint" >&2
+    die "Обновление остановлено: сначала устраните это на работающей версии, затем запустите обновление снова"
+}
+
 self_update() {
     local source="$SL_DIR/deploy/servicelist"
     [[ -f "$source" && "$SL_SELF" == /usr/local/bin/servicelist && -w "$(dirname "$SL_SELF")" ]] || return 0
@@ -448,6 +491,7 @@ cmd_deploy() {
         fi
         target=$sha
     fi
+    run_gates "$target"
     run git checkout --quiet --force -B "$current_branch" "$target"
     self_update
     [[ -f "$ENV_FILE" ]] || die "Нет настроек: выполните «servicelist config»"
@@ -573,4 +617,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then  # sourced by the tests: functions only
+    main "$@"
+fi

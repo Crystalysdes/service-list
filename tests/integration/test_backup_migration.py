@@ -310,12 +310,14 @@ async def test_stats_templates_and_settings(h, tg, db, ctx):
 
 async def test_an_archive_from_before_monthly_listings_gets_them_too(db):
     from app.services.backup import _after_restore
-    from app.services.settings import Prices, save_settings
+    from app.services.settings import Escrow, Prices, save_settings
 
-    for revision, days in (("0007", 30), ("0008", 0), (None, 0)):
+    for revision, days, fee in (("0007", 30, 100), ("0008", 0, 100), ("0009", 0, 500), (None, 0, 500)):
         async with db.session() as s:
             await save_settings(s, Prices(listing_days=0))
+            await save_settings(s, Escrow(fee_bps=500))
             await _after_restore(s, {"alembic_revision": revision})
             await s.commit()
         async with db.session() as s:
             assert (await get_settings(s, Prices)).listing_days == days, revision
+            assert (await get_settings(s, Escrow)).fee_bps == fee, revision  # 0009: the garant takes 1%

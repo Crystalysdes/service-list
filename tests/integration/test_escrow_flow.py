@@ -30,7 +30,7 @@ async def pay(ctx, tg, db):
         ):
             s.add(User(id=uid, username=username, first_name=name, lang="ru", captcha_passed_at=utcnow()))
             tg.add_user(uid, name, username)
-        await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0)
+        await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, fee_bps=500)  # the sums below
         await s.commit()
     tg.add_user(OWNER_ID, "Owner", "owner")
     return fake

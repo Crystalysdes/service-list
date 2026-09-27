@@ -498,6 +498,10 @@ SETTINGS_UPGRADES = {
         "UPDATE settings SET value = jsonb_set(value, '{listing_days}', '30') "
         "WHERE key = 'prices' AND jsonb_typeof(value) = 'object' AND value->>'listing_days' = '0'"
     ),
+    9: (  # 0009: the garant's fee is 1%
+        "UPDATE settings SET value = jsonb_set(value, '{fee_bps}', '100') "
+        "WHERE key = 'escrow' AND jsonb_typeof(value) = 'object' AND value ? 'fee_bps'"
+    ),
 }
 
 

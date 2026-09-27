@@ -172,7 +172,7 @@ class Escrow(SettingsGroup):
     KEY: ClassVar[str] = "escrow"
 
     enabled: bool = False  # new deals are accepted (the owner switches it on)
-    fee_bps: int = 500  # the service's fee in basis points: 500 = 5%
+    fee_bps: int = 100  # the service's fee in basis points: 100 = 1% (the gateway's fees come on top)
     min_cents: int = 500
     max_cents: int = 100_000
     delivery_days: list[int] = Field(default_factory=lambda: [1, 3, 7, 14])  # offered when creating

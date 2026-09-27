@@ -25,7 +25,7 @@ async def _setup(db, **settings):
     async with db.session() as s:
         for uid, name in ((BUYER, "buyer_b"), (SELLER, "seller_s"), (STRANGER, "stranger_x")):
             s.add(User(id=uid, username=name, lang="ru", captcha_passed_at=utcnow()))
-        await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, **settings)
+        await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, **{"fee_bps": 500, **settings})
         await s.commit()
 
 

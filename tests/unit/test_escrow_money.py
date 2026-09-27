@@ -74,3 +74,11 @@ def test_terms_hash_is_stable_and_sensitive():
     a = {"amount": 100, "terms": "Логотип", "fee_payer": "buyer"}
     assert terms_hash(a) == terms_hash(dict(reversed(list(a.items()))))
     assert terms_hash(a) != terms_hash({**a, "amount": 101})
+
+
+def test_the_garant_takes_one_percent_by_default():
+    from app.services.settings import Escrow
+
+    settings = Escrow()
+    assert settings.fee_bps == 100 and settings.fee_percent == 1
+    assert amounts(10_000, settings.fee_bps, "buyer").buyer_pays == 10_100  # 100 USDT + 1 USDT

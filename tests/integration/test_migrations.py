@@ -72,13 +72,32 @@ def test_listings_become_monthly_but_a_stored_price_stays():
             timeout=60,
         )
         assert result.returncode == 0, result.stderr[-2000:]
-        assert _alembic("upgrade", "head").returncode == 0
-        value = subprocess.run(
-            ["psql", url, "-At", "-c", "SELECT value::text FROM settings WHERE key = 'prices'"],
+        assert _alembic("upgrade", "0008").returncode == 0
+        escrow = '{"enabled": true, "fee_bps": 500, "release_hours": 72}'
+        result = subprocess.run(
+            [
+                "psql",
+                url,
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                f"INSERT INTO settings (key, value, updated_at) VALUES ('escrow', '{escrow}', now())",
+            ],
             capture_output=True,
-            text=True,
             timeout=60,
-        ).stdout.strip()
-        assert '"listing_days": 30' in value and '"listing_cents": 1500' in value
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert _alembic("upgrade", "head").returncode == 0
+
+        def stored(key: str) -> str:
+            return subprocess.run(
+                ["psql", url, "-At", "-c", f"SELECT value::text FROM settings WHERE key = '{key}'"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ).stdout.strip()
+
+        assert '"listing_days": 30' in stored("prices") and '"listing_cents": 1500' in stored("prices")
+        assert '"fee_bps": 100' in stored("escrow") and '"release_hours": 72' in stored("escrow")  # 0009: 1%
     finally:
         _psql(f"DROP DATABASE IF EXISTS {NAME}")

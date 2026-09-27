@@ -34,7 +34,9 @@ async def pay(ctx, tg, db):
             s.add(User(id=uid, username=username, first_name=name, lang="ru", captcha_passed_at=utcnow()))
             tg.add_user(uid, name, username)
         s.add_all([Staff(user_id=MOD, role="moderator"), Staff(user_id=ADMIN, role="admin")])
-        await update_settings(s, Escrow, enabled=True, create_cooldown_sec=0, admin_only_from_cents=50_000)
+        await update_settings(
+            s, Escrow, enabled=True, create_cooldown_sec=0, admin_only_from_cents=50_000, fee_bps=500
+        )
         await s.commit()
     return fake
 
