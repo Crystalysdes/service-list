@@ -562,6 +562,7 @@ class Deal(TimestampMixin, Base):
             "OR (verdict_by <> coalesce(buyer_id, 0) AND verdict_by <> coalesce(seller_id, 0))",
             name="judge_not_party",
         ),
+        CheckConstraint("gateway IN ('cryptopay', 'apirone')", name="gateway_valid"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -617,10 +618,17 @@ class Deal(TimestampMixin, Base):
     data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
     needs_attention: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     note: Mapped[str | None] = mapped_column(Text)
+    # where the money of the deal is: "apirone" (every deal since the switch) or "cryptopay" (the ones before;
+    # the bot no longer moves their money: staff pay them out of the Crypto Pay app by hand)
+    gateway: Mapped[str] = mapped_column(String(12), default="apirone", server_default=text("'apirone'"))
+    # where each side's payout goes (USDT BEP20, EIP-55 form); not part of the terms, changed by its side only
+    seller_address: Mapped[str | None] = mapped_column(String(64))
+    buyer_address: Mapped[str | None] = mapped_column(String(64))
 
 
 class DealInvoice(TimestampMixin, Base):
-    """A Crypto Pay invoice of a deal (kept apart from the listing invoices)."""
+    """The buyer's invoice of a deal: at Apirone one per deal, with an address of its own (money sent there
+    at any time belongs to the deal, see ``DealReceipt``); the older deals had Crypto Pay invoices."""
 
     __tablename__ = "deal_invoices"
     __table_args__ = (
@@ -633,18 +641,30 @@ class DealInvoice(TimestampMixin, Base):
             unique=True,
             postgresql_where=text("disposition = 'funded'"),
         ),
+        Index(
+            "uq_deal_invoices_one_per_deal",
+            "deal_id",
+            unique=True,
+            postgresql_where=text("address IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id", ondelete="RESTRICT"), index=True)
-    provider_invoice_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    provider_invoice_id: Mapped[str] = mapped_column(String(64), unique=True)
     payload: Mapped[str] = mapped_column(String(64))
-    pay_url: Mapped[str] = mapped_column(String(512))
+    pay_url: Mapped[str | None] = mapped_column(String(512))
     amount_cents: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(
-        String(16), default="active", index=True
-    )  # active/paid/expired/deleted
+    # active (can be paid) / paid (it funded the deal) / closed (the deal ended unpaid) / expired;
+    # Crypto Pay's also deleted
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     disposition: Mapped[str | None] = mapped_column(String(12))  # funded / extra / mismatch
+    address: Mapped[str | None] = mapped_column(
+        String(64), index=True, unique=True
+    )  # Apirone's deposit address, lower-case: one invoice's only
+    remote_status: Mapped[str | None] = mapped_column(
+        String(16)
+    )  # created/partpaid/paid/overpaid/completed/expired
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paid_amount: Mapped[str | None] = mapped_column(String(32))
@@ -653,8 +673,37 @@ class DealInvoice(TimestampMixin, Base):
     raw: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
 
 
+class DealReceipt(TimestampMixin, Base):
+    """Money that came to a deal invoice's address: one row per transaction, whichever look saw it first (the
+    invoice or the account's history). ``purpose`` says where it went; a row without one waits."""
+
+    __tablename__ = "deal_receipts"
+    __table_args__ = (
+        UniqueConstraint("invoice_id", "txid"),
+        CheckConstraint("cents >= 0", name="cents_valid"),
+        CheckConstraint("purpose IS NULL OR purpose IN ('deal', 'refund', 'review')", name="purpose_valid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id", ondelete="RESTRICT"), index=True)
+    invoice_id: Mapped[int] = mapped_column(ForeignKey("deal_invoices.id", ondelete="RESTRICT"), index=True)
+    txid: Mapped[str] = mapped_column(String(128))
+    amount: Mapped[str] = mapped_column(String(40))  # minor units (10**-18 USDT) as digits: beyond 64 bits
+    cents: Mapped[int] = mapped_column(Integer)  # the amount rounded down to a cent
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # deal (it paid for the deal) / refund (goes back to the buyer by payout_id) / review (the owner decides)
+    purpose: Mapped[str | None] = mapped_column(String(8))
+    payout_id: Mapped[int | None] = mapped_column(ForeignKey("deal_payouts.id", ondelete="RESTRICT"))
+    source: Mapped[str] = mapped_column(String(8), default="invoice")  # invoice / history
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+
+
 class DealPayout(TimestampMixin, Base):
-    """Money sent out of a deal. One per deal and side; spend_id makes the transfer happen once."""
+    """Money sent out of a deal: one per deal and side, plus the refunds of money that did not fit the deal.
+
+    Apirone has no idempotency key: a payout is claimed (``sending``, the address fixed) before its transfer,
+    and one whose outcome is unknown is only ever looked up in the account's history, never sent again by
+    the bot (``txid`` ties it to its transaction)."""
 
     __tablename__ = "deal_payouts"
     __table_args__ = (
@@ -665,12 +714,7 @@ class DealPayout(TimestampMixin, Base):
             unique=True,
             postgresql_where=text("purpose IN ('seller', 'buyer')"),
         ),
-        Index(
-            "uq_deal_payouts_source_invoice",
-            "source_invoice_id",
-            unique=True,
-            postgresql_where=text("source_invoice_id IS NOT NULL"),
-        ),
+        Index("uq_deal_payouts_txid", "txid", unique=True, postgresql_where=text("txid IS NOT NULL")),
         Index("ix_deal_payouts_status_next", "status", "next_attempt_at"),
         CheckConstraint("amount_cents > 0", name="positive"),
         CheckConstraint("purpose <> 'extra' OR source_invoice_id IS NOT NULL", name="extra_has_source"),
@@ -682,17 +726,55 @@ class DealPayout(TimestampMixin, Base):
     source_invoice_id: Mapped[int | None] = mapped_column(ForeignKey("deal_invoices.id", ondelete="RESTRICT"))
     recipient_id: Mapped[int] = mapped_column(BigInteger, index=True)
     amount_cents: Mapped[int] = mapped_column(Integer)
-    # pending / sending / done / retry / failed / unknown / manual
+    # pending / sending / done / retry / failed / unknown / manual / no_address
     status: Mapped[str] = mapped_column(String(16), default="pending")
-    spend_id: Mapped[str] = mapped_column(String(64), unique=True)
+    spend_id: Mapped[str] = mapped_column(String(64), unique=True)  # the payout's own name (esc-{code}-...)
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    transfer_id: Mapped[int | None] = mapped_column(BigInteger)
+    transfer_id: Mapped[str | None] = mapped_column(String(128))
+    address: Mapped[str | None] = mapped_column(String(64), index=True)  # fixed when claimed, lower-case
+    txid: Mapped[str | None] = mapped_column(String(128))
+    fee_minor: Mapped[str | None] = mapped_column(String(40))  # the fees taken out of it, minor units
+    doubt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # its outcome became unknown
     last_error: Mapped[str | None] = mapped_column(String(256))
     manual_ref: Mapped[str | None] = mapped_column(Text)
     decided_by: Mapped[int | None] = mapped_column(BigInteger)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+
+
+class EscrowWallet(TimestampMixin, Base):
+    """The address a user last gave for garant payouts: offered again in their next deal."""
+
+    __tablename__ = "escrow_wallets"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    currency: Mapped[str] = mapped_column(String(16), primary_key=True)
+    address: Mapped[str] = mapped_column(String(64))
+
+
+class EscrowWithdrawal(TimestampMixin, Base):
+    """The owner takes the garant's income (its fees) off the Apirone account: sent like a payout, once."""
+
+    __tablename__ = "escrow_withdrawals"
+    __table_args__ = (
+        Index("uq_escrow_withdrawals_txid", "txid", unique=True, postgresql_where=text("txid IS NOT NULL")),
+        CheckConstraint("amount_cents > 0", name="positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(BigInteger)
+    address: Mapped[str] = mapped_column(String(64))  # lower-case
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(12), default="sending")  # sending / unknown / done / failed
+    transfer_id: Mapped[str | None] = mapped_column(String(128))
+    txid: Mapped[str | None] = mapped_column(String(128))
+    fee_minor: Mapped[str | None] = mapped_column(String(40))
+    last_error: Mapped[str | None] = mapped_column(String(256))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    doubt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
 
 

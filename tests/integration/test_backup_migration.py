@@ -321,3 +321,42 @@ async def test_an_archive_from_before_monthly_listings_gets_them_too(db):
         async with db.session() as s:
             assert (await get_settings(s, Prices)).listing_days == days, revision
             assert (await get_settings(s, Escrow)).fee_bps == fee, revision  # 0009: the garant takes 1%
+
+
+async def test_an_archive_from_before_apirone_brings_its_deals_back_as_crypto_pay(db):
+    from datetime import UTC, datetime
+
+    from app.db.models import DealInvoice, DealPayout
+    from app.services.backup import _after_restore, _decode_row
+    from app.services.settings import EscrowRuntime
+
+    # Crypto Pay's ids were numbers: the text columns of today take them as text
+    assert _decode_row(DealInvoice.__table__, {"provider_invoice_id": 123456789012})[
+        "provider_invoice_id"
+    ] == ("123456789012")
+    assert _decode_row(DealPayout.__table__, {"transfer_id": 5, "amount_cents": 7}) == {
+        "transfer_id": "5",
+        "amount_cents": 7,
+    }
+    assert _decode_row(DealPayout.__table__, {"transfer_id": None})["transfer_id"] is None
+    insert = text(
+        "INSERT INTO deals (code, status, creator_id, creator_role, buyer_id, seller_id, title, terms, "
+        "terms_hash, amount_cents, fee_cents, buyer_pays_cents, seller_gets_cents, fee_bps, fee_payer, "
+        "delivery_days, pay_hours, release_hours, grace_hours) "
+        "VALUES (:code, 'funded', 1, 'buyer', 1, 2, 't', 't', 'h', 1000, 50, 1050, 1000, 500, 'buyer', "
+        "3, 24, 72, 24)"
+    )
+    made = "2026-09-01T10:00:00+00:00"
+    for revision, gateway in (("0009", "cryptopay"), ("0010", "apirone")):
+        async with db.session() as s:
+            await s.execute(text("DELETE FROM deals"))
+            await s.execute(insert, {"code": f"c{revision}"})
+            await _after_restore(s, {"alembic_revision": revision, "created_at": made})
+            await s.commit()
+        async with db.session() as s:
+            assert (await s.execute(text("SELECT gateway FROM deals"))).scalar_one() == gateway, revision
+            runtime = await get_settings(s, EscrowRuntime)
+        assert runtime.payouts_paused and runtime.pause_reason == "restore"
+        assert runtime.restored_backup_at == datetime(
+            2026, 9, 1, 10, tzinfo=UTC
+        )  # the history is read from here

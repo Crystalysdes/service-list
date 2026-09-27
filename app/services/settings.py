@@ -201,7 +201,8 @@ class GlowPacks(SettingsGroup):
 
 
 class EscrowRuntime(SettingsGroup):
-    """The garant's state kept by the bot: the payout pause and the last check of the Crypto Pay balance."""
+    """The garant's state kept by the bot: the payout pause, the last reconciliation with Apirone, the
+    outgoing payments no payout explains."""
 
     KEY: ClassVar[str] = "escrow_runtime"
 
@@ -209,12 +210,20 @@ class EscrowRuntime(SettingsGroup):
     pause_reason: str | None = None
     paused_at: datetime | None = None
     last_reconcile_at: datetime | None = None
-    last_balance: dict[str, Any] = Field(default_factory=dict)  # cents: available, onhold, owed
+    last_balance: dict[str, Any] = Field(default_factory=dict)  # cents: available, total and what is owed
     problems: list[str] = Field(default_factory=list)  # what the last check found
     told: list[str] = Field(default_factory=list)  # of those, the passing ones already told to the owner
     # accounts the owner vouched for as creators of deal groups (a service account): a group's creator stays
     # in every deal held there, so only these, the owners and current admins may be one
     pool_creators: list[int] = Field(default_factory=list)
+    switched_at: datetime | None = None  # the garant moved from Crypto Pay to Apirone (done once)
+    scanned_at: datetime | None = None  # the account's history was read in full up to here
+    restored_backup_at: datetime | None = None  # a restore brought back the state of this moment
+    # money that left the account with no payout or withdrawal of the bot behind it (a transfer made by hand,
+    # one made before a restore): [{txid, item, date, amount, addresses, status: open / owner}]; payouts to
+    # the addresses of an open one wait until the owner says what it was
+    unknown_payments: list[dict[str, Any]] = Field(default_factory=list)
+    withdraw_address: str | None = None  # where the owner's last withdrawal went
 
 
 class Payments(SettingsGroup):

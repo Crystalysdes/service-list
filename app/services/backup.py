@@ -21,7 +21,7 @@ import struct
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,7 @@ from aiogram.types import FSInputFile
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from sqlalchemy import URL, DateTime, Integer, func, make_url, select, text
+from sqlalchemy import URL, DateTime, Integer, String, func, make_url, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from app.config import Config
@@ -423,6 +423,8 @@ def _decode_row(table: Any, row: dict[str, Any]) -> dict[str, Any]:
         value = row[column.name]
         if value is not None and isinstance(column.type, DateTime) and isinstance(value, str):
             value = datetime.fromisoformat(value)
+        elif isinstance(column.type, String) and type(value) in (int, float):
+            value = str(value)  # a column that held numbers in an older archive (Crypto Pay's ids)
         result[column.name] = value
     return result
 
@@ -492,8 +494,8 @@ async def restore_archive(
     return RestoreResult(tables=counts, media=len(extracted), created_at=manifest.get("created_at"))
 
 
-# what migrations did to stored settings, done again to an archive made before them: {revision: SQL}
-SETTINGS_UPGRADES = {
+# what migrations did to stored data, done again to an archive made before them: {revision: SQL}
+ARCHIVE_UPGRADES = {
     8: (  # 0008: a listing "forever" became a listing for 30 days
         "UPDATE settings SET value = jsonb_set(value, '{listing_days}', '30') "
         "WHERE key = 'prices' AND jsonb_typeof(value) = 'object' AND value->>'listing_days' = '0'"
@@ -502,12 +504,21 @@ SETTINGS_UPGRADES = {
         "UPDATE settings SET value = jsonb_set(value, '{fee_bps}', '100') "
         "WHERE key = 'escrow' AND jsonb_typeof(value) = 'object' AND value ? 'fee_bps'"
     ),
+    10: "UPDATE deals SET gateway = 'cryptopay'",  # 0010: the deals before Apirone are Crypto Pay's
 }
+
+
+def _archive_time(manifest: dict[str, Any] | None) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(str((manifest or {}).get("created_at") or ""))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
 async def _after_restore(session: AsyncSession, manifest: dict[str, Any] | None = None) -> None:
     revision = str((manifest or {}).get("alembic_revision") or "")
-    for since, sql in SETTINGS_UPGRADES.items():
+    for since, sql in ARCHIVE_UPGRADES.items():
         if revision.isdigit() and int(revision) < since:
             await session.execute(text(sql))
     # the new server must prove premium emoji work again before posts with them are touched
@@ -515,10 +526,16 @@ async def _after_restore(session: AsyncSession, manifest: dict[str, Any] | None 
     from app.services.announce import cancel_unfinished
 
     await cancel_unfinished(session)  # the archive may predate announcements sent since
-    # the archive may predate payouts made since: garant payouts wait until the owner has checked
+    # the archive may predate payouts made since: garant payouts wait until the account's history since the
+    # archive was made is checked (a payout sent after it must not go out a second time)
     if await session.scalar(select(func.count()).select_from(Deal)):
         await update_settings(
-            session, EscrowRuntime, payouts_paused=True, pause_reason="restore", paused_at=utcnow()
+            session,
+            EscrowRuntime,
+            payouts_paused=True,
+            pause_reason="restore",
+            paused_at=utcnow(),
+            restored_backup_at=_archive_time(manifest) or utcnow() - timedelta(days=30),
         )
 
 
