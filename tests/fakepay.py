@@ -22,6 +22,8 @@ class FakeCryptoPay:
             "invoice_id": self.next_id,
             "status": "active",
             "bot_invoice_url": f"https://t.me/CryptoBot?start=IV{self.next_id}",
+            "mini_app_invoice_url": f"https://t.me/CryptoBot/app?startapp=invoice-IV{self.next_id}&mode=compact",
+            "web_app_invoice_url": f"https://app.send.tg/invoices/IV{self.next_id}",
             "amount": f"{amount_cents / 100:.2f}",
             "payload": payload,
             "fiat": "USD",

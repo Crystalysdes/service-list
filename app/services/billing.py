@@ -161,6 +161,13 @@ async def create_order(
     return order
 
 
+def browser_url(invoice: Invoice) -> str | None:
+    """The invoice's page in the web version of Crypto Bot: paid in any browser, for when the window Telegram
+    opens for @CryptoBot fails (Telegram Desktop's "WebView crashed")."""
+    url = (invoice.raw or {}).get("web_app_invoice_url")
+    return url if isinstance(url, str) and url.startswith("https://") and len(url) <= 512 else None
+
+
 async def active_invoice(session: AsyncSession, order: Order, now: datetime | None = None) -> Invoice | None:
     now = now or utcnow()
     return (

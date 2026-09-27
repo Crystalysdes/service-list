@@ -40,18 +40,20 @@ async def send_invoice(message: Message, data: dict[str, Any], order: Order) -> 
     builder.button(
         text=t("pay.button", price=billing.money(order.amount_cents)), url=invoice.pay_url, style="success"
     )
+    text = t(
+        "pay.invoice",
+        price=billing.money(order.amount_cents),
+        title=_cap(h(option_title(t, order))),
+        minutes=minutes,
+    )
+    web = billing.browser_url(invoice)
+    if web:
+        builder.button(text=t("pay.browser"), url=web)
+        text += "\n\n" + t("pay.browser_hint")
     builder.button(text=t("pay.check"), callback_data=f"paid:{order.id}")
     builder.button(text=t("common.menu"), callback_data="m:menu")
     builder.adjust(1)
-    await message.answer(
-        t(
-            "pay.invoice",
-            price=billing.money(order.amount_cents),
-            title=_cap(h(option_title(t, order))),
-            minutes=minutes,
-        ),
-        reply_markup=builder.as_markup(),
-    )
+    await message.answer(text, reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^pay:\d+$"))

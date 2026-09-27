@@ -83,6 +83,9 @@ async def test_submit_approve_pay_publish(h, tg, db, ctx):
     invoice_msg = h.last(USER)
     assert "Счёт на $10" in invoice_msg["text"] and "на 1 мес." in invoice_msg["text"]
     assert h.button(invoice_msg, "Оплатить")["url"].startswith("https://t.me/CryptoBot")
+    # Telegram's own window for @CryptoBot may fail ("WebView crashed"): the web version opens in a browser
+    assert h.button(invoice_msg, "в браузере")["url"] == f"https://app.send.tg/invoices/IV{pay.next_id}"
+    assert "сбой WebView" in invoice_msg["text"]
     await h.press(USER, invoice_msg, "Я оплатил")  # not paid yet -> alert, nothing changes
     async with db.session() as s:
         service = (await s.execute(select(Service).where(Service.name == "Fly Cheap"))).scalar_one()

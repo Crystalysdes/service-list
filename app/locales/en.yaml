@@ -98,6 +98,8 @@ pay:
   invoice: "💳 <b>Invoice for {price}</b>\n{title}\n\nPay in @CryptoBot (USDT, TON or BTC) within {minutes} min. Everything is activated automatically after payment."
   open: "💳 Go to payment"
   check: "✅ I have paid"
+  browser: "🌐 Pay in browser"
+  browser_hint: "If CryptoBot's window in Telegram does not open or shows a WebView error, tap «🌐 Pay in browser»: the web version of CryptoBot opens."
   not_yet: "The payment has not arrived yet. If you have just paid, wait a minute and press again."
   unavailable: "Payment is temporarily unavailable, please try later."
   adding: "✅ Payment received! Adding “{name}” to the “{category}” branch — I will message you as soon as it shows in the channel."
