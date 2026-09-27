@@ -193,8 +193,9 @@ async def after_paid(ctx: AppContext, result: PaidResult) -> None:
         builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
         builder.adjust(1)
         username = f"@{user.username}" if user and user.username else str(order.user_id)
+        way = " (USDT BEP20, Apirone)" if order.provider == "apirone" else ""
         staff_text = (
-            f"💰 Оплата {money(order.amount_cents)}: {h(option_title(Translator('ru'), order))} — "
+            f"💰 Оплата {money(order.amount_cents)}{way}: {h(option_title(Translator('ru'), order))} — "
             f"«{h(service.name)}» ({h(category.title if category else '')}) от {h(username)}"
         )
         if result.status != "ok":

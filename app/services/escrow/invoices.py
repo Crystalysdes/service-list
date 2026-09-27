@@ -118,16 +118,16 @@ async def invoice_for(
                 "escrow invoice %s does not match deal %s: %r", created.invoice_id, deal.id, created.raw
             )
             raise DealError("provider")
-        other = await session.scalar(
-            select(DealInvoice.deal_id).where(DealInvoice.address == created.address).limit(1)
-        )
-        if other is not None:  # money there could be either deal's: the garant stops taking payments
-            log.error("escrow invoice %s reuses the address of deal %s", created.invoice_id, other)
+        from app.services.apirone_pay import address_owner
+
+        other = await address_owner(session, created.address)
+        if other is not None:  # money there could be either one's: the garant stops taking payments
+            log.error("escrow invoice %s reuses the address of %s", created.invoice_id, other)
             from app.services.escrow.notify import alert_owner
 
             await alert_owner(
                 ctx,
-                f"⛔️ Apirone выдал для сделки #{deal.id} адрес, который уже был у сделки #{other}: "
+                f"⛔️ Apirone выдал для сделки #{deal.id} адрес, который уже был у {other}: "
                 "деньги на нём не разделить, поэтому бот не показывает такие счета. Напишите в поддержку "
                 "Apirone; пока это не решено, оплатить сделку нельзя.",
                 once=f"escrow_address_reuse:{created.address}",
@@ -330,6 +330,14 @@ async def scan_receipts(ctx: AppContext, since: datetime) -> tuple[list[Funding]
                     )
                 ).scalars()
             )
+        if not rows:  # an order's invoice (listings and options are paid here too): its own reading
+            from app.services import apirone_pay
+
+            async with ctx.db.session() as session:
+                listing = await apirone_pay.invoice_at(session, addresses)
+            if listing is not None:
+                await apirone_pay.history_receipt(ctx, listing, keys[0], item.amount, confirmed)
+                continue
         if len(rows) != 1:  # nobody's, or the item names the addresses of several invoices
             where = ", ".join(short(a) for a in sorted(addresses)) or "?"
             whose = "это не адрес счёта сделки" if not rows else "неясно, какой из сделок оно"

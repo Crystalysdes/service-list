@@ -220,12 +220,22 @@ class Order(TimestampMixin, Base):
 
 
 class Invoice(TimestampMixin, Base):
+    """An invoice of an order: Crypto Pay's (cryptobot) or Apirone's (apirone: USDT BEP20 to an address of its
+    own, the garant's account; money sent there later is noticed by the account's history)."""
+
     __tablename__ = "invoices"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), index=True)
     provider: Mapped[str] = mapped_column(String(16), default="cryptobot")
-    provider_invoice_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    provider_invoice_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)  # Crypto Pay's id
+    remote_id: Mapped[str | None] = mapped_column(String(64), unique=True)  # Apirone's id
+    address: Mapped[str | None] = mapped_column(String(64), index=True, unique=True)  # Apirone's, lower-case
+    remote_status: Mapped[str | None] = mapped_column(String(16))  # Apirone's status last seen
+    received_minor: Mapped[str | None] = mapped_column(String(40))  # USDT minor units seen at the address
+    # transactions to the address already accounted for (paid it, or told staff about): any other that the
+    # account's history shows later is a late payment for staff
+    txids: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))
     pay_url: Mapped[str] = mapped_column(String(512))
     amount_cents: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(

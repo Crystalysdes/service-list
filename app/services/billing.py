@@ -171,13 +171,16 @@ def browser_url(invoice: Invoice) -> str | None:
     return url if isinstance(url, str) and url.startswith("https://") and len(url) <= 512 else None
 
 
-async def active_invoice(session: AsyncSession, order: Order, now: datetime | None = None) -> Invoice | None:
+async def active_invoice(
+    session: AsyncSession, order: Order, now: datetime | None = None, *, provider: str = "cryptobot"
+) -> Invoice | None:
     now = now or utcnow()
     return (
         await session.execute(
             select(Invoice)
             .where(
                 Invoice.order_id == order.id,
+                Invoice.provider == provider,
                 Invoice.status == "active",
                 Invoice.expires_at > now + timedelta(seconds=60),
             )
@@ -214,7 +217,11 @@ async def ensure_invoice(ctx: AppContext, session: AsyncSession, order: Order) -
     if existing is not None:
         return existing
     stale = (
-        await session.execute(select(Invoice).where(Invoice.order_id == order.id, Invoice.status == "active"))
+        await session.execute(
+            select(Invoice).where(
+                Invoice.order_id == order.id, Invoice.status == "active", Invoice.provider == "cryptobot"
+            )
+        )
     ).scalars()
     for invoice in stale:
         # only an invoice Crypto Pay really deleted is forgotten: one it refused may have just been paid, and
@@ -302,30 +309,42 @@ async def handle_paid(ctx: AppContext, invoice: CryptoInvoice) -> PaidResult:
             order.status = "needs_attention"
             order.note = f"payload/amount mismatch: {invoice.payload} {invoice.amount}"
             result.status = "mismatch"
-        elif order.status not in OPEN_ORDER:
-            # settled already (another invoice, by hand) or closed (superseded, cancelled, the service
-            # banned): this money is not spent automatically, staff decide
-            why = f"оплачен счёт заказа в статусе «{order.status}» — верните оплату или выполните вручную"
-            if order.status not in ("paid", "fulfilled", "refunded"):
-                order.status = "needs_attention"
-            order.note = why
-            result.status = "attention"
-            result.notes = [why]
         else:
-            order.status = "paid"
-            order.paid_at = now
-            try:
-                result.notes = await fulfil(session, order, now)
-                order.status = "fulfilled"
-                order.fulfilled_at = now
-            except FulfilError as exc:
-                order.status = "needs_attention"
-                order.note = str(exc)
-                result.status = "attention"
-                result.notes = [str(exc)]
+            await settle_order(session, order, now, result)
         await audit(session, order.user_id, "order.paid", "order", order.id, {"status": result.status})
         await session.commit()
     return result
+
+
+async def settle_order(
+    session: AsyncSession, order: Order, now: datetime, result: PaidResult, *, provider: str | None = None
+) -> None:
+    """The order's invoice was paid (the caller holds the order's lock): it is carried out, or, when the
+    order no longer waits for this money, staff decide (``result`` says which). ``provider``: the way it was
+    paid, when that is not the order's own."""
+    if order.status not in OPEN_ORDER:
+        # settled already (another invoice, by hand) or closed (superseded, cancelled, the service
+        # banned): this money is not spent automatically, staff decide
+        why = f"оплачен счёт заказа в статусе «{order.status}» — верните оплату или выполните вручную"
+        if order.status not in ("paid", "fulfilled", "refunded"):
+            order.status = "needs_attention"
+        order.note = why
+        result.status = "attention"
+        result.notes = [why]
+        return
+    if provider is not None:
+        order.provider = provider
+    order.status = "paid"
+    order.paid_at = now
+    try:
+        result.notes = await fulfil(session, order, now)
+        order.status = "fulfilled"
+        order.fulfilled_at = now
+    except FulfilError as exc:
+        order.status = "needs_attention"
+        order.note = str(exc)
+        result.status = "attention"
+        result.notes = [str(exc)]
 
 
 def _norm_amount(value: str) -> str:
@@ -566,7 +585,7 @@ async def poll_invoices(
                 await session.execute(
                     select(Invoice, Order.status)
                     .join(Order, Order.id == Invoice.order_id)
-                    .where(Invoice.status == "active")
+                    .where(Invoice.status == "active", Invoice.provider == "cryptobot")
                 )
             ).all()
         )
@@ -630,7 +649,11 @@ async def check_order_now(ctx: AppContext, order_id: int) -> PaidResult | None:
             (
                 await session.execute(
                     select(Invoice)
-                    .where(Invoice.order_id == order_id, Invoice.status.in_(("active", "paid")))
+                    .where(
+                        Invoice.order_id == order_id,
+                        Invoice.status.in_(("active", "paid")),
+                        Invoice.provider == "cryptobot",
+                    )
                     .order_by(Invoice.id.desc())
                 )
             ).scalars()
@@ -652,7 +675,9 @@ async def check_order_now(ctx: AppContext, order_id: int) -> PaidResult | None:
 async def paid_total(session: AsyncSession, service_id: int) -> int:
     value = await session.scalar(
         select(func.coalesce(func.sum(Order.amount_cents), 0)).where(
-            Order.service_id == service_id, Order.status == "fulfilled", Order.provider == "cryptobot"
+            Order.service_id == service_id,
+            Order.status == "fulfilled",
+            Order.provider.in_(("cryptobot", "apirone")),
         )
     )
     return int(value or 0)

@@ -229,7 +229,8 @@ class EscrowRuntime(SettingsGroup):
 class Payments(SettingsGroup):
     KEY: ClassVar[str] = "payments"
 
-    accepted_assets: list[str] = Field(default_factory=lambda: ["USDT", "TON", "BTC"])
+    accepted_assets: list[str] = Field(default_factory=lambda: ["USDT", "TON", "BTC"])  # CryptoBot's
+    apirone: bool = True  # USDT BEP20 through Apirone too (when its account is set up: servicelist config)
 
 
 class LinkCheckSettings(SettingsGroup):

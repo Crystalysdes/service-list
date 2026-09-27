@@ -41,6 +41,9 @@ async def job_poll_invoices(ctx: AppContext) -> None:
     from app.services.purchases import after_paid
 
     await poll_invoices(ctx, on_paid=after_paid)  # the payer and staff hear right after each payment
+    from app.services import apirone_pay
+
+    await apirone_pay.poll(ctx, on_paid=after_paid)  # USDT BEP20 through Apirone
 
 
 async def job_expire_unpaid(ctx: AppContext) -> None:

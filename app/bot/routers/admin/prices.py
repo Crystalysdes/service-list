@@ -15,7 +15,7 @@ from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
 from app.services.audit import audit
 from app.services.billing import money
-from app.services.settings import Payments, Prices, Reminders, get_settings, save_settings
+from app.services.settings import Payments, Prices, Reminders, get_settings, save_settings, update_settings
 
 router = Router(name="admin_prices")
 router.message.filter(RoleFilter("admin"))
@@ -34,7 +34,7 @@ FIELDS = {
 }
 
 
-async def _screen(session: AsyncSession) -> tuple[str, Any]:
+async def _screen(session: AsyncSession, apirone_ready: bool = False) -> tuple[str, Any]:
     prices = await get_settings(session, Prices)
     reminders = await get_settings(session, Reminders)
     payments = await get_settings(session, Payments)
@@ -57,7 +57,13 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         f"Название из эмодзи: {money(prices.font_cents)} / мес.",
         f"Периоды: {periods}",
         f"Напоминания: за {', '.join(map(str, reminders.days_before))} дн.",
-        f"Оплата: {', '.join(payments.accepted_assets)}",
+        f"Оплата через CryptoBot: {', '.join(payments.accepted_assets)}",
+        "Оплата USDT BEP20 через Apirone (аккаунт гаранта): "
+        + (
+            ("включена" if apirone_ready else "включена, но аккаунт Apirone не задан (servicelist config)")
+            if payments.apirone
+            else "выключена"
+        ),
     ]
     builder = InlineKeyboardBuilder()
     for key, title in (
@@ -72,6 +78,10 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         ("assets", "Криптовалюты"),
     ):
         builder.button(text=f"✏️ {title}", callback_data=f"a:prices:{key}")
+    builder.button(
+        text="🪙 Выключить Apirone" if payments.apirone else "🪙 Включить Apirone",
+        callback_data="a:prices:apirone",
+    )
     builder.adjust(2)
     return "\n".join(lines), back_home(builder)
 
@@ -80,7 +90,20 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
 async def on_prices(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     await state.clear()
     await call.answer()
-    text, markup = await _screen(session)
+    text, markup = await _screen(session, data["ctx"].get("escrow_pay") is not None)
+    assert call.message is not None
+    await call.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "a:prices:apirone")
+async def on_apirone_toggle(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """USDT BEP20 through Apirone as a way to pay for listings and options, next to CryptoBot."""
+    payments = await get_settings(session, Payments)
+    await update_settings(session, Payments, apirone=not payments.apirone)
+    await audit(session, data["user"].id, "settings.apirone", data={"enabled": not payments.apirone})
+    await session.commit()
+    await call.answer("Оплата через Apirone " + ("выключена" if payments.apirone else "включена"))
+    text, markup = await _screen(session, data["ctx"].get("escrow_pay") is not None)
     assert call.message is not None
     await call.message.edit_text(text, reply_markup=markup)
 
@@ -150,13 +173,13 @@ async def input_price(message: Message, data: dict[str, Any], fsm: dict[str, Any
             assets = [a.upper() for a in raw.split() if a.upper() in ("USDT", "TON", "BTC")]
             if not assets:
                 raise ValueError
-            await save_settings(session, Payments(accepted_assets=assets))
+            await update_settings(session, Payments, accepted_assets=assets)
     except ValueError:
         await message.answer("Не получилось разобрать значение, попробуйте ещё раз.")
         return False
     if key not in ("reminders", "assets"):
         await save_settings(session, prices)
     await audit(session, data["user"].id, "prices.update", data={"key": key, "value": raw})
-    text, markup = await _screen(session)
+    text, markup = await _screen(session, data["ctx"].get("escrow_pay") is not None)
     await message.answer("✅ Сохранено.\n\n" + text, reply_markup=markup)
     return True
