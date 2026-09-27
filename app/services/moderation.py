@@ -6,8 +6,8 @@ import logging
 from datetime import timedelta
 from typing import Any
 
-from aiogram.exceptions import TelegramAPIError
-from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +21,7 @@ from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
 from app.services import billing, render_db
 from app.services.audit import audit
-from app.services.notify import staff_targets
+from app.services.notify import send_to_staff
 from app.services.settings import Limits, Prices, get_settings
 
 log = logging.getLogger(__name__)
@@ -268,33 +268,71 @@ def card_keyboard(request: ModerationRequest) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+async def safe_card_fragment(ctx: AppContext, session: AsyncSession, request: ModerationRequest) -> Fragment:
+    """The card, or a short one when it cannot be built: a request never goes unseen because of its card."""
+    try:
+        return await card_fragment(ctx, session, request)
+    except Exception:
+        log.exception("moderation card of request %s cannot be built", request.id)
+        service = await session.get(Service, request.service_id)
+        return Fragment.plain(
+            f"{KIND_TITLES.get(request.kind, request.kind)} #{request.id}\n"
+            f"Сервис: {service.name if service else '?'}\n"
+            "Полную карточку собрать не удалось — подробности в логе бота."
+        )
+
+
+def _entity_problem(exc: TelegramAPIError) -> bool:
+    text = (getattr(exc, "message", None) or str(exc)).lower()
+    return any(word in text for word in ("entit", "emoji", "document_invalid"))
+
+
 async def post_card(ctx: AppContext, request_id: int) -> None:
+    """The request's card for the moderators (see :func:`notify.send_to_staff`: a group that refuses never
+    swallows it). A card with premium emoji that a chat does not take goes without them."""
     bot = ctx.bot
     assert bot is not None
     async with ctx.db.session() as session:
         request = await session.get(ModerationRequest, request_id)
         if request is None:
             return
-        fragment = await card_fragment(ctx, session, request)
+        fragment = await safe_card_fragment(ctx, session, request)
         markup = card_keyboard(request)
-        targets = await staff_targets(ctx, session, "applications")
-        for chat_id, thread_id in targets:
+
+        async def send(chat_id: int, thread_id: int | None) -> Message:
+            assert bot is not None
+            entities = fragment.to_entities()
             try:
-                message = await bot.send_message(
+                return await bot.send_message(
                     chat_id,
                     fragment.text,
-                    entities=fragment.to_entities(),
+                    entities=entities,
                     parse_mode=None,
                     message_thread_id=thread_id,
                     reply_markup=markup,
                     link_preview_options=NO_PREVIEW,
                 )
-            except TelegramAPIError:
-                log.warning("cannot post moderation card to %s", chat_id, exc_info=True)
-                continue
+            except TelegramBadRequest as exc:
+                if not entities or not _entity_problem(exc):
+                    raise
+                log.warning("moderation card %s without premium emoji: %s", request_id, exc)
+                return await bot.send_message(
+                    chat_id,
+                    fragment.text,
+                    entities=[e for e in entities if e.type != "custom_emoji"],
+                    parse_mode=None,
+                    message_thread_id=thread_id,
+                    reply_markup=markup,
+                    link_preview_options=NO_PREVIEW,
+                )
+
+        for message in await send_to_staff(ctx, "applications", send, session=session):
             session.add(
                 ModerationCard(
-                    ref_type="request", ref_id=request.id, chat_id=chat_id, message_id=message.message_id
+                    ref_type="request",
+                    ref_id=request.id,
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
                 )
             )
         await session.commit()
@@ -315,7 +353,7 @@ async def close_cards(ctx: AppContext, ref_type: str, ref_id: int, line: str) ->
         )
         if ref_type == "request":
             request = await session.get(ModerationRequest, ref_id)
-            fragment = await card_fragment(ctx, session, request) if request else Fragment()
+            fragment = await safe_card_fragment(ctx, session, request) if request else Fragment()
         else:
             fragment = Fragment()
     final = fragment + Fragment.plain(f"\n\n{line}") if fragment.text else Fragment.plain(line)

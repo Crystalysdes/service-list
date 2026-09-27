@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import LinkPreviewOptions
+from aiogram.types import LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +31,7 @@ from app.services import billing
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.media import send_album
-from app.services.notify import notify_user, staff_targets
+from app.services.notify import notify_user, send_to_staff
 from app.services.settings import Chats, Limits, get_settings
 from app.services.timefmt import fmt_dt
 
@@ -244,26 +244,26 @@ async def post_case_card(ctx: AppContext, case_id: int, report_id: int | None = 
         for report in reports:
             if report_id is None or report.id == report_id:
                 media_ids.extend(report.media_ids or [])
-        targets = await staff_targets(ctx, session, "reports")
-        for chat_id, thread_id in targets:
+        markup = case_keyboard(case)
+
+        async def send(chat_id: int, thread_id: int | None) -> Message:
+            assert bot is not None
             try:
                 await send_album(bot, session, chat_id, media_ids, ctx.bot_id, message_thread_id=thread_id)
             except TelegramAPIError:
                 log.warning("cannot post case screenshots to %s", chat_id, exc_info=True)
-            try:
-                message = await bot.send_message(
-                    chat_id,
-                    text,
-                    message_thread_id=thread_id,
-                    reply_markup=case_keyboard(case),
-                    link_preview_options=NO_PREVIEW,
-                )
-            except TelegramAPIError:
-                log.warning("cannot post case card to %s", chat_id, exc_info=True)
-                continue
+            return await bot.send_message(
+                chat_id,
+                text,
+                message_thread_id=thread_id,
+                reply_markup=markup,
+                link_preview_options=NO_PREVIEW,
+            )
+
+        for message in await send_to_staff(ctx, "reports", send, session=session):
             session.add(
                 ModerationCard(
-                    ref_type="case", ref_id=case.id, chat_id=chat_id, message_id=message.message_id
+                    ref_type="case", ref_id=case.id, chat_id=message.chat.id, message_id=message.message_id
                 )
             )
         await session.commit()
@@ -378,21 +378,17 @@ async def post_owner_reply(ctx: AppContext, case_id: int) -> None:
             f"💬 <b>Ответ владельца по делу #{case.id}</b> ({h(service.name if service else '?')})\n\n"
             f"{h(str(reply.get('text', ''))[:3500])}"
         )
-        for chat_id, thread_id in await staff_targets(ctx, session, "reports"):
-            try:
-                await send_album(
-                    bot,
-                    session,
-                    chat_id,
-                    reply.get("media_ids") or [],
-                    ctx.bot_id,
-                    message_thread_id=thread_id,
-                )
-                await bot.send_message(
-                    chat_id, text, message_thread_id=thread_id, link_preview_options=NO_PREVIEW
-                )
-            except TelegramAPIError:
-                log.warning("cannot post owner reply to %s", chat_id, exc_info=True)
+
+        async def send(chat_id: int, thread_id: int | None) -> Message:
+            assert bot is not None
+            await send_album(
+                bot, session, chat_id, reply.get("media_ids") or [], ctx.bot_id, message_thread_id=thread_id
+            )
+            return await bot.send_message(
+                chat_id, text, message_thread_id=thread_id, link_preview_options=NO_PREVIEW
+            )
+
+        await send_to_staff(ctx, "reports", send, session=session)
     await refresh_case_cards(ctx, case_id)
 
 

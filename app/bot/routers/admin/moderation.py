@@ -468,7 +468,7 @@ async def on_queue_item(call: CallbackQuery, session: AsyncSession, **data: Any)
     if request is None:
         return
     ctx: AppContext = data["ctx"]
-    fragment = await moderation.card_fragment(ctx, session, request)
+    fragment = await moderation.safe_card_fragment(ctx, session, request)
     await call.answer()
     assert call.message is not None
     sent = await call.message.answer(

@@ -302,3 +302,55 @@ async def test_handle_paid_is_idempotent(tg, db, ctx):
     async with db.session() as s:
         assert (await s.get(Order, order2.id)).status == "needs_attention"
         assert (await s.get(Service, service2.id)).status == "approved"
+
+
+async def test_a_moderation_card_is_never_lost(h, tg, db, ctx):
+    """A group that refuses the bot (its topic gone, the bot removed) must not swallow requests: the card goes
+    to the group itself, then to the staff in private, and the owner learns why."""
+    from app.services.settings import Limits, update_settings
+
+    await _setup(tg, db, ctx)
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    async with db.session() as s:
+        chats = await get_settings(s, Chats)
+        chats.topic_applications = 999  # a topic deleted since
+        await save_settings(s, chats)
+        await update_settings(s, Limits, submission_cooldown_sec=0)
+        await s.commit()
+    tg.inject("sendMessage", 400, "Bad Request: message thread not found", chat_id=GROUP)
+    await _submit(h, tg, name="One", url="@one_service")
+    card = h.last(GROUP)
+    assert "Новая заявка" in card["text"] and "One" in card["text"] and not card.get("message_thread_id")
+    assert "Тема «Заявки» группы модерации недоступна" in h.last(OWNER_ID)["text"]
+
+    tg.inject("sendMessage", 403, "Forbidden: bot was kicked from the supergroup chat", chat_id=GROUP)
+    await _submit(h, tg, name="Two", url="@two_service")
+    texts = [m.get("text", "") for m in tg.bot_messages(OWNER_ID)]
+    assert any("не принимает сообщения бота" in t and "kicked" in t for t in texts)
+    card = next(m for m in reversed(tg.bot_messages(OWNER_ID)) if "Новая заявка" in m.get("text", ""))
+    assert "Two" in card["text"]  # in private, with its buttons: it can be decided there
+    await h.click(OWNER_ID, card, h.button(card, "Одобрить")["callback_data"])
+    async with db.session() as s:
+        request = (
+            await s.execute(select(ModerationRequest).order_by(ModerationRequest.id.desc()).limit(1))
+        ).scalar_one()
+    assert request.status == "approved"
+
+    tg.inject("sendMessage", 403, "Forbidden: bot was kicked from the supergroup chat", chat_id=GROUP)
+    await _submit(h, tg, name="Three", url="@three_service")  # the same problem: not told twice a day
+    texts = [m.get("text", "") for m in tg.bot_messages(OWNER_ID)]
+    assert sum("не принимает сообщения бота" in t for t in texts) == 1
+
+
+async def test_a_card_that_cannot_be_built_still_reaches_the_moderators(h, tg, db, ctx, monkeypatch):
+    from app.services import moderation
+
+    await _setup(tg, db, ctx)
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("a template that does not render")
+
+    monkeypatch.setattr(moderation, "card_fragment", broken)
+    await _submit(h, tg, name="Four", url="@four_service")
+    card = h.last(GROUP)
+    assert "Новая заявка" in card["text"] and "Four" in card["text"] and h.button(card, "Одобрить")
