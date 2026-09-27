@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.bot.routers.admin import diagnostics as diagnostics_screen
 from app.db.base import utcnow
 from app.db.models import Category, ChannelPost, Service
-from app.services import catalog
+from app.services import catalog, render_db
 from app.services.settings import Runtime, get_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.helpers import MAIN, engine_for, imported_channel
@@ -102,7 +102,7 @@ async def test_manual_post_after_nav_and_manual_edit(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     last = max(tg.messages[MAIN])
     assert tg.messages[MAIN][last]["text"].startswith("Навигационная панель")
-    assert tg.messages[MAIN][ids["nav"]]["text"] == "⠀"  # old nav became a spare
+    assert tg.messages[MAIN][ids["nav"]]["text"] == render_db.SPARE_TEXT  # old nav became a spare
 
     edited = dict(tg.messages[MAIN][ids["travel"]])
     edited["text"] = edited["text"].replace("Tripmafia", "Trip mafia")

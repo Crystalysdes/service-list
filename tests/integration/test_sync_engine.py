@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.db.base import utcnow
 from app.db.models import Category, ChannelPost, Service
 from app.domain.richtext import Fragment
-from app.services import catalog
+from app.services import catalog, render_db
 from app.services.selftest import diagnostics, selftest
 from app.services.settings import Runtime, Templates, get_settings, update_settings
 from tests.helpers import MAIN, engine_for, imported_channel
@@ -136,7 +136,7 @@ async def test_retry_after_and_removed_category_becomes_spare(tg, db, ctx):
         vpn.is_visible = False
         await s.commit()
     await engine.run_once(ids["channel_id"])
-    assert _posts(tg)[ids["vpn"]]["text"] == "⠀"
+    assert _posts(tg)[ids["vpn"]]["text"] == render_db.SPARE_TEXT  # Telegram refuses an invisible "⠀"
     async with db.session() as s:
         spare = (await s.execute(select(ChannelPost).where(ChannelPost.kind == "spare"))).scalar_one()
         assert spare.message_id == ids["vpn"]

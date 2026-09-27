@@ -29,6 +29,9 @@ from app.services.settings import Limits as LimitSettings
 
 VISIBLE_STATUSES = ("active",)
 GARANT_START = "bot:start:garant"
+# what a post the channel no longer needs is edited to (it keeps its place for a future category). Telegram
+# counts invisible fillers like "⠀" or "ㅤ" as an empty text and refuses them, so it is a small dot.
+SPARE_TEXT = "·"
 CHAT_LINE_RE = re.compile(r"^\s*chat\s*:\s*(\S+)", re.IGNORECASE)
 
 
@@ -268,7 +271,7 @@ async def render_block(
     if kind == "nav":
         return RenderedBlock(kind, 0, render_nav(await nav_items(session), tpl, ctx))
     if kind == "spare":
-        return RenderedBlock(kind, block_id, Fragment.plain("⠀"))
+        return RenderedBlock(kind, block_id, Fragment.plain(SPARE_TEXT))
     return None
 
 

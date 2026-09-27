@@ -60,6 +60,19 @@ def _strip_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+# what Telegram trims from both ends of a text (TDLib's strip_empty_characters): a text made only of these,
+# like the Braille blank "⠀" or the Hangul filler "ㅤ", counts as empty
+EMPTY_CHARS = (
+    " \t\n\r\x0b\x0c\u00a0\u00ad\u061c\u115f\u1160\u1680\u180e\u2800\u3000\u3164\ufeff\uffa0"
+    + "".join(chr(c) for c in (*range(0x2000, 0x2010), *range(0x2028, 0x2030), *range(0x205F, 0x2070)))
+)
+
+
+def _require_text(text: str) -> None:
+    if not text.strip(EMPTY_CHARS):
+        raise FakeError(400, "Bad Request: text must be non-empty")
+
+
 class FakeTelegram:
     def __init__(self, bot_id: int = 900000001, bot_username: str = "servicelist_bot") -> None:
         self.bot_user = {"id": bot_id, "is_bot": True, "first_name": "Service List", "username": bot_username}
@@ -369,6 +382,7 @@ class FakeTelegram:
         text, entities = self._process_entities(
             chat, params["text"], params.get("entities"), params.get("parse_mode")
         )
+        _require_text(text)
         msg = self._base_message(chat)
         msg["text"] = text
         if entities:
@@ -393,6 +407,7 @@ class FakeTelegram:
         text, entities = self._process_entities(
             chat, params["text"], params.get("entities"), params.get("parse_mode")
         )
+        _require_text(text)
         markup = params.get("reply_markup")
         if (
             msg.get("text") == text

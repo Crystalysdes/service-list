@@ -456,7 +456,7 @@ class SyncEngine:
                     message = await self._call(
                         bot.send_message(
                             chat_id,
-                            fragment.text or "⠀",
+                            fragment.text or render_db.SPARE_TEXT,
                             entities=fragment.to_entities(),
                             parse_mode=None,
                             link_preview_options=WITH_PREVIEW if block.link_preview else NO_PREVIEW,
@@ -579,7 +579,7 @@ class SyncEngine:
                 else:
                     edited = await self._call(
                         bot.edit_message_text(
-                            text=fragment.text or "⠀",
+                            text=fragment.text or render_db.SPARE_TEXT,
                             chat_id=chat_id,
                             message_id=message_id,
                             entities=fragment.to_entities(),
