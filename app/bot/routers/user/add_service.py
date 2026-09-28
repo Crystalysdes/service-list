@@ -3,8 +3,9 @@
 The showcase («✨ Сделайте сервис заметнее») offers the paid options with the application: a premium emoji
 before the name, a glowing name, a top position. It shows the line as the channel will, each option with its
 price and the total with the package discount (app/services/bundles.py); nothing is paid before the approval.
-It is one message edited in place (its id in the FSM data: ``sc``); the glowing name's colours are previewed
-in an animation of their own (``gif``). The choice is in ``opt`` (bundles.Wish).
+It is one message edited in place (its id in the FSM data: ``sc``). With a glowing name chosen it is the
+name shimmering in its colours (an animation, ``sc_glow``: its palette) with the showcase as its caption. The
+choice is in ``opt`` (bundles.Wish).
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaAnimation,
     LinkPreviewOptions,
     Message,
 )
@@ -30,7 +32,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.flows.start import register_payload, show_screen
+from app.bot.flows.start import has_media, register_payload, show_screen
 from app.bot.i18n import Translator, h
 from app.bot.states import AddService
 from app.db.models import Category, CustomEmoji
@@ -41,7 +43,7 @@ from app.domain.richtext import Fragment, RichText
 from app.services import billing, bundles, glow, moderation, options, render_db
 from app.services.billing import money
 from app.services.purchases import dropped_lines, listing_price
-from app.services.settings import Limits, Prices, Templates, get_settings
+from app.services.settings import Limits, Prices, get_settings
 from app.services.timefmt import fmt_date
 
 log = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+CAPTION_MAX = 1024  # Telegram's limit for a caption: a longer showcase stays text
 
 
 def _cancel_kb(t: Translator) -> Any:
@@ -145,14 +148,17 @@ async def on_add(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
 
 @router.callback_query(F.data == "add:cancel")
 async def on_cancel(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
-    if call.message is not None:  # the preview of the glowing name's colours goes with the application
-        await _drop_preview(call.message.bot, call.message.chat.id, state)  # type: ignore[arg-type]
     await state.clear()
     await call.answer(data["t"]("common.cancelled"))
     from app.bot.flows.start import send_menu
 
     assert call.message is not None
-    await send_menu(call.message.chat.id, data, edit=call.message)
+    edit: Message | None = call.message
+    if has_media(call.message):  # the showcase with the glowing name's animation goes with the application
+        with contextlib.suppress(TelegramAPIError):
+            await call.message.delete()
+        edit = None
+    await send_menu(call.message.chat.id, data, edit=edit)
 
 
 @router.callback_query(AddService.category, F.data.startswith("add:cat:"))
@@ -226,7 +232,7 @@ async def on_link(message: Message, state: FSMContext, session: AsyncSession, **
     if duplicate is not None:
         await message.answer(t("add.duplicate", name=h(duplicate.name)), reply_markup=_cancel_kb(t))
         return
-    await state.update_data(url=link.url, opt={}, sc=None, gif=None)
+    await state.update_data(url=link.url, opt={}, sc=None, sc_glow=None)
     await state.set_state(AddService.confirm)
     category = await session.get(Category, info["category_id"])
     assert category is not None
@@ -314,7 +320,7 @@ async def _showcase(
     lost = _plain(dropped_lines(t, [item.to_json() for item in dropped]))
     if lost:
         rt.text("\n\n" + lost)
-    rt.text("\n\n" + t("add.sc.line") + "\n").text(tpl.item_prefix)
+    rt.text("\n\n" + t("add.sc.line_glow" if kept.glow else "add.sc.line") + "\n").text(tpl.item_prefix)
     glyphs = [Glyph(None, name)] if kept.glow else None  # drawn after the payment: the name stands in
     rt.fragment(render_item(ItemView(name=name, url=url, emoji=kept.emoji, glyphs=glyphs), tpl))
     listing = month.items[0]
@@ -376,55 +382,109 @@ def _option_line(t: Translator, item: dict[str, Any]) -> str:
 
 
 async def _redraw(target: CallbackQuery, state: FSMContext, session: AsyncSession, t: Translator) -> None:
-    """The showcase again, in its own message (``sc``): edited in place, or sent anew when it cannot be."""
+    """The showcase again, in its own message (``sc``): edited in place, or sent anew when it cannot be.
+    With a glowing name it is the name shimmering in its colours, the showcase its caption."""
     info = await state.get_data()
     fragment, markup, wish = await _screen(session, t, info)
     await state.update_data(opt=wish)
+    palette = bundles.Wish.from_json(wish).glow
+    if palette is not None and fragment.u16len > CAPTION_MAX:  # too long for a caption: text after all
+        palette = None
     bot: Bot = target.bot  # type: ignore[assignment]
     assert target.message is not None
-    chat_id = target.message.chat.id
-    try:
-        await bot.edit_message_text(
-            text=fragment.text,
-            chat_id=chat_id,
-            message_id=info.get("sc") or 0,
-            entities=fragment.to_entities(),
-            parse_mode=None,
-            reply_markup=markup,
-            link_preview_options=NO_PREVIEW,
-        )
-    except TelegramBadRequest as exc:
-        if "not modified" in exc.message.lower():
-            return
+    chat_id, message_id, shown = target.message.chat.id, info.get("sc") or 0, info.get("sc_glow")
+    common: dict[str, Any] = {"parse_mode": None, "reply_markup": markup}
+    if palette is None:
+        if shown is None:  # a text showcase: edited in place
+            try:
+                await bot.edit_message_text(
+                    text=fragment.text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    entities=fragment.to_entities(),
+                    link_preview_options=NO_PREVIEW,
+                    **common,
+                )
+                return
+            except TelegramBadRequest as exc:
+                if "not modified" in exc.message.lower():
+                    return
+        else:  # the glowing name was taken out: an animation cannot become text
+            with contextlib.suppress(TelegramAPIError):
+                await bot.delete_message(chat_id, message_id)
         sent = await bot.send_message(
-            chat_id,
-            fragment.text,
-            entities=fragment.to_entities(),
-            parse_mode=None,
-            reply_markup=markup,
-            link_preview_options=NO_PREVIEW,
+            chat_id, fragment.text, entities=fragment.to_entities(), link_preview_options=NO_PREVIEW, **common
         )
-        await state.update_data(sc=sent.message_id)
+        await state.update_data(sc=sent.message_id, sc_glow=None)
+        return
+    if shown == palette:  # the same colours: the caption changes
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=fragment.text,
+                caption_entities=fragment.to_entities(),
+                **common,
+            )
+            return
+        except TelegramBadRequest as exc:
+            if "not modified" in exc.message.lower():
+                return
+    animation = await _shimmer(info["name"], palette)
+    try:  # the showcase becomes the animation in place (a text message too)
+        await bot.edit_message_media(
+            chat_id=chat_id,
+            message_id=message_id,
+            media=InputMediaAnimation(
+                media=animation,
+                caption=fragment.text,
+                caption_entities=fragment.to_entities(),
+                parse_mode=None,
+            ),
+            reply_markup=markup,
+        )
+        await state.update_data(sc_glow=palette)
+        return
+    except TelegramAPIError:
+        with contextlib.suppress(TelegramAPIError):
+            await bot.delete_message(chat_id, message_id)
+    sent = await bot.send_animation(
+        chat_id,
+        await _shimmer(info["name"], palette),
+        caption=fragment.text,
+        caption_entities=fragment.to_entities(),
+        **common,
+    )
+    await state.update_data(sc=sent.message_id, sc_glow=palette)
 
 
-async def _ours(
-    call: CallbackQuery, state: FSMContext, t: Translator, key: str = "sc"
-) -> dict[str, Any] | None:
-    """The application's data when the button is on its showcase (``key``: or on the colours' preview); a
-    button of an older application says so."""
+async def _shimmer(name: str, palette: str) -> BufferedInputFile:
+    """The name drawn in the colours, shimmering (a second or so of drawing)."""
+    animation = await asyncio.to_thread(glow.preview_gif, glow.drawable(name), palette)
+    return BufferedInputFile(animation, filename="glow.gif")
+
+
+async def _picker(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+    """A picker in place of the showcase (in the caption of the glowing name's animation, when it is one)."""
+    message = call.message
+    assert isinstance(message, Message)
+    if not has_media(message):
+        await show_screen(message, text, reply_markup=markup)
+        return
+    try:
+        await message.edit_caption(caption=text, reply_markup=markup)
+    except TelegramBadRequest as exc:
+        if "not modified" not in exc.message.lower():
+            raise
+
+
+async def _ours(call: CallbackQuery, state: FSMContext, t: Translator) -> dict[str, Any] | None:
+    """The application's data when the button is on its showcase; a button of an older application says so."""
     info = await state.get_data()
-    if call.message is None or info.get(key) != call.message.message_id:
+    if call.message is None or info.get("sc") != call.message.message_id:
         await call.answer(t("add.stale"), show_alert=True)
         return None
     return info
-
-
-async def _drop_preview(bot: Bot, chat_id: int, state: FSMContext) -> None:
-    info = await state.get_data()
-    if info.get("gif"):
-        with contextlib.suppress(TelegramAPIError):
-            await bot.delete_message(chat_id, info["gif"])
-        await state.update_data(gif=None)
 
 
 def _refusal(t: Translator, dropped: list[bundles.Dropped], kind: str) -> str | None:
@@ -503,10 +563,7 @@ async def on_emoji(call: CallbackQuery, state: FSMContext, session: AsyncSession
         builder.row(InlineKeyboardButton(text=t("add.sc.emoji_none"), callback_data="add:ex"))
     builder.row(InlineKeyboardButton(text=t("add.sc.back"), callback_data="add:o"))
     await call.answer()
-    assert call.message is not None
-    await show_screen(
-        call.message, t("add.sc.emoji_pick", price=money(price)), reply_markup=builder.as_markup()
-    )
+    await _picker(call, t("add.sc.emoji_pick", price=money(price)), builder.as_markup())
 
 
 @router.callback_query(AddService.confirm, F.data.regexp(r"^add:e:\d+$"))
@@ -546,75 +603,21 @@ async def on_glow(call: CallbackQuery, state: FSMContext, session: AsyncSession,
         builder.row(InlineKeyboardButton(text=t("add.sc.font_none"), callback_data="add:gx"))
     builder.row(InlineKeyboardButton(text=t("add.sc.back"), callback_data="add:o"))
     await call.answer()
-    assert call.message is not None
-    await show_screen(
-        call.message,
-        t("add.sc.glow_pick", name=h(info["name"]), price=money(price)),
-        reply_markup=builder.as_markup(),
-    )
+    await _picker(call, t("add.sc.glow_pick", name=h(info["name"]), price=money(price)), builder.as_markup())
 
 
 @router.callback_query(AddService.confirm, F.data.regexp(r"^add:g:[a-z]+$"))
 async def on_glow_colours(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
-    """The colours as they will shimmer: an animation of its own, with «this one» and «another»."""
+    """The colours are taken at once: the showcase shows the name shimmering in them (others a tap away)."""
     t: Translator = data["t"]
     info = await _ours(call, state, t)
     palette = (call.data or "").rsplit(":", 1)[1]
     if info is None or palette not in glow.PALETTES:
         return
-    category = await session.get(Category, info["category_id"])
-    assert category is not None
     wish = replace(bundles.Wish.from_json(info.get("opt")), glow=palette)
-    _kept, dropped = await bundles.check(session, category, wish, name=info["name"], url=info["url"])
-    why = _refusal(t, dropped, bundles.FONT)
-    if why:
-        await call.answer(why, show_alert=True)
-        return
-    await call.answer()
-    assert call.message is not None
-    await _drop_preview(call.message.bot, call.message.chat.id, state)  # type: ignore[arg-type]
-    text = glow.drawable(info["name"])
-    animation = await asyncio.to_thread(glow.preview_gif, text, palette)  # a second or so of drawing
-    templates = await get_settings(session, Templates)
-    marker = Fragment.from_json(templates.emoji_name_marker).text or "[тык.]"
-    builder = InlineKeyboardBuilder()
-    builder.button(text=t("add.sc.glow_take"), callback_data=f"add:gy:{palette}", style="success")
-    builder.button(text=t("add.sc.glow_other"), callback_data="add:gd")
-    builder.adjust(2)
-    sent = await call.message.answer_animation(
-        BufferedInputFile(animation, filename="glow.gif"),
-        caption=t(
-            "opt.glow_preview", name=h(info["name"]), segments=glow.layout(text).segments, marker=h(marker)
-        ),
-        reply_markup=builder.as_markup(),
-    )
-    await state.update_data(gif=sent.message_id)
-
-
-@router.callback_query(AddService.confirm, F.data.regexp(r"^add:gy:[a-z]+$"))
-async def on_glow_take(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
-    t: Translator = data["t"]
-    info = await _ours(call, state, t, "gif")
-    palette = (call.data or "").rsplit(":", 1)[1]
-    if info is None or palette not in glow.PALETTES:
-        return
-    wish = replace(bundles.Wish.from_json(info.get("opt")), glow=palette)
-    if not await _set(call, state, session, t, info, wish, bundles.FONT):
-        return
-    await call.answer(t("add.sc.glow_taken"))
-    assert call.message is not None
-    await _drop_preview(call.message.bot, call.message.chat.id, state)  # type: ignore[arg-type]
-    await _redraw(call, state, session, t)
-
-
-@router.callback_query(AddService.confirm, F.data == "add:gd")
-async def on_glow_other(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
-    """Another colour: the preview goes, the colours are still on the showcase's message."""
-    if await _ours(call, state, data["t"], "gif") is None:
-        return
-    await call.answer()
-    assert call.message is not None
-    await _drop_preview(call.message.bot, call.message.chat.id, state)  # type: ignore[arg-type]
+    if await _set(call, state, session, t, info, wish, bundles.FONT):
+        await call.answer()
+        await _redraw(call, state, session, t)
 
 
 # ---- the top
@@ -647,8 +650,7 @@ async def on_top(call: CallbackQuery, state: FSMContext, session: AsyncSession, 
         builder.row(InlineKeyboardButton(text=t("add.sc.top_none"), callback_data="add:tx"))
     builder.row(InlineKeyboardButton(text=t("add.sc.back"), callback_data="add:o"))
     await call.answer()
-    assert call.message is not None
-    await show_screen(call.message, "\n".join(lines), reply_markup=builder.as_markup())
+    await _picker(call, "\n".join(lines), builder.as_markup())
 
 
 @router.callback_query(AddService.confirm, F.data.regexp(r"^add:t:\d+$"))
@@ -686,7 +688,6 @@ async def on_restart(call: CallbackQuery, state: FSMContext, session: AsyncSessi
         return
     await call.answer()
     assert call.message is not None
-    await _drop_preview(call.message.bot, call.message.chat.id, state)  # type: ignore[arg-type]
     with contextlib.suppress(TelegramAPIError):
         await call.message.edit_reply_markup(reply_markup=None)
     category = await session.get(Category, info.get("category_id", 0))
@@ -707,9 +708,6 @@ async def on_submit(call: CallbackQuery, state: FSMContext, session: AsyncSessio
     await state.clear()
     with contextlib.suppress(TelegramAPIError):
         await call.message.edit_reply_markup(reply_markup=None)
-    if info.get("gif"):
-        with contextlib.suppress(TelegramAPIError):
-            await call.message.bot.delete_message(call.message.chat.id, info["gif"])  # type: ignore[union-attr]
     problem = await _gate(session, data["user"], t)
     category = await session.get(Category, info.get("category_id", 0))
     if problem or category is None or not category.is_open or not category.is_visible:

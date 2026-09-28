@@ -45,32 +45,38 @@ async def _fill(h, name: str = "Sky Tours", url: str = "@skytours_bot", branch: 
     return h.last(USER)
 
 
-def _now(tg, message: dict) -> dict:
-    return tg.messages[USER][message["message_id"]]
+def _sc(h) -> dict:
+    """The showcase: always the last message of the application (the pickers show in its place)."""
+    return h.last(USER)
+
+
+def _body(message: dict) -> str:
+    return message.get("text") or message.get("caption") or ""
+
+
+def _entities(message: dict) -> list[dict]:
+    return message.get("entities") or message.get("caption_entities") or []
 
 
 def _emoji(message: dict) -> list[str]:
-    return [e["custom_emoji_id"] for e in message.get("entities") or [] if e["type"] == "custom_emoji"]
+    return [e["custom_emoji_id"] for e in _entities(message) if e["type"] == "custom_emoji"]
 
 
 def _alert(tg) -> str:
     return tg.called("answerCallbackQuery")[-1].get("text") or ""
 
 
-async def _choose(
-    h, tg, showcase: dict, *, emoji: bool = True, colours: str | None = "Неон", top: int | None = 1
-) -> dict:
+async def _choose(h, *, emoji: bool = True, colours: str | None = "Неон", top: int | None = 1) -> dict:
     if emoji:
-        await h.press(USER, _now(tg, showcase), "Добавить эмодзи")
-        await h.click(USER, _now(tg, showcase), "add:e:9001")
+        await h.press(USER, _sc(h), "Добавить эмодзи")
+        await h.click(USER, _sc(h), "add:e:9001")
     if colours:
-        await h.press(USER, _now(tg, showcase), "Добавить светящийся ник")
-        await h.press(USER, _now(tg, showcase), colours)
-        await h.press(USER, h.last(USER), "Этот цвет")
+        await h.press(USER, _sc(h), "Добавить светящийся ник")
+        await h.press(USER, _sc(h), colours)
     if top:
-        await h.press(USER, _now(tg, showcase), "Добавить топ")
-        await h.press(USER, _now(tg, showcase), f"{top}-е место")
-    return _now(tg, showcase)
+        await h.press(USER, _sc(h), "Добавить топ")
+        await h.press(USER, _sc(h), f"{top}-е место")
+    return _sc(h)
 
 
 async def _travel(db) -> Category:
@@ -128,49 +134,49 @@ async def test_the_showcase_offers_the_options_and_counts_the_package(h, tg, db,
 
     # an emoji: the same message changes, the line has it
     await h.press(USER, showcase, "Добавить эмодзи")
-    assert "Выберите эмодзи" in _now(tg, showcase)["text"]
-    await h.click(USER, _now(tg, showcase), "add:e:9001")
-    shown = _now(tg, showcase)
+    assert "Выберите эмодзи" in _body(_sc(h)) and _sc(h)["message_id"] == showcase["message_id"]
+    await h.click(USER, _sc(h), "add:e:9001")
+    shown = _sc(h)
+    assert shown["message_id"] == showcase["message_id"]
     assert "✅ ⭐ Эмодзи перед названием — $15/мес" in shown["text"] and _emoji(shown) == ["9001"]
-    assert (
-        "🎁 Добавьте светящийся ник — и −15% на всё" in shown["text"]
-        and "Итого в месяц: $25" in shown["text"]
-    )
+    assert "🎁 Добавьте светящийся ник — и −15% на всё" in shown["text"]
+    assert "Итого в месяц: $25" in shown["text"]
 
-    # a glowing name: its colours shimmer in an animation of their own, which goes once they are taken
+    # a glowing name: the showcase becomes the name shimmering in its colours, the showcase its caption
     await h.press(USER, shown, "Добавить светящийся ник")
-    await h.press(USER, _now(tg, showcase), "Золото")
-    preview = h.last(USER)
-    assert preview.get("animation") and h.button(preview, "Этот цвет")
-    await h.press(USER, preview, "Другой цвет")  # the preview goes, the colours are still there
-    assert preview["message_id"] not in tg.messages[USER]
-    await h.press(USER, _now(tg, showcase), "Неон")
-    preview = h.last(USER)
-    await h.press(USER, preview, "Этот цвет")
-    assert preview["message_id"] not in tg.messages[USER]
-    shown = _now(tg, showcase)
-    assert "✅ 🌈 Светящийся ник (неон) — $20/мес" in shown["text"] and "[тык.]" in shown["text"]
-    assert "🎁 Пакет «эмодзи + ник»: −15% на всё" in shown["text"]
-    assert "Итого в месяц: $38.25 вместо $45" in shown["text"]
-    assert any(e["type"] == "strikethrough" for e in shown["entities"])
+    await h.press(USER, _sc(h), "Золото")
+    shown = _sc(h)
+    assert shown["message_id"] == showcase["message_id"] and shown.get("animation")
+    assert "✅ 🌈 Светящийся ник (золото) — $20/мес" in shown["caption"] and "[тык.]" in shown["caption"]
+    assert "ник переливается, как на анимации выше" in shown["caption"]
+    assert "🎁 Пакет «эмодзи + ник»: −15% на всё" in shown["caption"]
+    assert "Итого в месяц: $38.25 вместо $45" in shown["caption"]
+    assert any(e["type"] == "strikethrough" for e in shown["caption_entities"]) and _emoji(shown) == ["9001"]
+    first_gif = shown["animation"]["file_id"]
+    await h.press(USER, shown, "Сменить цвет ника")  # the colours in its caption, the name still shimmers
+    assert "Выберите цвета" in _sc(h)["caption"] and _sc(h).get("animation")
+    await h.press(USER, _sc(h), "Неон")
+    shown = _sc(h)
+    assert shown["animation"]["file_id"] != first_gif and "(неон)" in shown["caption"]
 
-    # without the glowing name no package; the top of the branch
+    # without the glowing name no package, the showcase is text again; the top of the branch
     await h.press(USER, shown, "Убрать ник")
-    assert "Итого в месяц: $25" in _now(tg, showcase)["text"]
-    await h.press(USER, _now(tg, showcase), "Добавить топ")
-    assert "1-е место — $25/мес — ✅ свободно" in _now(tg, showcase)["text"]
-    await h.press(USER, _now(tg, showcase), "1-е место")
-    shown = _now(tg, showcase)
+    shown = _sc(h)
+    assert not shown.get("animation") and "Итого в месяц: $25" in shown["text"]
+    assert showcase["message_id"] not in tg.messages[USER]  # the animation went
+    await h.press(USER, shown, "Добавить топ")
+    assert "1-е место — $25/мес — ✅ свободно" in _sc(h)["text"]
+    await h.press(USER, _sc(h), "1-е место")
+    shown = _sc(h)
     assert "✅ 🔝 1-е место в топе ветки — $25/мес" in shown["text"] and "Итого в месяц: $50" in shown["text"]
     await h.press(USER, shown, "Добавить светящийся ник")
-    await h.press(USER, _now(tg, showcase), "Радуга")
-    await h.press(USER, h.last(USER), "Этот цвет")
-    shown = _now(tg, showcase)
-    assert "Итого в месяц: $59.50 вместо $70" in shown["text"]
+    await h.press(USER, _sc(h), "Радуга")
+    shown = _sc(h)
+    assert shown.get("animation") and "Итого в месяц: $59.50 вместо $70" in shown["caption"]
 
     await h.press(USER, shown, "Отправить на проверку")
     assert "Опции из заявки подключатся вместе с размещением" in h.last(USER)["text"]
-    assert not (_now(tg, showcase).get("reply_markup") or {}).get("inline_keyboard")
+    assert not (tg.messages[USER][shown["message_id"]].get("reply_markup") or {}).get("inline_keyboard")
     travel = await _travel(db)
     async with db.session() as s:
         request = (await s.execute(select(ModerationRequest))).scalar_one()
@@ -192,8 +198,8 @@ async def test_the_showcase_offers_the_options_and_counts_the_package(h, tg, db,
 async def test_one_invoice_pays_for_the_listing_and_the_options(h, tg, db, ctx):
     ids, pay, engine = await _setup(tg, db, ctx)
     await _catalog(tg, db)
-    showcase = await _fill(h)
-    await h.press(USER, await _choose(h, tg, showcase), "Отправить на проверку")
+    await _fill(h)
+    await h.press(USER, await _choose(h), "Отправить на проверку")
     await _approve(h, tg)
     approved = h.last(USER)
     assert "одобрена" in approved["text"] and "вместе с опциями" in approved["text"]
@@ -256,8 +262,8 @@ async def test_one_invoice_pays_for_the_listing_and_the_options(h, tg, db, ctx):
 async def test_the_listing_alone_after_all(h, tg, db, ctx):
     await _setup(tg, db, ctx)
     await _catalog(tg, db)
-    showcase = await _fill(h)
-    await h.press(USER, await _choose(h, tg, showcase, top=None), "Отправить на проверку")
+    await _fill(h)
+    await h.press(USER, await _choose(h, top=None), "Отправить на проверку")
     await _approve(h, tg)
     await h.press(USER, h.last(USER), "Только размещение")
     choice = h.last(USER)
@@ -277,8 +283,8 @@ async def test_the_listing_alone_after_all(h, tg, db, ctx):
 async def test_what_cannot_be_had_at_the_approval_is_said_and_left_out(h, tg, db, ctx):
     await _setup(tg, db, ctx)
     await _catalog(tg, db)
-    showcase = await _fill(h)
-    await h.press(USER, await _choose(h, tg, showcase, colours=None), "Отправить на проверку")
+    await _fill(h)
+    await h.press(USER, await _choose(h, colours=None), "Отправить на проверку")
     async with db.session() as s:  # meanwhile the emoji left the catalog, the position was given away
         (await s.get(CustomEmoji, "9001")).in_catalog = False
         await s.commit()
@@ -295,8 +301,8 @@ async def test_what_cannot_be_had_at_the_approval_is_said_and_left_out(h, tg, db
 async def test_a_free_approval_offers_the_options_alone(h, tg, db, ctx):
     await _setup(tg, db, ctx)
     await _catalog(tg, db)
-    showcase = await _fill(h)
-    await h.press(USER, await _choose(h, tg, showcase, top=None), "Отправить на проверку")
+    await _fill(h)
+    await h.press(USER, await _choose(h, top=None), "Отправить на проверку")
     await _approve(h, tg, "бесплатно")
     offer = h.last(USER)
     assert "размещение на 1 мес. бесплатно" in offer["text"]
@@ -327,8 +333,8 @@ async def test_a_free_approval_offers_the_options_alone(h, tg, db, ctx):
 async def test_a_part_that_cannot_be_carried_out_is_given_back(h, tg, db, ctx):
     await _setup(tg, db, ctx)
     await _catalog(tg, db)
-    showcase = await _fill(h)
-    await h.press(USER, await _choose(h, tg, showcase, colours=None), "Отправить на проверку")
+    await _fill(h)
+    await h.press(USER, await _choose(h, colours=None), "Отправить на проверку")
     await _approve(h, tg)
     approved = h.last(USER)
     assert "💳 1 мес. — $50" in [b["text"] for b in h.buttons(approved)]  # no package without the name
