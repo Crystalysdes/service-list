@@ -239,6 +239,9 @@ opt:
   glow_off: "The glowing name is not available right now."
   glow_switched: "🌟 Drawing the glowing name — it appears in the channel within a minute."
   glow_ready: "🌟 The glowing name for “{name}” is ready — it is already in the channel."
+  glow_ready_manual: "🌟 The glowing name for “{name}” is drawn. The admins will put it into the channel — the bot will tell you once it is there."
+  live_glow: "✅ The glowing name for “{name}” is in the channel now."
+  live_emoji: "✅ The premium emoji for “{name}” is in the channel now."
   title_glow: "glowing name for {months} mo."
 claim:
   btn: "🙋 This is my service"

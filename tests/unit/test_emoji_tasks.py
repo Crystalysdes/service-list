@@ -8,19 +8,25 @@ from dataclasses import replace
 from app.domain.fonts import Glyph
 from app.domain.render import ItemView, RenderTemplates, render_item
 from app.domain.richtext import Fragment, RichText
-from app.services.emoji_tasks import Match, card, match
+from app.services.emoji_tasks import Alignment, Match, _paid_slots, align, card, match
 
 LETTERS = [Glyph("11", "🅒"), Glyph("12", "🅞"), Glyph("11", "🅒"), Glyph("12", "🅞")]
 
 
-def _post(*, star: str = "⭐", drop: bool = False, word: str = "Coco") -> Fragment:
+def _post(
+    *, star: str = "⭐", drop: bool = False, word: str = "Coco", flask: str | None = "5001", gem: str = "9001"
+) -> Fragment:
     rt = RichText().text("Travel\n  ↳  ")
     if drop:
         rt.text(star)
     else:
-        rt.emoji("9001", star)
+        rt.emoji(gem, star)
     rt.link(word, "https://t.me/coco").text("\n  ↳  ")
-    rt.emoji("5001", "🧪").link("Trip", "https://t.me/trip")
+    if flask is None:
+        rt.text("🧪")
+    else:
+        rt.emoji(flask, "🧪")
+    rt.link("Trip", "https://t.me/trip")
     return rt.build()
 
 
@@ -95,3 +101,34 @@ def test_the_card_marks_what_is_new_and_what_went():
 
     many = [{**items[0], "service_id": n, "service": f"S{n}"} for n in range(40)]
     assert "… и ещё 10" in card("Travel", many, None, []).text
+
+
+def test_the_bought_emoji_in_place_are_told_from_the_rest():
+    want = _post()  # 9001 before "Coco" was bought, 5001 before "Trip" is the post's design
+    items = [{"kind": "emoji", "ids": ["9001"]}, {"kind": "design", "count": 1}]
+    assert _paid_slots(want, items) == [0]
+    # the post as the bot published it: every premium emoji still its stand-in
+    assert align(want, _post(drop=True, flask=None)) == Alignment(True, (None, None))
+    # only the bought one put in: enough for the task, though not the whole post
+    only_bought = align(want, _post(flask=None))
+    assert only_bought == Alignment(True, ("9001", None))
+    assert not match(want, _post(flask=None)).full
+    # another emoji where the bought one goes: in place, but not the one bought
+    other = align(want, _post(gem="4242"))
+    assert other.ok and other.filled == ("4242", "5001") and match(want, _post(gem="4242")).have == 1
+    # the text or a link changed, or an emoji more: not the task's post
+    assert not align(want, _post(word="Cola")).ok
+    assert not align(want, RichText().emoji("7", "✨").fragment(want).build()).ok
+    relinked = [
+        replace(e, url="https://t.me/else") if e.url == "https://t.me/coco" else e for e in want.entities
+    ]
+    assert not align(want, Fragment(want.text, tuple(relinked))).ok
+
+
+def test_the_same_emoji_twice_counts_as_bought_as_many_times_as_it_was():
+    rt = RichText()
+    for glyph in ("11", "12", "11", "12"):
+        rt.emoji(glyph, "✨")
+    want = rt.text(" ").emoji("11", "✨").build()  # a glowing name of four, then the same emoji once more
+    assert _paid_slots(want, [{"kind": "glow", "ids": ["11", "12", "11", "12"]}]) == [0, 1, 2, 3]
+    assert _paid_slots(want, [{"kind": "design", "count": 5, "ids": ["11"]}]) == []

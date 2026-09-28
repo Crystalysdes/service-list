@@ -12,7 +12,7 @@ from app.db.base import utcnow
 from app.db.models import Feature, Service
 from app.jobs import job_poll_invoices
 from app.services import glow, glownick
-from app.services.settings import GlowPacks, get_settings
+from app.services.settings import GlowPacks, Runtime, get_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.helpers import MAIN
 from tests.integration.test_options_flow import USER, _open_card, _setup
@@ -82,6 +82,17 @@ async def test_a_bought_glowing_name_is_drawn_into_a_pack_and_shown_in_the_chann
     assert all(e in _post_emoji(tg, ids["travel"]) for e in emoji) and "[тык.]" in travel["text"]
     await glownick.job(ctx)  # nothing changed: nothing drawn again
     assert len(tg.called("createNewStickerSet")) == 1
+
+
+async def test_while_the_admins_put_premium_emoji_in_by_hand_the_owner_is_told_so(h, tg, db, ctx):
+    await _bought(h, tg, db, ctx)
+    async with db.session() as s:  # the bot cannot put premium emoji in the channel: the admins do
+        await update_settings(s, Runtime, selftest_emoji_ok=False, manual_emoji=True)
+        await s.commit()
+    await glownick.job(ctx)
+    told = h.last(USER)["text"]
+    assert "Светящийся ник для «Tripmafia» нарисован" in told and "поставят администраторы" in told
+    assert "уже в канале" not in told
 
 
 async def test_a_new_name_is_drawn_again_and_the_old_pack_goes_later(h, tg, db, ctx):

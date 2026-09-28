@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from app.db.base import utcnow
 from app.db.models import Category, ChannelPost, EmojiTask, Feature, Service, User
-from app.domain.richtext import Fragment
+from app.domain.richtext import Fragment, u16len
 from app.jobs import job_poll_invoices
 from app.services import emoji_tasks, lifecycle, options
 from app.services.settings import Chats, Runtime, get_settings, update_settings
@@ -77,13 +77,15 @@ async def _tasks(db) -> list[EmojiTask]:
         return list((await s.execute(select(EmojiTask).order_by(EmojiTask.id))).scalars())
 
 
-async def _paste(h, tg, message_id: int, source: dict, *, drop: int = 0, text: str | None = None) -> None:
-    """An admin replaces the post's text with ``source``'s (``drop``: that many premium emoji did not come
+async def _paste(
+    h, tg, message_id: int, source: dict, *, drop_id: str | None = None, text: str | None = None
+) -> None:
+    """An admin replaces the post's text with ``source``'s (``drop_id``: that premium emoji did not come
     through; ``text``: something else typed in)."""
     edited = dict(tg.messages[MAIN][message_id])
-    entities = [dict(e) for e in source.get("entities", [])]
-    for _ in range(drop):
-        entities.remove(next(e for e in entities if e["type"] == "custom_emoji"))
+    entities = [
+        dict(e) for e in source.get("entities", []) if e.get("custom_emoji_id") != drop_id or not drop_id
+    ]
     edited["text"] = text if text is not None else source["text"]
     edited["entities"] = entities
     tg.clock += 1
@@ -253,11 +255,10 @@ async def test_a_short_paste_and_another_text_are_told_apart(h, tg, db, ctx):
     await _task_out(ctx)
     [card] = _cards(tg, ids["travel_title"])
     text = _reply(tg, card)
-    need = len(_emoji_ids(text))
 
-    await _paste(h, tg, ids["travel"], text, drop=1)  # one emoji did not come through
+    await _paste(h, tg, ids["travel"], text, drop_id="9001")  # the bought emoji did not come through
     card = tg.messages[GROUP][card["message_id"]]
-    assert f"⏳ Сейчас в посте {need - 1} из {need} премиум-эмодзи" in card["text"]
+    assert "⏳ На месте 0 из 1 купленных премиум-эмодзи" in card["text"]
     assert h.button(card, "Открыть пост")
     assert not [t for t in _texts(tg, GROUP) if "отредактирован вручную" in t]
 
@@ -325,7 +326,7 @@ async def test_without_premium_for_the_bots_owner_the_card_says_so(h, tg, db, ct
     tg.custom_emoji_in_groups = False
     await _task_out(ctx)
     card = _cards(tg, ids["travel_title"])[0]
-    assert "⚠️ Бот не смог показать здесь премиум-эмодзи" in card["text"] and "Наборы: " in card["text"]
+    assert "⚠️ Telegram убрал премиум-эмодзи" in card["text"] and "Наборы: " in card["text"]
 
 
 async def test_tasks_end_when_the_bot_can_put_the_emoji_itself(h, tg, db, ctx):
@@ -388,3 +389,49 @@ async def test_without_a_group_the_admins_get_them_in_private(h, tg, db, ctx):
     assert len(cards) == 1
     text = next(m for m in tg.bot_messages(OWNER_ID) if m.get("_reply_to") == cards[0]["message_id"])
     assert _emoji_ids(text)
+
+
+async def test_without_premium_the_card_explains_and_resend_brings_the_emoji(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    tg.custom_emoji_in_groups = False  # the bot's owner has no Telegram Premium
+    await _task_out(ctx)
+    card = _cards(tg, ids["travel_title"])[0]
+    assert "⚠️ Telegram убрал премиум-эмодзи" in card["text"] and "Прислать заново" in card["text"]
+    assert "«Tripmafia»: 💎 → премиум-эмодзи из набора Gems" in card["text"]
+    old = _reply(tg, card)
+    assert not _emoji_ids(old)
+
+    tg.custom_emoji_in_groups = True  # the owner got Premium
+    await h.press(OWNER_ID, card, "Прислать заново")
+    assert "Отправил заново" in tg.called("answerCallbackQuery")[-1]["text"]
+    assert card["message_id"] not in tg.messages[GROUP] and old["message_id"] not in tg.messages[GROUP]
+    new = _cards(tg, ids["travel_title"])[-1]
+    assert "⚠️" not in new["text"] and h.button(new, "Прислать заново")
+    text = _reply(tg, new)
+    assert "9001" in _emoji_ids(text)
+    await _paste(h, tg, ids["travel"], text)
+    assert tg.messages[GROUP][new["message_id"]]["text"].startswith("✅ Премиум-эмодзи на месте")
+
+
+async def test_without_premium_putting_in_only_the_bought_emoji_is_enough(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    tg.custom_emoji_in_groups = False
+    await _task_out(ctx)
+    card = _cards(tg, ids["travel_title"])[0]
+    text = _reply(tg, card)  # only the stand-ins came through
+    # an admin pastes it and puts the bought 💎 in from the emoji panel; the rest stay stand-ins
+    at = u16len(text["text"][: text["text"].index("💎Tripmafia")])
+    entities = [
+        *text.get("entities", []),
+        {"type": "custom_emoji", "offset": at, "length": 2, "custom_emoji_id": "9001"},
+    ]
+    await _paste(h, tg, ids["travel"], {"text": text["text"], "entities": entities})
+    assert tg.messages[GROUP][card["message_id"]]["text"].startswith("✅ Премиум-эмодзи на месте")
+    assert (await _row(db, ids["travel"])).sent_hash.startswith("plain:")  # the rest are still plain
+    assert any("Премиум-эмодзи для «Tripmafia» теперь в канале" in t for t in _texts(tg, USER))
+    await _task_out(ctx)  # nothing is asked again for the same post
+    assert not _cards(tg, ids["travel_title"])

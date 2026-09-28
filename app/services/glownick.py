@@ -28,7 +28,7 @@ from app.domain.fonts import Glyph, glyphs_to_json
 from app.services import billing, glow
 from app.services.notify import claim_notification, notify_staff, notify_user
 from app.services.redact import describe
-from app.services.settings import GlowPacks, get_settings, update_settings
+from app.services.settings import GlowPacks, Runtime, get_settings, update_settings
 
 log = logging.getLogger(__name__)
 
@@ -119,10 +119,15 @@ async def draw(ctx: AppContext, feature_id: int) -> bool:
 
     request_sync(ctx)
     if owner_id:
+        from app.services.emoji_tasks import active
+
         async with ctx.db.session() as session:
             user = await session.get(User, owner_id)
+            by_hand = active(await get_settings(session, Runtime))  # the admins put it into the post
         t = Translator(user.lang if user else None)
-        await notify_user(ctx, owner_id, t("opt.glow_ready", name=h(name)))
+        await notify_user(
+            ctx, owner_id, t("opt.glow_ready_manual" if by_hand else "opt.glow_ready", name=h(name))
+        )
     return True
 
 

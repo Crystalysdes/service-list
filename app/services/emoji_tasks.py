@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -31,15 +32,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot.i18n import Translator, h
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Category, Channel, ChannelPost, EmojiTask
+from app.db.models import Category, Channel, ChannelPost, EmojiTask, Service, User
 from app.domain.fonts import glyphs_from_json
-from app.domain.richtext import Entity, Fragment, RichText
+from app.domain.richtext import Entity, Fragment, RichText, u16len
 from app.domain.symbols import channel_post_base
 from app.services import render_db
 from app.services.channels import INACTIVE_STATUSES
-from app.services.notify import close_alert, send_to_staff
+from app.services.notify import close_alert, notify_user, send_to_staff
 from app.services.settings import Runtime, get_settings
 from app.services.sync import manual as kept_edits
 from app.services.sync.engine import SETTLED, emoji_allowed
@@ -60,8 +62,8 @@ HOWTO = (
     "Сохранить (нужен Telegram Premium). Бот проверит сам."
 )
 NO_PREMIUM = (
-    "⚠️ Бот не смог показать здесь премиум-эмодзи: у владельца бота (аккаунт, создавший его в @BotFather) нет "
-    "Telegram Premium. Вставьте их в пост вручную — из наборов по ссылкам выше."
+    "⚠️ Telegram убрал премиум-эмодзи из текста ниже: у владельца бота (аккаунт, создавший его в "
+    "@BotFather) нет Telegram Premium. Оформили Premium — нажмите «🔄 Прислать заново»."
 )
 MISMATCH = (
     "Если вставляли текст из задания «✨ Премиум-эмодзи вручную» — он не совпал с ним: вставьте следующее за "
@@ -92,35 +94,73 @@ def _ordered(fragment: Fragment, kind: str) -> list[Entity]:
     return sorted((e for e in fragment.entities if e.type == kind), key=lambda e: (e.offset, e.length))
 
 
-def _outside(fragment: Fragment) -> list[str]:
-    """The text between the premium emoji (their stand-in characters left out)."""
-    pieces, at = [], 0
-    for entity in _ordered(fragment, "custom_emoji"):
-        pieces.append(fragment.slice(at, entity.offset).text)
-        at = max(at, entity.end)
-    pieces.append(fragment.slice(at).text)
-    return pieces
+@dataclass(frozen=True)
+class Alignment:
+    ok: bool  # the task's text and links; each of its premium emoji there or still its stand-in
+    filled: tuple[str | None, ...] = ()  # for each premium emoji of the task, in order: the one put there
+
+
+def _links(fragment: Fragment) -> list[tuple[str, str | None]]:
+    return [(fragment.entity_text(e), e.url) for e in _ordered(fragment, "text_link")]
+
+
+def align(desired: Fragment, edited: Fragment) -> Alignment:
+    """Read the edited post against the task's text. Where the task has a premium emoji the post has either
+    one (with any stand-in character: an emoji put in from the panel brings its own) or still the stand-in;
+    the text around them and the links must be the task's. Bold and the like are not compared (a paste may
+    drop them)."""
+    want, got = desired.without_auto().strip(), edited.without_auto().strip()
+    if _links(want) != _links(got):
+        return Alignment(False)
+    placed = {e.offset: e for e in _ordered(got, "custom_emoji")}
+    filled: list[str | None] = []
+    at = before = 0
+    for slot in _ordered(want, "custom_emoji"):
+        piece = want.slice(before, slot.offset).text
+        if got.slice(at, at + u16len(piece)).text != piece:
+            return Alignment(False)
+        at += u16len(piece)
+        stand_in = want.entity_text(slot)
+        entity = placed.get(at)
+        if entity is not None:
+            filled.append(entity.custom_emoji_id)
+            at = entity.end
+        elif got.slice(at, at + u16len(stand_in)).text == stand_in:
+            filled.append(None)
+            at += u16len(stand_in)
+        else:
+            return Alignment(False)
+        before = slot.end
+    if got.slice(at).text != want.slice(before).text:
+        return Alignment(False)
+    if len(placed) != sum(1 for f in filled if f is not None):  # an emoji where the task has none
+        return Alignment(False)
+    return Alignment(True, tuple(filled))
+
+
+def _emoji_ids(fragment: Fragment) -> list[str | None]:
+    return [e.custom_emoji_id for e in _ordered(fragment.without_auto().strip(), "custom_emoji")]
 
 
 def match(desired: Fragment, edited: Fragment) -> Match:
-    """How the edited post compares with the task's text. An emoji put in from the emoji panel may have
-    another stand-in character than the copied one: then the text between the emoji, their order and the
-    links must be the task's. Bold and the like are not compared (a paste may drop them)."""
-    want, got = desired.without_auto().strip(), edited.without_auto().strip()
-    need = want.custom_emoji_count()
-    links = [(e.offset, e.length, e.url) for e in _ordered(want, "text_link")]
-    if want.text == got.text and links == [(e.offset, e.length, e.url) for e in _ordered(got, "text_link")]:
-        wanted = {(e.offset, e.custom_emoji_id) for e in _ordered(want, "custom_emoji")}
-        have = sum(1 for e in _ordered(got, "custom_emoji") if (e.offset, e.custom_emoji_id) in wanted)
-        return Match(have == need and got.custom_emoji_count() == need, True, have, need)
-    same = (
-        _outside(want) == _outside(got)
-        and [e.custom_emoji_id for e in _ordered(want, "custom_emoji")]
-        == [e.custom_emoji_id for e in _ordered(got, "custom_emoji")]
-        and [(want.entity_text(e), e.url) for e in _ordered(want, "text_link")]
-        == [(got.entity_text(e), e.url) for e in _ordered(got, "text_link")]
-    )
-    return Match(same, same, need if same else 0, need)
+    """How the edited post compares with the task's text (see ``align``)."""
+    ids = _emoji_ids(desired)
+    found = align(desired, edited)
+    if not found.ok:
+        return Match(False, False, 0, len(ids))
+    have = sum(1 for want, got in zip(ids, found.filled, strict=True) if want == got)
+    return Match(have == len(ids), True, have, len(ids))
+
+
+def _paid_slots(desired: Fragment, items: list[dict[str, Any]]) -> list[int]:
+    """Which premium emoji of the task (by order) are of the options bought or granted through the bot."""
+    wanted = Counter(i for item in items if item.get("kind") != "design" for i in item.get("ids") or ())
+    slots = []
+    for index, emoji_id in enumerate(_emoji_ids(desired)):
+        if emoji_id and wanted[emoji_id] > 0:
+            wanted[emoji_id] -= 1
+            slots.append(index)
+    return slots
 
 
 # ------------------------------------------------------------------------------------------ the card
@@ -177,25 +217,48 @@ def card(
     return rt.build()
 
 
+def _manual_steps(rt: RichText, task: EmojiTask) -> None:
+    """Without Premium for the bot's owner: how the admins put the bought emoji in themselves."""
+    sets = task.notes.get("sets") or {}
+    rt.text("\n\n" + NO_PREMIUM)
+    rt.text(
+        "\n\nИли вручную (нужен Telegram Premium):\n1. Скопируйте текст ниже целиком → «🔗 Открыть пост» → "
+        "Изменить → замените весь текст.\n2. Замените значки на премиум-эмодзи:"
+    )
+    for item in task.items:
+        ids = item.get("ids") or []
+        if item.get("kind") not in ("emoji", "glow", "font") or not ids:
+            continue
+        if item["kind"] == "emoji":
+            rt.text(f"\n•  «{item.get('service')}»: {item.get('alt') or '⭐'} → премиум-эмодзи")
+        else:
+            stand_ins = item.get("alt") or "✨" * len(ids)
+            rt.text(f"\n•  «{item.get('service')}»: {stand_ins} → {len(ids)} эмодзи по порядку")
+        if sets.get(ids[0]):
+            rt.text(" из набора ")
+            rt.link(sets[ids[0]], f"https://t.me/addemoji/{sets[ids[0]]}")
+    rt.text("\nОстальные значки можно не трогать.\n3. Сохраните — бот проверит сам.")
+
+
 def _with_notes(task: EmojiTask) -> Fragment:
     """The task's card as sent, with what was learned since (no Premium to show the emoji, a paste short)."""
-    fragment = Fragment.from_json(task.notes.get("card"))
-    extra = []
+    rt = RichText().fragment(Fragment.from_json(task.notes.get("card")))
     if task.notes.get("no_premium"):
-        extra.append(NO_PREMIUM)
+        _manual_steps(rt, task)
     if task.notes.get("have") is not None:
-        extra.append(
-            f"⏳ Сейчас в посте {task.notes['have']} из {task.notes.get('need', '?')} премиум-эмодзи — "
-            "вставьте текст целиком ещё раз."
+        rt.text(
+            f"\n\n⏳ На месте {task.notes['have']} из {task.notes.get('need', '?')} купленных "
+            "премиум-эмодзи — вставьте текст целиком ещё раз или замените оставшиеся значки."
         )
-    return fragment + Fragment.plain("".join("\n\n" + line for line in extra)) if extra else fragment
+    return rt.build()
 
 
-def _open_button(url: str | None) -> Any:
-    if not url:
-        return None
+def _keyboard(task: EmojiTask, url: str | None) -> Any:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔗 Открыть пост", url=url)
+    if url:
+        builder.button(text="🔗 Открыть пост", url=url)
+    builder.button(text="🔄 Прислать заново", callback_data=f"em:re:{task.id}")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -210,7 +273,7 @@ async def _edit_cards(bot: Bot, task: EmojiTask) -> None:
                 entities=fragment.to_entities(),
                 parse_mode=None,
                 link_preview_options=NO_PREVIEW,
-                reply_markup=_open_button(task.notes.get("url")),
+                reply_markup=_keyboard(task, task.notes.get("url")),
             )
 
 
@@ -241,13 +304,14 @@ async def _items(session: AsyncSession, row: ChannelPost, desired: Fragment, tz:
                     }
                 )
             font = render_db.active_feature(service, "font")
-            glyphs = [g.emoji_id for g in glyphs_from_json(font.params.get("glyphs"))] if font else []
-            if font is not None and font.source in PAID and any(glyphs):
+            glyphs = [g for g in glyphs_from_json(font.params.get("glyphs")) if g.emoji_id] if font else []
+            if font is not None and font.source in PAID and glyphs:
                 items.append(
                     {
                         **base,
                         "kind": "glow",
-                        "ids": [str(g) for g in glyphs if g],
+                        "ids": [str(g.emoji_id) for g in glyphs],
+                        "alt": "".join(g.alt for g in glyphs),  # the tiles' stand-ins in a post without them
                         "until": _until(font.expires_at, tz),
                     }
                 )
@@ -264,18 +328,16 @@ async def _title(session: AsyncSession, row: ChannelPost) -> str:
     return "навигация" if row.kind == "nav" else "пост канала"
 
 
-async def _sets(bot: Bot, desired: Fragment) -> list[str]:
-    """The emoji sets the post's premium emoji come from (to add them when they cannot be copied)."""
-    ids = list(
-        dict.fromkeys(e.custom_emoji_id for e in _ordered(desired, "custom_emoji") if e.custom_emoji_id)
-    )
+async def _sets(bot: Bot, desired: Fragment) -> dict[str, str]:
+    """The emoji set of each premium emoji of the post (to add them when they cannot be copied)."""
+    ids = list(dict.fromkeys(i for i in _emoji_ids(desired) if i))
     if not ids:
-        return []
+        return {}
     try:
         stickers = await bot.get_custom_emoji_stickers(custom_emoji_ids=ids[:200])
     except TelegramAPIError:
-        return []
-    return list(dict.fromkeys(s.set_name for s in stickers if s.set_name))
+        return {}
+    return {s.custom_emoji_id: s.set_name for s in stickers if s.custom_emoji_id and s.set_name}
 
 
 async def _delete(bot: Bot, chat_id: int, message_id: int) -> bool:
@@ -323,7 +385,8 @@ async def _send(
     assert bot is not None
     title = await _title(session, row)
     desired = Fragment.from_json(task.desired)
-    body = card(title, task.items, task.notes.get("previous"), await _sets(bot, desired))
+    sets = await _sets(bot, desired)
+    body = card(title, task.items, task.notes.get("previous"), list(dict.fromkeys(sets.values())))
     url = channel_post_base(channel.chat_id, channel.username) + str(row.message_id)
 
     async def send(chat_id: int, thread_id: int | None) -> Message:
@@ -334,12 +397,12 @@ async def _send(
             parse_mode=None,
             message_thread_id=thread_id,
             link_preview_options=NO_PREVIEW,
-            reply_markup=_open_button(url),
+            reply_markup=_keyboard(task, url),
         )
 
     cards = await send_to_staff(ctx, TOPIC, send, session=session)
     if not cards:  # nobody could be told now
-        task.due_at = now + RETRY
+        task.status, task.due_at = "pending", now + RETRY
         return
     copies, lost = [], False
     for sent in cards:
@@ -364,9 +427,16 @@ async def _send(
         copies.append({"chat_id": sent.chat.id, "card_id": sent.message_id, "text_id": text_id})
     task.messages = copies
     task.status = "open"
-    task.notes = {**task.notes, "sent": True, "title": title, "url": url, "card": body.to_json()}
-    if lost:  # Telegram took the emoji out of the bot's message: the bot's owner has no Premium
-        task.notes = {**task.notes, "no_premium": True}
+    task.notes = {
+        **task.notes,
+        "sent": True,
+        "title": title,
+        "url": url,
+        "card": body.to_json(),
+        "sets": sets,
+        "no_premium": lost,  # Telegram took the emoji out of the bot's message: its owner has no Premium
+    }
+    if lost:
         await _edit_cards(bot, task)
 
 
@@ -425,6 +495,19 @@ async def _reconcile(
         if task.status == "pending" and task.due_at <= now:
             await _send(ctx, session, channel, row, task, now)
         return
+    if task is None:  # the admins may have put in what was bought already (the rest left plain)
+        last = await session.scalar(
+            select(EmojiTask)
+            .where(EmojiTask.channel_post_id == row.id)
+            .order_by(EmojiTask.id.desc())
+            .limit(1)
+        )
+        if (
+            last is not None
+            and last.status == "done"
+            and (last.content_hash, last.message_id) == (content_hash, row.message_id)
+        ):
+            return
     previous = await _previous(session, row, task)
     if task is not None:
         await _finish(ctx.bot, task, "stale", now)
@@ -506,25 +589,63 @@ async def on_edit(ctx: AppContext, session: AsyncSession, row: ChannelPost, edit
     ).scalar_one_or_none()
     if task is None or task.message_id != row.message_id:
         return None
-    result = match(Fragment.from_json(task.desired), edited)
-    if result.full:
-        alerted = bool(row.manual)  # an earlier try raised the "edited by hand" alert
-        row.snapshot = edited.to_json()
-        row.sent_hash = task.content_hash
-        row.manual = None
-        await _finish(ctx.bot, task, "done", utcnow())
-        if alerted:
-            await close_alert(
-                ctx, "post_edit", row.id, ACCEPTED.format(title=task.notes.get("title") or "пост")
-            )
-        return "done"
-    if result.same_text:
-        row.snapshot = edited.to_json()  # the same edit again is not news
-        task.notes = {**task.notes, "have": result.have, "need": result.need}
+    desired = Fragment.from_json(task.desired)
+    found = align(desired, edited)
+    if not found.ok:
+        return "mismatch"
+    ids = _emoji_ids(desired)
+    paid = _paid_slots(desired, task.items)
+    have = sum(1 for index in paid if found.filled[index] == ids[index])
+    row.snapshot = edited.to_json()  # the same edit again is not news
+    if have < len(paid):
+        task.notes = {**task.notes, "have": have, "need": len(paid)}
         if task.status == "open" and ctx.bot is not None:
             await _edit_cards(ctx.bot, task)
         return "partial"
-    return "mismatch"
+    alerted = bool(row.manual)  # an earlier try raised the "edited by hand" alert
+    if list(found.filled) == ids:  # all of them: the post is what the bot would show with emoji
+        row.sent_hash = task.content_hash
+    row.manual = None
+    await _finish(ctx.bot, task, "done", utcnow())
+    if alerted:
+        title = task.notes.get("title") or "пост"
+        await close_alert(ctx, "post_edit", row.id, ACCEPTED.format(title=title))
+    await _tell_owners(ctx, session, task)
+    return "done"
+
+
+async def _tell_owners(ctx: AppContext, session: AsyncSession, task: EmojiTask) -> None:
+    """The owners of what was bought or granted, new since the post's last task: it is in the channel."""
+    before = {_key(item) for item in task.notes.get("previous") or []}
+    for item in task.items:
+        if item.get("kind") not in ("emoji", "glow") or _key(item) in before:
+            continue
+        service = await session.get(Service, item.get("service_id"))
+        if service is None or not service.owner_id:
+            continue
+        user = await session.get(User, service.owner_id)
+        t = Translator(user.lang if user else None)
+        key = "opt.live_glow" if item["kind"] == "glow" else "opt.live_emoji"
+        await notify_user(ctx, service.owner_id, t(key, name=h(service.name)))
+
+
+async def resend(ctx: AppContext, session: AsyncSession, task: EmojiTask) -> bool | None:
+    """The task's card and text again (the old ones go), e.g. once the bot's owner got Telegram Premium.
+    Returns whether the premium emoji came through this time; None when the task is no longer open."""
+    if task.status != "open" or ctx.bot is None:
+        return None
+    row = await session.get(ChannelPost, task.channel_post_id)
+    channel = await session.get(Channel, row.channel_id) if row is not None else None
+    if row is None or channel is None or row.message_id != task.message_id:
+        return None
+    for copy in task.messages:
+        await _delete(ctx.bot, copy["chat_id"], copy["card_id"])
+        if copy.get("text_id"):
+            await _delete(ctx.bot, copy["chat_id"], copy["text_id"])
+    task.messages = []
+    task.notes = {k: v for k, v in task.notes.items() if k not in ("no_premium", "have", "need")}
+    await _send(ctx, session, channel, row, task, utcnow())
+    return not task.notes.get("no_premium")
 
 
 async def drop_after_restore(session: AsyncSession) -> None:

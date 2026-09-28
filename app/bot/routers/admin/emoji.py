@@ -17,9 +17,9 @@ from app.bot.filters import RoleFilter
 from app.bot.i18n import h
 from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
-from app.db.models import CustomEmoji, Feature, Service
+from app.db.models import CustomEmoji, EmojiTask, Feature, Service
 from app.domain.richtext import Fragment, RichText
-from app.services import billing, glow, options
+from app.services import billing, emoji_tasks, glow, options
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.glownick import glow_params, placeholder_glyphs
@@ -301,3 +301,23 @@ async def on_grant_do(call: CallbackQuery, session: AsyncSession, **data: Any) -
     )
     request_sync(data["ctx"])
     await call.answer(done, show_alert=True)
+
+
+# ----------------------------------------------------------------------------------------- manual emoji tasks
+@router.callback_query(F.data.regexp(r"^em:re:\d+$"))
+async def on_task_resend(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """🔄 under a task of premium emoji to put in by hand: its card and text again (e.g. once the bot's owner
+    got Telegram Premium, the text comes with the emoji)."""
+    task = await session.get(EmojiTask, int((call.data or "").rsplit(":", 1)[1]), with_for_update=True)
+    came = await emoji_tasks.resend(data["ctx"], session, task) if task is not None else None
+    await session.commit()
+    if came is None:
+        await call.answer("Это задание уже закрыто.", show_alert=True)
+    elif came:
+        await call.answer("✅ Отправил заново — текст с премиум-эмодзи.", show_alert=True)
+    else:
+        await call.answer(
+            "Telegram снова убрал премиум-эмодзи: Premium у владельца бота ещё не действует. Проверьте, "
+            "что он оформлен на аккаунт, создавший бота в @BotFather.",
+            show_alert=True,
+        )
