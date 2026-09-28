@@ -13,8 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot.filters import RoleFilter
 from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
+from app.services import apirone_pay
 from app.services.audit import audit
 from app.services.billing import money
+from app.services.escrow.money import BY_KEY, COINS
 from app.services.settings import Payments, Prices, Reminders, get_settings, save_settings, update_settings
 
 router = Router(name="admin_prices")
@@ -64,11 +66,15 @@ async def _screen(session: AsyncSession, apirone_ready: bool = False) -> tuple[s
         + (f"−{prices.bundle_discount_pct}% на всё" if prices.bundle_discount_pct else "без скидки"),
         f"Напоминания: за {', '.join(map(str, reminders.days_before))} дн.",
         f"Оплата через CryptoBot: {', '.join(payments.accepted_assets)}",
-        "Оплата USDT BEP20 через Apirone (аккаунт гаранта): "
+        "Оплата через Apirone (аккаунт гаранта): "
         + (
             ("включена" if apirone_ready else "включена, но аккаунт Apirone не задан (servicelist config)")
             if payments.apirone
             else "выключена"
+        ),
+        "Монеты Apirone: "
+        + " · ".join(
+            f"{coin.label} {'✅' if code in payments.apirone_coins else '⛔️'}" for code, coin in COINS.items()
         ),
     ]
     builder = InlineKeyboardBuilder()
@@ -89,6 +95,9 @@ async def _screen(session: AsyncSession, apirone_ready: bool = False) -> tuple[s
         text="🪙 Выключить Apirone" if payments.apirone else "🪙 Включить Apirone",
         callback_data="a:prices:apirone",
     )
+    for code, coin in COINS.items():
+        mark = "✅" if code in payments.apirone_coins else "⛔️"
+        builder.button(text=f"{mark} {coin.label}", callback_data=f"a:prices:apc:{coin.key}")
     builder.adjust(2)
     return "\n".join(lines), back_home(builder)
 
@@ -110,6 +119,29 @@ async def on_apirone_toggle(call: CallbackQuery, session: AsyncSession, **data: 
     await audit(session, data["user"].id, "settings.apirone", data={"enabled": not payments.apirone})
     await session.commit()
     await call.answer("Оплата через Apirone " + ("выключена" if payments.apirone else "включена"))
+    text, markup = await _screen(session, data["ctx"].get("escrow_pay") is not None)
+    assert call.message is not None
+    await call.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.regexp(r"^a:prices:apc:(usdt|btc|ltc)$"))
+async def on_coin_toggle(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """A coin of Apirone offered to payers or not; switching one on checks it first (its units, its price)."""
+    coin = BY_KEY[(call.data or "").rsplit(":", 1)[1]]
+    payments = await get_settings(session, Payments)
+    on = coin.code in payments.apirone_coins
+    if not on:
+        problem = await apirone_pay.coin_problem(data["ctx"], coin)
+        if problem is not None:
+            await call.answer(f"{coin.label} не включить: {problem}"[:200], show_alert=True)
+            return
+    codes = [code for code in COINS if (code in payments.apirone_coins) != (code == coin.code)]
+    await update_settings(session, Payments, apirone_coins=codes)
+    await audit(
+        session, data["user"].id, "settings.apirone_coin", data={"coin": coin.code, "enabled": not on}
+    )
+    await session.commit()
+    await call.answer(f"{coin.label}: " + ("выключено" if on else "включено"))
     text, markup = await _screen(session, data["ctx"].get("escrow_pay") is not None)
     assert call.message is not None
     await call.message.edit_text(text, reply_markup=markup)

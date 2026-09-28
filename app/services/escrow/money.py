@@ -1,5 +1,10 @@
-"""Money of a deal, in cents of USDT (integers only: the backups keep every column as JSON). The payment
-gateway counts in minor units of 10**-18 USDT: those are converted at its edge and never stored as numbers."""
+"""Money of a deal, in whole units of its coin (integers only: the backups keep every column as JSON):
+cents of USDT, satoshi of BTC and LTC. The payment gateway counts in minor units of the coin (10**-18 USDT,
+10**-8 BTC): those are converted at its edge and never stored as numbers.
+
+The module's functions are USDT's (the garant began with USDT alone). The coins (:class:`Coin`) carry the same
+operations as methods without a default: an amount in satoshi can never be taken for cents by a forgotten
+argument."""
 
 from __future__ import annotations
 
@@ -7,7 +12,8 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from datetime import timedelta
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 ASSET = "USDT"
@@ -162,3 +168,182 @@ def terms_hash(fields: dict[str, Any]) -> str:
     """Fingerprint of everything the sides agree on; "✅ Принять" is bound to it."""
     payload = json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ------------------------------------------------------------------------------------------ the coins
+@dataclass(frozen=True)
+class Coin:
+    """A coin the garant's Apirone account takes. Amounts in the database are whole units of it
+    (``places`` decimals: cents of USDT, satoshi of BTC and LTC); Apirone counts in minor units
+    (``decimals``)."""
+
+    code: str  # Apirone's name of the currency
+    key: str  # short, for buttons: usdt / btc / ltc
+    ticker: str  # USDT / BTC / LTC
+    network: str  # the network as the payer sees it
+    decimals: int  # of Apirone's minor unit
+    places: int  # of the unit kept in the database
+    shown: int  # decimals shown for minor amounts (fees are often below a unit)
+    min_payout: int  # units: a payout pays the network fee out of itself; a split part is 0 or at least this
+    fee_allowance: int  # units: what the network and Apirone may take out of a transfer (on top of 10%)
+    withdraw_reserve: int  # units kept out of "free": the network fee of a withdrawal in the cabinet
+    give_up: timedelta  # a transfer whose outcome is unknown is looked for in the history this long
+    retry_after_doubt: timedelta  # the owner may send such a payout again only after this
+    change_window: timedelta  # after a transfer of the bot, its change may be unconfirmed this long (UTXO)
+    utxo: bool
+    stable: bool  # 1 unit of the coin is 1 unit of the dollar ($1 = 1 USDT)
+    rate_band: tuple[Decimal, Decimal]  # a dollar price outside of it is taken for a broken reply
+    tx_link: str
+    address_link: str
+
+    @property
+    def kw(self) -> dict[str, str]:
+        """The currency for Apirone's calls: none for USDT (its calls are as they always were)."""
+        return {} if self.code == CURRENCY else {"currency": self.code}
+
+    @property
+    def label(self) -> str:
+        return f"{self.ticker} {NETWORK}" if self.code == CURRENCY else f"{self.network} ({self.ticker})"
+
+    def to_minor(self, units: int) -> int:
+        return units * 10 ** (self.decimals - self.places)
+
+    def from_minor(self, minor: int) -> int:
+        """Minor units → whole units, rounded down (what is kept in the database)."""
+        return minor // 10 ** (self.decimals - self.places)
+
+    def number(self, units: int) -> str:
+        """Units → "12.5" / "0.00015873" (trailing zeros trimmed)."""
+        sign = "-" if units < 0 else ""
+        whole, part = divmod(abs(units), 10**self.places)
+        text = f"{whole}.{part:0{self.places}d}".rstrip("0").rstrip(".") if self.places else str(whole)
+        return sign + text
+
+    def show(self, units: int) -> str:
+        return f"{self.number(units)} {self.ticker}"
+
+    def show_minor(self, minor: int) -> str:
+        """Minor units → "0.012345 USDT" / "0.00015873 BTC" (``shown`` decimals, trimmed)."""
+        step = Decimal(1).scaleb(-self.shown)
+        value = (Decimal(minor).scaleb(-self.decimals)).quantize(step, rounding=ROUND_HALF_UP)
+        text = format(value, "f").rstrip("0").rstrip(".")
+        return f"{text or '0'} {self.ticker}"
+
+    def parse(self, text: str) -> int:
+        """ "0.0015", "0,0015 btc" → units; at most ``places`` decimals."""
+        raw = (text or "").strip().replace(" ", "").upper().removesuffix(self.ticker).strip()
+        if not re.fullmatch(rf"\d{{1,9}}([.,]\d{{1,{self.places}}})?", raw):
+            raise AmountError("not an amount")
+        units = int(Decimal(raw.replace(",", ".")).scaleb(self.places))
+        if units <= 0:
+            raise AmountError("amount must be positive")
+        return units
+
+    def split(self, total: Amounts, seller_share: int) -> tuple[int, int]:
+        """A verdict dividing the money: (to the seller, to the buyer); each part 0 or ≥ ``min_payout``."""
+        if not 0 <= seller_share <= total.distributable:
+            raise AmountError("the seller's part is outside of what can be handed out")
+        buyer_share = total.distributable - seller_share
+        for part in (seller_share, buyer_share):
+            if 0 < part < self.min_payout:
+                raise AmountError(f"each part must be 0 or at least {self.show(self.min_payout)}")
+        return seller_share, buyer_share
+
+    def usd_to_units(self, usd_cents: int, rate: Decimal, rounding: str) -> int:
+        """Dollars (cents) → units at ``rate`` (dollars for one coin), rounded as asked (decimal.ROUND_…)."""
+        if self.stable:
+            return usd_cents * 10 ** (self.places - 2)
+        value = (Decimal(usd_cents) / 100 / rate).scaleb(self.places)
+        return int(value.to_integral_value(rounding=rounding))
+
+    def units_to_usd_cents(self, units: int, rate: Decimal) -> int:
+        if self.stable:
+            return units // 10 ** (self.places - 2)
+        value = Decimal(units).scaleb(-self.places) * rate * 100
+        return int(value.to_integral_value(rounding=ROUND_HALF_UP))
+
+    def tx_url(self, txid: str) -> str:
+        """The transaction in the network's explorer (BTC and LTC ids without the ``0x`` kept as a key)."""
+        return self.tx_link.format(txid if self.code == CURRENCY else txid.removeprefix("0x"))
+
+    def address_url(self, address: str) -> str:
+        return self.address_link.format(address)
+
+
+USDT = Coin(
+    code=CURRENCY,
+    key="usdt",
+    ticker=ASSET,
+    network="BNB Smart Chain (BEP20)",
+    decimals=DECIMALS,
+    places=2,
+    shown=6,
+    min_payout=MIN_PAYOUT_CENTS,
+    fee_allowance=100,
+    withdraw_reserve=0,
+    give_up=timedelta(minutes=30),
+    retry_after_doubt=timedelta(hours=2),
+    change_window=timedelta(0),
+    utxo=False,
+    stable=True,
+    rate_band=(Decimal(1), Decimal(1)),
+    tx_link="https://bscscan.com/tx/{}",
+    address_link="https://bscscan.com/token/0x55d398326f99059ff775485246999027b3197955?a={}",
+)
+BTC = Coin(
+    code="btc",
+    key="btc",
+    ticker="BTC",
+    network="Bitcoin",
+    decimals=8,
+    places=8,
+    shown=8,
+    min_payout=10_000,  # 0.0001 BTC
+    fee_allowance=20_000,
+    withdraw_reserve=50_000,
+    give_up=timedelta(hours=3),
+    retry_after_doubt=timedelta(hours=24),
+    change_window=timedelta(hours=3),
+    utxo=True,
+    stable=False,
+    rate_band=(Decimal(1_000), Decimal(10_000_000)),
+    tx_link="https://mempool.space/tx/{}",
+    address_link="https://mempool.space/address/{}",
+)
+LTC = Coin(
+    code="ltc",
+    key="ltc",
+    ticker="LTC",
+    network="Litecoin",
+    decimals=8,
+    places=8,
+    shown=8,
+    min_payout=100_000,  # 0.001 LTC
+    fee_allowance=200_000,
+    withdraw_reserve=100_000,
+    give_up=timedelta(hours=1),
+    retry_after_doubt=timedelta(hours=6),
+    change_window=timedelta(hours=1),
+    utxo=True,
+    stable=False,
+    rate_band=(Decimal(1), Decimal(100_000)),
+    tx_link="https://litecoinspace.org/tx/{}",
+    address_link="https://litecoinspace.org/address/{}",
+)
+COINS: dict[str, Coin] = {c.code: c for c in (USDT, BTC, LTC)}
+BY_KEY: dict[str, Coin] = {c.key: c for c in COINS.values()}
+
+
+def coin(code: str | None) -> Coin:
+    """The coin of an Apirone currency (none: USDT, what everything was before the other coins)."""
+    if not code:
+        return USDT
+    try:
+        return COINS[code.lower()]
+    except KeyError:
+        raise ValueError(f"unknown coin {code!r}") from None
+
+
+def coin_of(row: Any) -> Coin:
+    """The coin of a deal or an invoice (``currency``; none: USDT)."""
+    return coin(getattr(row, "currency", None))

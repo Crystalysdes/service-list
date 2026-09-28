@@ -103,3 +103,41 @@ def test_minor_units_of_the_gateway():
     assert show_minor(to_minor(1250)) == "12.5 USDT"
     assert show_minor(123_456_789_000_000) == "0.000123 USDT"
     assert show_minor(0) == "0 USDT" and show_minor(10**11) == "0 USDT"
+
+
+def test_the_coins_keep_their_own_units():
+    from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+
+    from app.services.escrow.money import BTC, LTC, USDT, coin, show_minor, to_minor
+
+    # USDT through a coin is USDT as it always was
+    assert USDT.show(2550) == show(2550) and USDT.parse(" 1 000 usdt ") == parse_amount(" 1 000 usdt ")
+    assert USDT.to_minor(10_050) == to_minor(10_050) and USDT.show_minor(123_456_789_000_000) == (
+        show_minor(123_456_789_000_000)
+    )
+    assert USDT.kw == {} and USDT.label == "USDT BEP20"
+    # BTC and LTC: satoshi in the database and at Apirone, shown exactly
+    assert BTC.to_minor(15_874) == 15_874 == BTC.from_minor(15_874) and BTC.kw == {"currency": "btc"}
+    assert BTC.show(15_874) == "0.00015874 BTC" and BTC.show(100_000_000) == "1 BTC"
+    assert LTC.show_minor(12_500_000) == "0.125 LTC" and LTC.label == "Litecoin (LTC)"
+    assert BTC.parse("0.0015") == 150_000 and LTC.parse("0,5 ltc") == 50_000_000
+    for bad in ("0.000000001", "0", "abc", "1e-3"):  # finer than a satoshi, or not an amount
+        with pytest.raises(AmountError):
+            BTC.parse(bad)
+    # dollars at a rate, rounded the way asked
+    rate = Decimal("63000")
+    assert BTC.usd_to_units(1000, rate, ROUND_CEILING) == 15_874  # 15 873.01…
+    assert BTC.usd_to_units(1000, rate, ROUND_FLOOR) == 15_873
+    assert USDT.usd_to_units(1000, Decimal(1), ROUND_CEILING) == 1000
+    assert BTC.units_to_usd_cents(100_000, Decimal("65000")) == 6500
+    assert USDT.units_to_usd_cents(1234, rate) == 1234
+    # a split part is 0 or at least the coin's own minimum payout
+    total = amounts(1_000_000, 100, "buyer")  # 0.01 BTC
+    assert BTC.split(total, 500_000) == (500_000, 500_000)
+    with pytest.raises(AmountError):
+        BTC.split(total, 9_999)  # below 0.0001 BTC
+    assert coin(None) is USDT and coin("BTC") is BTC and coin("ltc") is LTC
+    with pytest.raises(ValueError):
+        coin("doge")
+    assert BTC.tx_url("0x" + "ab" * 32) == "https://mempool.space/tx/" + "ab" * 32
+    assert USDT.tx_url("0xab") == "https://bscscan.com/tx/0xab"

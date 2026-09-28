@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, ClassVar, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -254,7 +254,8 @@ class EscrowRuntime(SettingsGroup):
     # in every deal held there, so only these, the owners and current admins may be one
     pool_creators: list[int] = Field(default_factory=list)
     switched_at: datetime | None = None  # the garant moved from Crypto Pay to Apirone (done once)
-    scanned_at: datetime | None = None  # the account's history was read in full up to here
+    scanned_at: datetime | None = None  # the account's history (of USDT) was read in full up to here
+    scanned: dict[str, datetime] = Field(default_factory=dict)  # the same for the other coins: code → moment
     restored_backup_at: datetime | None = None  # a restore brought back the state of this moment
     # money that left the account with no payout or withdrawal of the bot behind it (a transfer made by hand,
     # one made before a restore): [{txid, item, date, amount, addresses, status: open / owner}]; payouts to
@@ -267,7 +268,16 @@ class Payments(SettingsGroup):
     KEY: ClassVar[str] = "payments"
 
     accepted_assets: list[str] = Field(default_factory=lambda: ["USDT", "TON", "BTC"])  # CryptoBot's
-    apirone: bool = True  # USDT BEP20 through Apirone too (when its account is set up: servicelist config)
+    apirone: bool = True  # through Apirone too (when its account is set up: servicelist config)
+    # the coins offered through Apirone; the others are switched on in 💵 Цены и сроки (their check passed)
+    apirone_coins: list[str] = Field(default_factory=lambda: ["usdt@bnb"])
+
+    @field_validator("apirone_coins")
+    @classmethod
+    def _known_coins(cls, value: list[str]) -> list[str]:
+        from app.services.escrow.money import COINS
+
+        return list(dict.fromkeys(code for code in value if code in COINS))
 
 
 class LinkCheckSettings(SettingsGroup):

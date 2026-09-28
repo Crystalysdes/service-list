@@ -10,14 +10,22 @@ It behaves the way the bot must expect from the real service (see app/services/a
 * a transfer takes the fees (Apirone's ``fee_bps`` of the amount plus the network's ``gas``) out of the
   amount sent; the history shows the full amount (``net_in_history``: the amount that arrived).
 
+Every call is of one currency (USDT BEP20 when none is given, as the bot's calls of USDT are). BTC and LTC
+invoices get bech32 addresses with a valid checksum (``base58``: legacy ones, whose case matters), their own
+balances (``coins``), items and fees (``coin_gas``); a transfer to a malformed address of its coin is refused
+(an address lower-cased by mistake fails). The ticker answers ``rates``.
+
 Fault injection: ``fail`` (every call: no answer), ``transfer_errors`` (refusals ``(status, message)``, one
 per call), ``transfer_timeouts`` (no answer, nothing sent), ``transfer_lost_replies`` (sent, then no answer),
-``transfer_5xx`` (sent, then a server error), ``history_fail`` / ``balance_fail`` / ``invoice_fail`` (those
-calls get no answer), ``history_lag`` (the newest items are not in the history yet).
+``transfer_5xx`` (sent, then a server error), ``history_fail`` / ``balance_fail`` / ``invoice_fail`` /
+``rate_fail`` (those calls get no answer), ``history_lag`` (the newest items are not in the history yet),
+``coin_history_fail`` (the history of those currencies gets no answer), ``filter_ignored`` (the history
+lists every currency whatever was asked).
 """
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import re
 from collections.abc import Callable
@@ -25,10 +33,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from app.services import coinaddr
 from app.services.apirone import ApironeError, ApironeInvoice, ApironeTransfer, HistoryItem
 from app.services.escrow import money
+from app.services.evm import AddressError
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+USDT = money.CURRENCY
 
 
 def _stamp(moment: datetime) -> str:
@@ -60,6 +71,15 @@ class FakeApirone:
         self.transfer_lost_replies = 0
         self.transfer_5xx = 0
         self.calls: list[str] = []
+        self.coins: dict[str, list[int]] = {"btc": [0, 0], "ltc": [0, 0]}  # [available, total] minor units
+        self.coin_gas = {"btc": 2_000, "ltc": 10_000}  # the network fee of a transfer, minor units
+        self.rates = {"btc": Decimal("63000"), "ltc": Decimal("80")}
+        self.units = {USDT: Decimal("1E-18"), "btc": Decimal("1E-8"), "ltc": Decimal("1E-8")}
+        self.forwarding: dict[str, Any] = {}  # currency → destinations set in the cabinet
+        self.base58 = False  # BTC/LTC invoices get legacy addresses (1… / L…)
+        self.rate_fail = False
+        self.coin_history_fail: set[str] = set()
+        self.filter_ignored = False
         self._ids = itertools.count(1)
         self._addr = itertools.count(1)
         self._tx = itertools.count(1)
@@ -70,18 +90,49 @@ class FakeApirone:
         if self.fail:
             raise ApironeError("no answer in time", unknown=True)
 
-    def _new_address(self) -> str:
-        return f"0x{0xA000000000000000000000000000000000000000 + next(self._addr):040x}"
+    def _new_address(self, currency: str = USDT) -> str:
+        n = next(self._addr)
+        if currency == USDT:
+            return f"0x{0xA000000000000000000000000000000000000000 + n:040x}"
+        program = hashlib.sha256(f"{currency}-{n}".encode()).digest()[:20]
+        if self.base58:
+            version = {"btc": 0x00, "ltc": 0x30}[currency]
+            return coinaddr.encode_base58check(bytes([version]) + program)
+        return coinaddr.encode_segwit({"btc": "bc", "ltc": "ltc"}[currency], 0, program)
 
-    def new_txid(self) -> str:
-        return f"0x{next(self._tx):064x}"
+    def new_txid(self, currency: str = USDT) -> str:
+        n = next(self._tx)
+        return f"0x{n:064x}" if currency == USDT else hashlib.sha256(f"tx-{n}".encode()).hexdigest()
 
-    def _add_item(self, kind: str, amount: int, txid: str, address: str, confirmed: bool) -> dict[str, Any]:
+    def _credit(self, currency: str, amount: int, confirmed: bool) -> None:
+        if currency == USDT:
+            self.total += amount
+            if confirmed:
+                self.available += amount
+        else:
+            self.coins[currency][1] += amount
+            if confirmed:
+                self.coins[currency][0] += amount
+
+    def _debit(self, currency: str, amount: int) -> None:
+        if currency == USDT:
+            self.available -= amount
+            self.total -= amount
+        else:
+            self.coins[currency][0] -= amount
+            self.coins[currency][1] -= amount
+
+    def _available(self, currency: str) -> int:
+        return self.available if currency == USDT else self.coins[currency][0]
+
+    def _add_item(
+        self, kind: str, amount: int, txid: str, address: str, confirmed: bool, currency: str = USDT
+    ) -> dict[str, Any]:
         item = {
             "id": f"hist-{next(self._ids)}",
             "date": _stamp(self.clock()),
             "type": kind,
-            "currency": money.CURRENCY,
+            "currency": currency,
             "amount": amount,
             "txs": [txid],
             "is_confirmed": confirmed,
@@ -95,30 +146,43 @@ class FakeApirone:
         return ApironeInvoice.from_api(public)
 
     # ------------------------------------------------------------------------------------------ the API
-    async def units_factor(self) -> Decimal | None:
+    async def units_factor(self, currency: str = USDT) -> Decimal | None:
         self._check("units_factor")
-        return Decimal("1E-18")
+        return self.units.get(currency)
 
-    async def account_info(self) -> dict[str, Any]:
+    async def account_info(self, currency: str = USDT) -> dict[str, Any]:
         self._check("account_info")
-        return {"account": self.account, "info": [{"currency": money.CURRENCY, "destinations": None}]}
+        return {
+            "account": self.account,
+            "info": [{"currency": currency, "destinations": self.forwarding.get(currency)}],
+        }
 
-    async def balance(self, currency: str | None = money.CURRENCY) -> dict[str, tuple[int, int]]:
+    async def rate(self, currency: str, fiat: str = "usd") -> Decimal:
+        self._check("rate")
+        if self.rate_fail:
+            raise ApironeError("no answer in time", unknown=True)
+        return self.rates[currency]
+
+    async def balance(self, currency: str | None = USDT) -> dict[str, tuple[int, int]]:
         self._check("balance")
         if self.balance_fail:
             raise ApironeError("no answer in time", unknown=True)
-        return {money.CURRENCY: (self.available, self.total)}
+        if currency in (USDT, None):
+            return {USDT: (self.available, self.total)}
+        return {currency: (self.coins[currency][0], self.coins[currency][1])}
 
-    async def create_invoice(self, amount: int, lifetime: int, title: str) -> ApironeInvoice:
+    async def create_invoice(
+        self, amount: int, lifetime: int, title: str, currency: str = USDT
+    ) -> ApironeInvoice:
         self._check("create_invoice")
         now = self.clock()
         invoice_id = f"inv{next(self._ids)}"
-        address = self._new_address()
+        address = self._new_address(currency)
         data = {
             "account": self.account,
             "invoice": invoice_id,
             "created": _stamp(now),
-            "currency": money.CURRENCY,
+            "currency": currency,
             "address": address,
             "expire": _stamp(now + timedelta(seconds=lifetime)),
             "amount": amount,
@@ -129,8 +193,8 @@ class FakeApirone:
             "_seen": 0,  # minor units paid to it while it could still be paid
         }
         self.invoices_by_id[invoice_id] = data
-        self.by_address[address] = invoice_id
-        self.created.append({"amount": amount, "lifetime": lifetime, "title": title})
+        self.by_address[coinaddr.key(address)] = invoice_id
+        self.created.append({"amount": amount, "lifetime": lifetime, "title": title, "currency": currency})
         return self._invoice_view(data)
 
     async def invoice(self, invoice_id: str) -> ApironeInvoice:
@@ -147,15 +211,23 @@ class FakeApirone:
         found = list(reversed(self.invoices_by_id.values()))[offset : offset + limit]
         return [self._invoice_view(data) for data in found]
 
-    def _fees(self, amount: int) -> tuple[int, int]:
-        return -(-amount * self.fee_bps // 10_000), self.gas
+    def _fees(self, amount: int, currency: str = USDT) -> tuple[int, int]:
+        return -(-amount * self.fee_bps // 10_000), self.gas if currency == USDT else self.coin_gas[currency]
 
-    async def estimate(self, address: str, amount: int) -> ApironeTransfer:
+    def _valid_destination(self, address: str, currency: str) -> bool:
+        if currency == USDT:
+            return _ADDRESS_RE.match(address) is not None
+        try:
+            return coinaddr.normalize(currency, address) == address  # the case of base58 is part of it
+        except AddressError:
+            return False
+
+    async def estimate(self, address: str, amount: int, currency: str = USDT) -> ApironeTransfer:
         self._check("estimate")
-        processing, network = self._fees(amount)
+        processing, network = self._fees(amount, currency)
         return ApironeTransfer.from_api(
             {
-                "currency": money.CURRENCY,
+                "currency": currency,
                 "destinations": [{"address": address, "amount": amount - processing - network}],
                 "fee": {"network": {"amount": network}, "processing": {"amount": processing}},
                 "amount": amount,
@@ -163,7 +235,7 @@ class FakeApirone:
             }
         )
 
-    async def transfer(self, address: str, amount: int) -> ApironeTransfer:
+    async def transfer(self, address: str, amount: int, currency: str = USDT) -> ApironeTransfer:
         self._check("transfer")
         if self.transfer_timeouts:
             self.transfer_timeouts -= 1
@@ -171,30 +243,31 @@ class FakeApirone:
         if self.transfer_errors:
             status, message = self.transfer_errors.pop(0)
             raise ApironeError(message, status)
-        if not _ADDRESS_RE.match(address):
+        if not self._valid_destination(address, currency):
             raise ApironeError("Invalid destination address", 400)
-        processing, network = self._fees(amount)
+        processing, network = self._fees(amount, currency)
         if processing + network >= amount:
             raise ApironeError("Amount is too small to cover the fee", 400)
-        if amount > self.available:
+        if amount > self._available(currency):
             raise ApironeError("Insufficient funds", 400)
-        self.available -= amount
-        self.total -= amount
-        txid = self.new_txid()
+        self._debit(currency, amount)
+        txid = self.new_txid(currency)
         net = amount - processing - network
+        key = coinaddr.key(address)
         transfer = {
             "id": f"tr-{next(self._ids)}",
-            "address": address.lower(),
+            "address": key,
             "amount": amount,
             "net": net,
             "txid": txid,
             "date": self.clock(),
+            "currency": currency,
         }
         self.transfers.append(transfer)
-        self._add_item("payment", net if self.net_in_history else amount, txid, address.lower(), True)
+        self._add_item("payment", net if self.net_in_history else amount, txid, key, True, currency)
         reply = {
             "account": self.account,
-            "currency": money.CURRENCY,
+            "currency": currency,
             "created": _stamp(self.clock()),
             "destinations": [{"address": address, "amount": net}],
             "fee": {
@@ -216,24 +289,32 @@ class FakeApirone:
         return ApironeTransfer.from_api(reply)
 
     async def history(
-        self, *, kind: str | None = None, since: datetime | None = None, offset: int = 0, limit: int = 100
+        self,
+        *,
+        kind: str | None = None,
+        since: datetime | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        currency: str = USDT,
     ) -> list[HistoryItem]:
         self._check("history")
-        if self.history_fail:
+        if self.history_fail or currency in self.coin_history_fail:
             raise ApironeError("no answer in time", unknown=True)
         visible = self.items[: len(self.items) - self.history_lag] if self.history_lag else self.items
         found = []
         for item in reversed(visible):
             if kind and item["type"] != kind:
                 continue
+            if item["currency"] != currency and not self.filter_ignored:
+                continue
             if since is not None and HistoryItem.from_api(item).date < since.replace(microsecond=0):
                 continue
             found.append({k: v for k, v in item.items() if k != "address"})  # the list names no address
-        return [HistoryItem.from_api(item) for item in found[offset : offset + limit]]
+        return [HistoryItem.from_api(item, currency) for item in found[offset : offset + limit]]
 
-    async def history_item(self, item_id: str) -> HistoryItem:
+    async def history_item(self, item_id: str, currency: str = USDT) -> HistoryItem:
         self._check("history_item")
-        if self.history_fail:
+        if self.history_fail or currency in self.coin_history_fail:
             raise ApironeError("no answer in time", unknown=True)
         for item in self.items:
             if item["id"] == item_id:
@@ -242,7 +323,7 @@ class FakeApirone:
                     detail["destinations"] = [{"address": item["address"], "amount": item["amount"]}]
                 else:
                     detail["address"] = item["address"]
-                return HistoryItem.from_api(detail)
+                return HistoryItem.from_api(detail, currency)
         raise ApironeError("History item not found", 404)
 
     async def close(self) -> None:
@@ -261,21 +342,31 @@ class FakeApirone:
         confirmed: bool = False,
         txid: str | None = None,
     ) -> str:
-        """The buyer pays to an invoice's address (the whole invoice when no amount is given); the txid."""
+        """The buyer pays to an invoice's address (the whole invoice when no amount is given; ``cents``: of
+        USDT); the txid."""
         data = self.invoices_by_id[self.invoice_id(invoice_id)]
         amount = (
             minor if minor is not None else money.to_minor(cents) if cents is not None else data["amount"]
         )
         return self.pay_to(data["address"], minor=amount, confirmed=confirmed, txid=txid)
 
-    def pay_to(self, address: str, *, minor: int, confirmed: bool = False, txid: str | None = None) -> str:
-        txid = txid or self.new_txid()
-        self._add_item("receipt", minor, txid, address.lower(), confirmed)
-        self.total += minor
-        if confirmed:
-            self.available += minor
-        invoice_id = self.by_address.get(address.lower())
+    def pay_to(
+        self,
+        address: str,
+        *,
+        minor: int,
+        confirmed: bool = False,
+        txid: str | None = None,
+        currency: str | None = None,
+    ) -> str:
+        """Money arrives at an address (``currency``: of the invoice there, else USDT)."""
+        key = coinaddr.key(address)
+        invoice_id = self.by_address.get(key)
         data = self.invoices_by_id.get(invoice_id) if invoice_id else None
+        currency = currency or (data["currency"] if data is not None else USDT)
+        txid = txid or self.new_txid(currency)
+        self._add_item("receipt", minor, txid, key, confirmed, currency)
+        self._credit(currency, minor, confirmed)
         if data is not None and data["status"] in ("created", "partpaid", "paid", "overpaid"):
             data["_seen"] += minor
             status = (
@@ -307,7 +398,10 @@ class FakeApirone:
         for item in self.items:
             if item["type"] == "receipt" and not item["is_confirmed"] and txid in (None, item["txs"][0]):
                 item["is_confirmed"] = True
-                self.available += item["amount"]
+                if item["currency"] == USDT:
+                    self.available += item["amount"]
+                else:
+                    self.coins[item["currency"]][0] += item["amount"]
         for data in self.invoices_by_id.values():
             self._complete(data)
 
@@ -317,19 +411,19 @@ class FakeApirone:
             data["status"] = "expired"
             data["history"].append({"date": _stamp(self.clock()), "status": "expired"})
 
-    def send_by_hand(self, address: str, cents: int) -> str:
+    def send_by_hand(
+        self, address: str, cents: int | None = None, *, minor: int | None = None, currency: str = USDT
+    ) -> str:
         """Money sent from the account outside the bot (Apirone's dashboard, or before a restore)."""
-        amount = money.to_minor(cents)
-        self.available -= amount
-        self.total -= amount
-        txid = self.new_txid()
-        self._add_item("payment", amount, txid, address.lower(), True)
+        amount = minor if minor is not None else money.to_minor(cents or 0)
+        self._debit(currency, amount)
+        txid = self.new_txid(currency)
+        self._add_item("payment", amount, txid, coinaddr.key(address), True, currency)
         return txid
 
-    def fund(self, cents: int) -> None:
+    def fund(self, cents: int | None = None, *, minor: int | None = None, currency: str = USDT) -> None:
         """Money on the account that no invoice brought (the owner topped it up)."""
-        self.available += money.to_minor(cents)
-        self.total += money.to_minor(cents)
+        self._credit(currency, minor if minor is not None else money.to_minor(cents or 0), True)
 
     def sent_to(self, address: str) -> int:
         """Cents that arrived at an address (after the fees)."""

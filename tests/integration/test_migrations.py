@@ -281,3 +281,57 @@ def test_names_lose_their_emoji_and_the_arrows_move_closer_to_the_edge():
         assert _alembic("downgrade", "0013").returncode == 0  # data only: nothing to undo
     finally:
         _psql(f"DROP DATABASE IF EXISTS {NAME}")
+
+
+def test_an_invoice_in_another_coin_keeps_the_schema_from_going_down():
+    """0017: an invoice knows its coin. Going down is refused while one in BTC or LTC is kept (the older code
+    would take its satoshi for USDT) and goes once there is none."""
+    if not _psql(f"DROP DATABASE IF EXISTS {NAME}") or not _psql(f"CREATE DATABASE {NAME}"):
+        pytest.skip("cannot create a scratch database")
+    url = _admin_url().rsplit("/", 1)[0] + f"/{NAME}"
+
+    def sql(statement: str) -> str:
+        result = subprocess.run(
+            ["psql", url, "-v", "ON_ERROR_STOP=1", "-At", "-c", statement],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        return result.stdout.strip()
+
+    try:
+        assert _alembic("upgrade", "head").returncode == 0
+        category = sql(
+            "INSERT INTO categories (slug, title, nav_label, header, post_order, nav_order, top_slots, "
+            "updated_at, created_at) VALUES ('travel', 'Travel', '#travel', '{}', 0, 0, 3, now(), now()) "
+            "RETURNING id"
+        ).splitlines()[0]
+        service = sql(
+            "INSERT INTO services (category_id, name, url, url_kind, position, status, source, link_state, "
+            f"link_dead_streak, updated_at, created_at) VALUES ({category}, 'Sky', 'https://t.me/x', "
+            "'telegram', 0, 'approved', 'user', 'unknown', 0, now(), now()) RETURNING id"
+        ).splitlines()[0]
+        order = sql(
+            "INSERT INTO orders (user_id, service_id, kind, months, params, amount_cents, status, provider, "
+            f"updated_at, created_at) VALUES (1, {service}, 'listing', 1, '{{}}', 1000, 'invoiced', "
+            "'apirone', now(), now()) RETURNING id"
+        ).splitlines()[0]
+        sql(
+            "INSERT INTO invoices (order_id, provider, remote_id, address, currency, amount_minor, pay_url, "
+            f"amount_cents, status, updated_at, created_at) VALUES ({order}, 'apirone', 'inv1', "
+            "'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4', 'btc', '15874', '', 1000, 'active', now(), now())"
+        )
+        refused = _alembic("downgrade", "0016")
+        assert refused.returncode != 0 and "BTC or LTC" in refused.stderr
+        sql("UPDATE invoices SET currency = 'usdt@bnb'")
+        assert _alembic("downgrade", "0016").returncode == 0
+        assert (
+            sql(
+                "SELECT count(*) FROM information_schema.columns WHERE table_name = 'invoices' "
+                "AND column_name IN ('currency', 'amount_minor')"
+            )
+            == "0"
+        )
+    finally:
+        _psql(f"DROP DATABASE IF EXISTS {NAME}")

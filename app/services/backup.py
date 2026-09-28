@@ -42,7 +42,7 @@ from app.services.settings import Chats, EscrowRuntime, Runtime, get_settings, u
 
 log = logging.getLogger(__name__)
 
-FORMAT = 1
+FORMAT = 2  # 2: amounts may be of BTC or LTC (an older bot, which knows USDT only, refuses such archives)
 MAGIC = b"SLBK1"
 CHUNK = 1 << 20
 SKIP_TABLES = {"fsm_states", "backups"}  # dialog states and the local list of archives
@@ -252,6 +252,13 @@ async def create_archive(config: Config, db: Database, *, bot_username: str | No
     )
 
 
+def newer_revision(archive: Any, current: str | None) -> bool:
+    """An archive of a newer schema than the database's: restored by this code, the columns it does not know
+    would be dropped silently (a BTC amount taken for USDT cents). Unknown on either side: not refused."""
+    theirs, ours = str(archive or ""), str(current or "")
+    return theirs.isdigit() and ours.isdigit() and int(theirs) > int(ours)
+
+
 async def _alembic_revision(conn: AsyncConnection) -> str | None:
     try:
         return (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one_or_none()
@@ -449,6 +456,12 @@ async def restore_archive(
             manifest = json.loads(archive.read("manifest.json"))
             if manifest.get("app") != "service-list" or int(manifest.get("format", 0)) > FORMAT:
                 raise BackupError("архив создан другой программой или более новой версией бота")
+            async with db.engine.connect() as conn:
+                current = await _alembic_revision(conn)
+            if newer_revision(manifest.get("alembic_revision"), current):
+                raise BackupError(
+                    "архив создан более новой версией бота: сначала обновите бота, потом восстанавливайте"
+                )
             extracted = await asyncio.to_thread(_extract_media, archive, manifest, config.media_dir)
             counts: dict[str, int] = {}
             tables = _tables()

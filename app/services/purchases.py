@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot.i18n import Translator, h
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Category, Channel, ChannelPost, Order, Service, User
+from app.db.models import Category, Channel, ChannelPost, Invoice, Order, Service, User
 from app.domain.symbols import channel_post_base
 from app.services import billing
 from app.services.billing import PaidResult, feature_row, money
@@ -284,7 +284,7 @@ async def after_paid(ctx: AppContext, result: PaidResult) -> None:
         builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
         builder.adjust(1)
         username = f"@{user.username}" if user and user.username else str(order.user_id)
-        way = " (USDT BEP20, Apirone)" if order.provider == "apirone" else ""
+        way = await _apirone_way(session, order) if order.provider == "apirone" else ""
         staff_text = (
             f"💰 Оплата {money(order.amount_cents)}{way}: {h(option_title(Translator('ru'), order))} — "
             f"«{h(service.name)}» ({h(category.title if category else '')}) от {h(username)}"
@@ -305,6 +305,19 @@ async def after_paid(ctx: AppContext, result: PaidResult) -> None:
                 )
     await notify_user(ctx, order.user_id, text, reply_markup=builder.as_markup())
     await notify_staff(ctx, staff_text)
+
+
+async def _apirone_way(session: AsyncSession, order: Order) -> str:
+    """How an order was paid through Apirone, for staff: " (USDT BEP20, Apirone)" or the coin's sum."""
+    paid = await session.scalar(
+        select(Invoice)
+        .where(Invoice.order_id == order.id, Invoice.provider == "apirone", Invoice.status == "paid")
+        .order_by(Invoice.id.desc())
+        .limit(1)
+    )
+    if paid is None or paid.currency in (None, "usdt@bnb") or not paid.paid_amount:
+        return " (USDT BEP20, Apirone)"
+    return f" ({paid.paid_amount}, Apirone)"
 
 
 async def _bundle_paid(

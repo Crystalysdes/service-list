@@ -683,6 +683,7 @@ async def _reconcile(ctx: AppContext, now: datetime) -> list[str]:
 
     async with ctx.db.session() as session:
         before = await get_settings(session, EscrowRuntime)
+        others = await ledger.other_coins(session)
     since = (before.scanned_at or now - FIRST_WINDOW) - WINDOW
     scanned = True
     try:
@@ -706,6 +707,21 @@ async def _reconcile(ctx: AppContext, now: datetime) -> list[str]:
     if scanned:  # the next check starts from here (and looks a day further back)
         async with ctx.db.session() as session:
             await update_settings(session, EscrowRuntime, scanned_at=now)
+            await session.commit()
+    for coin, first in others:  # BTC and LTC: each read on its own (one failing holds back no other)
+        try:
+            fundings, strangers = await invoices.scan_receipts(
+                ctx, (before.scanned.get(coin.code) or first) - WINDOW, coin
+            )
+        except PROVIDER_ERRORS as exc:
+            failed(f"историю поступлений {coin.ticker}", exc)
+            continue
+        problems += strangers
+        for funding in fundings:
+            await on_funding(ctx, funding)
+        async with ctx.db.session() as session:
+            runtime = await get_settings(session, EscrowRuntime)
+            await update_settings(session, EscrowRuntime, scanned={**runtime.scanned, coin.code: now})
             await session.commit()
     async with ctx.db.session() as session:
         runtime = await get_settings(session, EscrowRuntime)

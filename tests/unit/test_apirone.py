@@ -313,3 +313,63 @@ def test_parsing_what_the_sdk_shows():
     assert item.item_id == "7" and item.addresses == {SELLER.lower()} and item.confirmed is None
     txid = "0x" + "ab" * 32  # a transaction id is not an address, though it starts like one
     assert HistoryItem.from_api({"id": 8, "txs": [txid], "note": f"sent {txid}"}).addresses == set()
+
+
+async def test_a_coin_is_asked_for_in_every_call(api):
+    client, seen, _ = api
+    await client.create_invoice(15_874, 3600, "t", currency="btc")
+    assert seen[-1]["body"]["currency"] == "btc" and seen[-1]["body"]["amount"] == 15_874
+    await client.history(kind="receipt", currency="ltc")
+    assert seen[-1]["query"]["currency"] == "ltc"
+    await client.transfer("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", 50_000, currency="btc")
+    assert seen[-1]["body"]["currency"] == "btc"
+    await client.account_info(currency="btc")
+    assert seen[-1]["query"]["currency"] == "btc"
+    assert await client.units_factor("btc") == Decimal("1E-8")
+    await client.create_invoice(1, 60, "t")  # USDT: as always
+    assert seen[-1]["body"]["currency"] == "usdt@bnb"
+
+
+@pytest.mark.parametrize(
+    ("body", "price"),
+    [
+        ('{"usd": 63000.12, "eur": 58000}', Decimal("63000.12")),
+        ('{"btc": {"usd": "63000"}}', Decimal("63000")),
+        ("63000.5", Decimal("63000.5")),
+    ],
+)
+async def test_the_price_of_a_coin(api, body, price):
+    client, seen, replies = api
+    replies[("GET", "v2/ticker")] = (200, body)
+    assert await client.rate("btc") == price
+    assert seen[-1]["query"] == {"currency": "btc", "fiat": "usd"}
+
+
+@pytest.mark.parametrize("body", ['{"eur": 58000}', '{"usd": -1}', '{"usd": "NaN"}', '{"usd": true}', "[]"])
+async def test_a_price_that_does_not_read_is_no_price(api, body):
+    client, _, replies = api
+    replies[("GET", "v2/ticker")] = (200, body)
+    with pytest.raises(ApironeError) as err:
+        await client.rate("btc")
+    assert outcome_unknown(err.value)
+
+
+def test_a_legacy_address_keeps_its_case_and_history_items_name_their_coin_s_addresses():
+    legacy = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+    invoice = ApironeInvoice.from_api({"invoice": "b1", "address": legacy, "currency": "btc"})
+    assert invoice.address == legacy
+    upper = ApironeInvoice.from_api(
+        {"invoice": "b2", "address": "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4", "status": "created"}
+    )
+    assert upper.address == "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    item = HistoryItem.from_api(
+        {
+            "id": 1,
+            "currency": "btc",
+            "txs": ["ab" * 32],
+            "destinations": [{"address": "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"}],
+            "note": SELLER,
+        }
+    )
+    assert item.addresses == {"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"}  # BTC's only: not the EVM one
+    assert HistoryItem.from_api({"id": 2, "note": SELLER}).addresses == {SELLER.lower()}  # USDT by default

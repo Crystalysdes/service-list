@@ -21,10 +21,11 @@ from sqlalchemy import func, select
 from app.bot.i18n import h
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Deal, DealPayout, DealReceipt, EscrowWithdrawal
+from app.db.models import Deal, DealPayout, DealReceipt, EscrowWithdrawal, Invoice
 from app.services.apirone import PROVIDER_ERRORS, ApironeError, HistoryItem, outcome_unknown
 from app.services.escrow import money
 from app.services.escrow.deals import GATEWAY, HELD, txid_key
+from app.services.escrow.money import USDT, Coin
 from app.services.evm import short
 from app.services.redact import describe
 from app.services.settings import EscrowRuntime, get_settings, update_settings
@@ -73,14 +74,16 @@ def transient(exc: BaseException) -> bool:
 
 
 # ------------------------------------------------------------------------------------------ the history
-async def movements(pay: Any, kind: str, since: datetime) -> list[HistoryItem]:
-    """Every item of ``kind`` (payment / receipt) from ``since`` on. A history longer than can be read in one
-    go counts as no answer: a part of it would prove nothing."""
+async def movements(pay: Any, kind: str, since: datetime, coin: Coin = USDT) -> list[HistoryItem]:
+    """Every item of ``kind`` (payment / receipt) of the coin from ``since`` on. A history longer than can be
+    read in one go counts as no answer: a part of it would prove nothing. An item of another coin is never
+    taken for one of this (the server's filter is a hint only)."""
+    accepted = ("", coin.code) if coin is USDT else (coin.code,)
     found: list[HistoryItem] = []
     for page in range(MAX_PAGES):
-        items = await pay.history(kind=kind, since=since, offset=page * PAGE, limit=PAGE)
+        items = await pay.history(kind=kind, since=since, offset=page * PAGE, limit=PAGE, **coin.kw)
         for item in items:
-            if item.kind != kind or item.currency not in ("", money.CURRENCY):
+            if item.kind != kind or item.currency.lower() not in accepted:
                 continue
             if item.date is None or item.date >= since:
                 found.append(item)
@@ -105,12 +108,25 @@ class Moved:
         return moment is None or self.item.date is None or self.item.date >= moment - SLACK
 
 
-async def addresses_of(pay: Any, item: HistoryItem, cache: dict[str, set[str]]) -> set[str]:
+async def addresses_of(
+    pay: Any, item: HistoryItem, cache: dict[str, set[str]], coin: Coin = USDT
+) -> set[str]:
     if item.addresses:
         return item.addresses
     if item.item_id not in cache:
-        cache[item.item_id] = (await pay.history_item(item.item_id)).addresses
+        cache[item.item_id] = (await pay.history_item(item.item_id, **coin.kw)).addresses
     return cache[item.item_id]
+
+
+async def other_coins(session: Any) -> list[tuple[Coin, datetime]]:
+    """The coins besides USDT whose invoices were ever made, each with its first invoice's moment: their
+    history is read from there on (a coin without an invoice has nothing to find)."""
+    rows = await session.execute(
+        select(Invoice.currency, func.min(Invoice.created_at))
+        .where(Invoice.currency.is_not(None), Invoice.currency != USDT.code)
+        .group_by(Invoice.currency)
+    )
+    return [(money.coin(code), first) for code, first in rows.all() if code in money.COINS]
 
 
 async def taken_txids(session: Any) -> set[str]:

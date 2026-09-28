@@ -294,12 +294,14 @@ async def expire_due(ctx: AppContext, *, now: datetime | None = None) -> list[De
     return expired
 
 
-async def scan_receipts(ctx: AppContext, since: datetime) -> tuple[list[Funding], list[str]]:
-    """Money the account's history shows arriving since ``since``: each payment to an invoice's address is
-    taken to its deal (a late one goes back to the buyer); a payment to an address that is no invoice's is
-    a problem for the owner. Raises what Apirone raises."""
+async def scan_receipts(
+    ctx: AppContext, since: datetime, coin: money.Coin = money.USDT
+) -> tuple[list[Funding], list[str]]:
+    """Money of the coin the account's history shows arriving since ``since``: each payment to an invoice's
+    address is taken to its deal (a late one goes back to the buyer) or to its order; a payment to an address
+    that is no invoice's is a problem for the owner. Raises what Apirone raises."""
     pay = provider(ctx)
-    items = await movements(pay, "receipt", since)
+    items = await movements(pay, "receipt", since, coin)
     if not items:
         return [], []
     txids = {deals.txid_key(t) for item in items for t in item.txids}
@@ -321,7 +323,7 @@ async def scan_receipts(ctx: AppContext, since: datetime) -> tuple[list[Funding]
         confirmed = bool(item.confirmed)
         if keys[0] in known_txids and ((keys[0], True) in known or not confirmed):
             continue  # written down already, with nothing new to add
-        addresses = await addresses_of(pay, item, cache)
+        addresses = await addresses_of(pay, item, cache, coin)
         async with ctx.db.session() as session:
             rows = list(
                 (
@@ -334,14 +336,17 @@ async def scan_receipts(ctx: AppContext, since: datetime) -> tuple[list[Funding]
             from app.services import apirone_pay
 
             async with ctx.db.session() as session:
-                listing = await apirone_pay.invoice_at(session, addresses)
+                listing = await apirone_pay.invoice_at(session, addresses, coin)
             if listing is not None:
-                await apirone_pay.history_receipt(ctx, listing, keys[0], item.amount, confirmed)
+                await apirone_pay.history_receipt(ctx, listing, keys[0], item.amount, confirmed, coin)
+                continue
+            if coin is not money.USDT:  # BTC/LTC: the change of the account's own transfers may come back
+                log.info("receipt %s of %s at no invoice's address: %s", keys[0], coin.code, addresses)
                 continue
         if len(rows) != 1:  # nobody's, or the item names the addresses of several invoices
             where = ", ".join(short(a) for a in sorted(addresses)) or "?"
             whose = "это не адрес счёта сделки" if not rows else "неясно, какой из сделок оно"
-            problems.append(f"поступление {money.show_minor(item.amount)} на {where} — {whose}")
+            problems.append(f"поступление {coin.show_minor(item.amount)} на {where} — {whose}")
             continue
         seen = Seen(keys[0], item.amount, confirmed, "history", item.raw)
         results.append(await deals.take_payments(ctx.db, rows[0].id, seen=[seen]))

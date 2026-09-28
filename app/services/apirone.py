@@ -1,9 +1,10 @@
-"""Apirone (apirone.com): the garant's payment gateway, USDT on BNB Smart Chain.
+"""Apirone (apirone.com): the garant's payment gateway, USDT on BNB Smart Chain, BTC and LTC.
 
 An account holds the money. An invoice gives the buyer an address and an amount; the account's history shows
 every payment in and out; a transfer sends money to an address, with the network and Apirone fees taken out
-of the amount sent. Amounts are minor units (10**-18 USDT for ``usdt@bnb``), far beyond 64 bits: they travel
-as integers or strings of digits and are never floats here.
+of the amount sent. Amounts are minor units (10**-18 USDT for ``usdt@bnb``, 10**-8 for ``btc`` and ``ltc``),
+far beyond 64 bits for USDT: they travel as integers or strings of digits and are never floats here. Every
+call is of one currency (USDT when none is given: the calls of USDT are as they always were).
 
 Replies are read defensively: the shapes come from Apirone's open-source PHP SDK. A reply of another shape
 counts like no reply at all ("outcome unknown"); a 4xx is a refusal, nothing was done. The transfer key
@@ -15,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,13 +24,13 @@ from typing import Any, TypeVar
 
 import aiohttp
 
-from app.services.escrow.money import CURRENCY, parse_minor
+from app.services import coinaddr
+from app.services.escrow.money import COINS, CURRENCY, parse_minor
 
 log = logging.getLogger(__name__)
 
 BASE = "https://apirone.com/api/"
 T = TypeVar("T")
-_EVM_RE = re.compile(r"(?<![0-9a-fA-Fx])0x[0-9a-fA-F]{40}(?![0-9a-fA-F])")  # not a transaction id's start
 GET_TIMEOUT = 15.0
 TRANSFER_TIMEOUT = 45.0  # a transfer answered later is an unknown outcome (the bot stops within 60 s)
 
@@ -77,18 +77,10 @@ def _when(value: Any) -> datetime | None:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
-def _addresses(value: Any, found: set[str] | None = None) -> set[str]:
-    """Every EVM address anywhere in a reply (lower-case)."""
-    found = set() if found is None else found
-    if isinstance(value, str):
-        found.update(match.lower() for match in _EVM_RE.findall(value))
-    elif isinstance(value, dict):
-        for item in value.values():
-            _addresses(item, found)
-    elif isinstance(value, list):
-        for item in value:
-            _addresses(item, found)
-    return found
+def _addresses(value: Any, currency: str) -> set[str]:
+    """Every address of the currency anywhere in a reply (keys: app/services/coinaddr.py)."""
+    code = currency.lower()
+    return coinaddr.find(code, value) if code in COINS else set()
 
 
 def _txids(value: Any) -> list[str]:
@@ -156,7 +148,7 @@ class ApironeInvoice:
                 by_txid[txid] = Payment(txid, amount, _text(entry.get("status")))
         return cls(
             invoice_id=invoice_id,
-            address=_text(data.get("address")).lower(),
+            address=coinaddr.key(_text(data.get("address"))),
             amount=parse_minor(data.get("amount")),
             currency=_text(data.get("currency")),
             status=_text(data.get("status")) or "created",
@@ -212,37 +204,39 @@ class HistoryItem:
     currency: str
     amount: int | None
     txids: list[str]
-    addresses: set[str]  # every address named in the item, lower-case
+    addresses: set[str]  # every address of its currency named in the item (keys)
     confirmed: bool | None
     raw: dict[str, Any] = field(repr=False)
 
     @classmethod
-    def from_api(cls, data: dict[str, Any]) -> HistoryItem:
+    def from_api(cls, data: dict[str, Any], currency: str = CURRENCY) -> HistoryItem:
+        """``currency``: the one asked for (the item's own, when it names one, wins)."""
         item_id = _text(data["id"])
         if not item_id:
             raise ValueError("no id")
         confirmed = data.get("is_confirmed")
+        own = _text(data.get("currency"))
         return cls(
             item_id=item_id,
             date=_when(data.get("date")),
             kind=_text(data.get("type")),
-            currency=_text(data.get("currency")),
+            currency=own,
             amount=parse_minor(data.get("amount")),
             txids=_txids(data.get("txs")),
-            addresses=_addresses(data),
+            addresses=_addresses(data, own or currency),
             confirmed=confirmed if isinstance(confirmed, bool) else None,
             raw=data,
         )
 
 
-def _units_factor(data: Any) -> Decimal | None:
-    """units-factor of our currency in the service info (None if not found)."""
+def _units_factor(data: Any, currency: str = CURRENCY) -> Decimal | None:
+    """units-factor of the currency in the service info (None if not found)."""
     stack = [data]
     while stack:
         item = stack.pop()
         if isinstance(item, dict):
             names = {_text(item.get(key)).lower() for key in ("abbr", "currency", "name")}
-            if CURRENCY in names:
+            if currency in names:
                 raw = item.get("units-factor", item.get("units_factor"))
                 try:
                     return Decimal(str(raw)) if raw is not None else None
@@ -319,17 +313,37 @@ class ApironeClient:
             raise ApironeError(f"a reply that does not read (HTTP {status})", status, unknown=True) from exc
 
     # --- the service and the account
-    async def units_factor(self) -> Decimal | None:
-        """One minor unit of our currency (1e-18 for usdt@bnb); None if the service does not say."""
-        return await self._request("OPTIONS", "v2/accounts", _units_factor)
+    async def units_factor(self, currency: str = CURRENCY) -> Decimal | None:
+        """One minor unit of the currency (1e-18 for usdt@bnb, 1e-8 for btc); None if the service does not
+        say."""
+        return await self._request("OPTIONS", "v2/accounts", lambda data: _units_factor(data, currency))
 
-    async def account_info(self) -> dict[str, Any]:
+    async def account_info(self, currency: str = CURRENCY) -> dict[str, Any]:
         def parse(data: Any) -> dict[str, Any]:
             if not isinstance(data, dict):
                 raise TypeError("an object was expected")
             return data
 
-        return await self._request("GET", f"v2/accounts/{self.account}", parse, query={"currency": CURRENCY})
+        return await self._request("GET", f"v2/accounts/{self.account}", parse, query={"currency": currency})
+
+    async def rate(self, currency: str, fiat: str = "usd") -> Decimal:
+        """The price of one coin in ``fiat`` (Apirone's ticker). A reply that does not read is an unknown
+        outcome, as always: no price is ever guessed."""
+
+        def parse(data: Any) -> Decimal:
+            value = data
+            if isinstance(value, dict) and currency in value:
+                value = value[currency]
+            if isinstance(value, dict):
+                value = value.get(fiat)
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise ValueError("no price")
+            price = Decimal(str(value))
+            if not price.is_finite() or price <= 0:
+                raise ValueError("not a price")
+            return price
+
+        return await self._request("GET", "v2/ticker", parse, query={"currency": currency, "fiat": fiat})
 
     async def balance(self, currency: str | None = CURRENCY) -> dict[str, tuple[int, int]]:
         """currency → (available, total) in minor units (every currency of the account when None)."""
@@ -340,7 +354,7 @@ class ApironeClient:
                 available, total = parse_minor(item.get("available")), parse_minor(item.get("total"))
                 if available is None or total is None:
                     raise ValueError("an amount that does not read")
-                result[_text(item["currency"])] = (available, total)
+                result[_text(item["currency"]).lower()] = (available, total)
             return result
 
         return await self._request(
@@ -348,9 +362,11 @@ class ApironeClient:
         )
 
     # --- invoices
-    async def create_invoice(self, amount: int, lifetime: int, title: str) -> ApironeInvoice:
+    async def create_invoice(
+        self, amount: int, lifetime: int, title: str, currency: str = CURRENCY
+    ) -> ApironeInvoice:
         body = {
-            "currency": CURRENCY,
+            "currency": currency,
             "amount": amount,
             "lifetime": lifetime,
             "user-data": {"merchant": title},
@@ -375,9 +391,9 @@ class ApironeClient:
         )
 
     # --- money out
-    async def estimate(self, address: str, amount: int) -> ApironeTransfer:
+    async def estimate(self, address: str, amount: int, currency: str = CURRENCY) -> ApironeTransfer:
         query = {
-            "currency": CURRENCY,
+            "currency": currency,
             "destinations": f"{address}:{amount}",
             "fee": "normal",
             "subtract-fee-from-amount": "true",
@@ -386,11 +402,11 @@ class ApironeClient:
             "GET", f"v2/accounts/{self.account}/transfer", ApironeTransfer.from_api, query=query
         )
 
-    async def transfer(self, address: str, amount: int) -> ApironeTransfer:
+    async def transfer(self, address: str, amount: int, currency: str = CURRENCY) -> ApironeTransfer:
         """Send ``amount`` (minor units) to ``address``; the fees come out of it. Once only: there is no
         idempotency key, so a caller must never repeat a call whose outcome is unknown."""
         body = {
-            "currency": CURRENCY,
+            "currency": currency,
             "destinations": [{"address": address, "amount": str(amount)}],
             "fee": "normal",
             "subtract-fee-from-amount": True,
@@ -408,9 +424,15 @@ class ApironeClient:
 
     # --- history
     async def history(
-        self, *, kind: str | None = None, since: datetime | None = None, offset: int = 0, limit: int = 100
+        self,
+        *,
+        kind: str | None = None,
+        since: datetime | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        currency: str = CURRENCY,
     ) -> list[HistoryItem]:
-        """The account's movements of our currency, newest first. The filters are a hint to the server: the
+        """The account's movements of the currency, newest first. The filters are a hint to the server: the
         caller filters again."""
         filters = []
         if kind:
@@ -418,20 +440,22 @@ class ApironeClient:
         if since is not None:
             filters.append(f"date_from:{since.astimezone(UTC).isoformat(timespec='seconds')}")
         query = {
-            "currency": CURRENCY,
+            "currency": currency,
             "offset": offset,
             "limit": limit,
             "q": ",".join(filters) or None,
         }
 
         def parse(data: Any) -> list[HistoryItem]:
-            return [HistoryItem.from_api(item) for item in _items(data, "items", "history")]
+            return [HistoryItem.from_api(item, currency) for item in _items(data, "items", "history")]
 
         return await self._request("GET", f"v2/accounts/{self.account}/history", parse, query=query)
 
-    async def history_item(self, item_id: str) -> HistoryItem:
+    async def history_item(self, item_id: str, currency: str = CURRENCY) -> HistoryItem:
         return await self._request(
-            "GET", f"v2/accounts/{self.account}/history/{item_id}", HistoryItem.from_api
+            "GET",
+            f"v2/accounts/{self.account}/history/{item_id}",
+            lambda data: HistoryItem.from_api(data, currency),
         )
 
     async def close(self) -> None:
