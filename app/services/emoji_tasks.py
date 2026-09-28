@@ -1,12 +1,15 @@
 """Premium emoji the admins put in by hand while Telegram does not let the bot put them (no Fragment name).
 
 The channel's posts then go without them (sync/engine.py ``_gate``, ``Runtime.manual_emoji``). For each post
-of the main channel shown that way the admins get a task in the admin chat: what the post should have (emoji
-bought for services, names of emoji letters, glowing names, the post's own design) and, as a message of its
-own, the post's text with its premium emoji. An admin with Telegram Premium copies that message into the post
-(«Изменить», the whole text); the bot sees the edit (routers/channel.py → ``on_edit``) and marks the task
-done. A later change of the post by the bot (a new service, an option that ended) takes the emoji out again: a
-new task follows, saying what was added and what was removed.
+of the main channel shown that way which has options bought or granted through the bot (``PAID``: a premium
+emoji before a name, a glowing name) the admins get a task in the admin chat: those options and, as a message
+of its own, the post's text with all its premium emoji (the design and the imported ones too). Posts with only
+those others make no task: they stay plain once the bot changed them.
+
+An admin with Telegram Premium copies that message into the post («Изменить», the whole text); the bot sees
+the edit (routers/channel.py → ``on_edit``) and marks the task done. A later change of the post by the bot (a
+new service, an option that ended) takes the emoji out again: a new task follows, saying what was added and
+what was removed; a task no longer needed goes from the chat.
 
 Tasks come from what the channel shows — a post whose hash is the ``plain:`` one of its current rendering —
 whatever path published it; a task goes out ``DEBOUNCE`` after the post settled, so a few changes in a row
@@ -64,14 +67,10 @@ MISMATCH = (
     "Если вставляли текст из задания «✨ Премиум-эмодзи вручную» — он не совпал с ним: вставьте следующее за "
     "заданием сообщение целиком ещё раз."
 )
-# the final line of a task's card: {title} is the post's
+PAID = ("order", "admin")  # options bought or granted through the bot: only they make a task
+# the card of a task done ({title}: the post's); the others go from the chat
 DONE = "✅ Премиум-эмодзи на месте · «{title}»"
-STALE = "🔄 Устарело · «{title}»: пост снова изменился — актуальное задание ниже."
-NOT_NEEDED = "✅ Больше не нужно · «{title}»: в посте нет премиум-эмодзи."
-ALLOWED = "✅ Больше не нужно · «{title}»: бот снова ставит премиум-эмодзи сам."
-SWITCHED_OFF = "✖️ Снято · «{title}»: премиум-эмодзи вручную выключены (🩺 Диагностика)."
-KEPT = "✖️ Снято · «{title}»: правку поста оставили как есть."
-GONE = "✖️ Снято · «{title}»: поста больше нет."
+DROPPED = "✖️ Задание снято · «{title}»"  # when Telegram no longer lets the bot delete the card
 ACCEPTED = "✅ Пост «{title}» совпал с заданием «✨ Премиум-эмодзи вручную» — правка принята."
 
 
@@ -141,7 +140,7 @@ def _describe(rt: RichText, item: dict[str, Any], *, removed: bool = False) -> N
     elif kind == "glow":
         rt.text(f"светящийся ник у «{name}»" if removed else f"светящийся ник «{name}»")
     else:
-        rt.text(f"оформление поста — {item.get('count', 0)} эмодзи")
+        rt.text(f"остальные премиум-эмодзи поста (оформление, старые из канала) — {item.get('count', 0)}")
     if not removed and item.get("line"):
         rt.text(f" (строка {item['line']})")
     if not removed and item.get("until"):
@@ -223,8 +222,8 @@ def _until(value: datetime | None, tz: str) -> str | None:
 
 
 async def _items(session: AsyncSession, row: ChannelPost, desired: Fragment, tz: str) -> list[dict[str, Any]]:
-    """What premium emoji the post has: the services' options (with their line and term), then the rest
-    (the category's header, the templates) as the post's design."""
+    """What premium emoji the post has: the options bought or granted through the bot (with their line and
+    term), then the rest (the design, emoji that came with the imported channel) as one line."""
     items: list[dict[str, Any]] = []
     if row.kind == "category":
         services = await render_db.category_services(session, row.block_id)
@@ -233,7 +232,7 @@ async def _items(session: AsyncSession, row: ChannelPost, desired: Fragment, tz:
                 continue
             base = {"service_id": service.id, "service": service.name, "line": line}
             emoji = render_db.active_feature(service, "emoji")
-            if emoji is not None and emoji.params.get("emoji_id"):
+            if emoji is not None and emoji.source in PAID and emoji.params.get("emoji_id"):
                 items.append(
                     {
                         **base,
@@ -245,7 +244,7 @@ async def _items(session: AsyncSession, row: ChannelPost, desired: Fragment, tz:
                 )
             font = render_db.active_feature(service, "font")
             glyphs = [g.emoji_id for g in glyphs_from_json(font.params.get("glyphs"))] if font else []
-            if font is not None and any(glyphs):
+            if font is not None and font.source in PAID and any(glyphs):
                 items.append(
                     {
                         **base,
@@ -281,26 +280,41 @@ async def _sets(bot: Bot, desired: Fragment) -> list[str]:
     return list(dict.fromkeys(s.set_name for s in stickers if s.set_name))
 
 
-async def _finish(bot: Bot | None, task: EmojiTask, status: str, why: str, now: datetime) -> None:
-    """The task ends: its card says why, the text to copy goes (it must not be pasted any more)."""
+async def _delete(bot: Bot, chat_id: int, message_id: int) -> bool:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except TelegramAPIError:
+        return False
+    return True
+
+
+async def _edit_plain(bot: Bot, chat_id: int, message_id: int, text: str) -> None:
+    with contextlib.suppress(TelegramAPIError):
+        await bot.edit_message_text(
+            text=text,
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode=None,
+            link_preview_options=NO_PREVIEW,
+            reply_markup=None,
+        )
+
+
+async def _finish(bot: Bot | None, task: EmojiTask, status: str, now: datetime) -> None:
+    """The task ends. Done: its card says so. Otherwise (not needed any more, or a newer task replaces it) its
+    messages go from the chat. The text to copy goes either way: it must not be pasted any more."""
     task.status = status
     task.closed_at = now
     if bot is None:
         return
-    text = why.format(title=task.notes.get("title") or "пост")
+    title = task.notes.get("title") or "пост"
     for copy in task.messages:
-        with contextlib.suppress(TelegramAPIError):
-            await bot.edit_message_text(
-                text=text,
-                chat_id=copy["chat_id"],
-                message_id=copy["card_id"],
-                parse_mode=None,
-                link_preview_options=NO_PREVIEW,
-                reply_markup=None,
-            )
+        if status == "done":
+            await _edit_plain(bot, copy["chat_id"], copy["card_id"], DONE.format(title=title))
+        elif not await _delete(bot, copy["chat_id"], copy["card_id"]):
+            await _edit_plain(bot, copy["chat_id"], copy["card_id"], DROPPED.format(title=title))
         if copy.get("text_id"):
-            with contextlib.suppress(TelegramAPIError):
-                await bot.delete_message(copy["chat_id"], copy["text_id"])
+            await _delete(bot, copy["chat_id"], copy["text_id"])
 
 
 async def _send(
@@ -389,24 +403,25 @@ async def _reconcile(
         return  # being sent, gone missing, or about to be redrawn: later
     if kept_edits.is_kept(row.manual):  # the admins keep their own text there
         if task is not None:
-            await _finish(ctx.bot, task, "dropped", KEPT, now)
+            await _finish(ctx.bot, task, "dropped", now)
         return
     if not row.sent_hash.startswith(kept_edits.PLAIN):  # it shows the post with its emoji, or has none
         if task is not None:
             done = row.sent_hash == task.content_hash and row.message_id == task.message_id
-            await _finish(ctx.bot, task, "done" if done else "dropped", DONE if done else NOT_NEEDED, now)
+            await _finish(ctx.bot, task, "done" if done else "dropped", now)
         return
     block = await render_db.render_block(session, row.kind, row.block_id, link_ctx, tpl)
     if block is None:
         if task is not None:
-            await _finish(ctx.bot, task, "dropped", GONE, now)
+            await _finish(ctx.bot, task, "dropped", now)
         return
     content_hash = block.content_hash()
     if row.sent_hash != kept_edits.PLAIN + content_hash:
         return  # the data changed since: the sync engine redraws the post first
-    if not block.fragment.custom_emoji_count():
+    items = await _items(session, row, block.fragment, ctx.config.timezone)
+    if not any(item["kind"] != "design" for item in items):  # nothing bought or granted in it
         if task is not None:
-            await _finish(ctx.bot, task, "dropped", NOT_NEEDED, now)
+            await _finish(ctx.bot, task, "dropped", now)
         return
     if task is not None and task.content_hash == content_hash and task.message_id == row.message_id:
         if task.status == "pending" and task.due_at <= now:
@@ -414,7 +429,7 @@ async def _reconcile(
         return
     previous = await _previous(session, row, task)
     if task is not None:
-        await _finish(ctx.bot, task, "stale", STALE, now)
+        await _finish(ctx.bot, task, "stale", now)
         await session.flush()  # one live task per post
     session.add(
         EmojiTask(
@@ -422,7 +437,7 @@ async def _reconcile(
             message_id=row.message_id,
             content_hash=content_hash,
             desired=block.fragment.to_json(),
-            items=await _items(session, row, block.fragment, ctx.config.timezone),
+            items=items,
             status="pending",
             due_at=now + DEBOUNCE,
             notes={"previous": previous},
@@ -449,9 +464,8 @@ async def job(ctx: AppContext, now: datetime | None = None) -> None:
     async with ctx.db.session() as session:
         runtime = await get_settings(session, Runtime)
         if not active(runtime):
-            why = SWITCHED_OFF if not runtime.manual_emoji else ALLOWED
             for task in await _live(session):
-                await _finish(ctx.bot, task, "dropped", why, now)
+                await _finish(ctx.bot, task, "dropped", now)
             await session.commit()
             return
         channel = (
@@ -476,7 +490,7 @@ async def job(ctx: AppContext, now: datetime | None = None) -> None:
         ours = {row.id for row in rows}
         for post_id, task in live.items():
             if post_id not in ours:  # a post of a channel that is not the main one any more
-                await _finish(ctx.bot, task, "dropped", GONE, now)
+                await _finish(ctx.bot, task, "dropped", now)
         for row in rows:
             await _reconcile(ctx, session, channel, row, live.get(row.id), link_ctx, tpl, now)
         await session.commit()
@@ -500,7 +514,7 @@ async def on_edit(ctx: AppContext, session: AsyncSession, row: ChannelPost, edit
         row.snapshot = edited.to_json()
         row.sent_hash = task.content_hash
         row.manual = None
-        await _finish(ctx.bot, task, "done", DONE, utcnow())
+        await _finish(ctx.bot, task, "done", utcnow())
         if alerted:
             await close_alert(
                 ctx, "post_edit", row.id, ACCEPTED.format(title=task.notes.get("title") or "пост")

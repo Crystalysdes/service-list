@@ -1,7 +1,7 @@
 """Premium emoji the admins put in by hand while the bot cannot put them (no Fragment username): the
-channel's posts go without them, the admin chat gets each such post's text with them, an admin's paste is
-recognised, and a later change of the post (a bought option, one that ended) asks again, saying what
-changed."""
+channel's posts go without them; a post with options bought or granted through the bot gets a task in the
+admin chat with its text with them, the admins' paste is recognised, a later change asks again; posts with
+only the design or imported emoji make no task."""
 
 from __future__ import annotations
 
@@ -96,6 +96,31 @@ def _emoji_ids(message: dict) -> list[str]:
     return [e["custom_emoji_id"] for e in message.get("entities", []) if e["type"] == "custom_emoji"]
 
 
+async def _grant(db, tg, name: str, emoji: tuple[str, str, str] = ("9001", "💎", "Gems")) -> None:
+    """An emoji before ``name`` granted through the bot (as 🎁 in the admin panel does)."""
+    if emoji[0] not in tg.custom_emoji:
+        tg.add_custom_emoji(*emoji)
+    async with db.session() as s:
+        service = (await s.execute(select(Service).where(Service.name == name))).scalar_one()
+        s.add(
+            Feature(
+                service_id=service.id,
+                category_id=service.category_id,
+                kind="emoji",
+                status="active",
+                source="admin",
+                expires_at=utcnow() + timedelta(days=30),
+                params={"emoji_id": emoji[0], "alt": emoji[1]},
+            )
+        )
+        await s.commit()
+
+
+async def _task_out(ctx) -> None:
+    await emoji_tasks.job(ctx)
+    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+
+
 async def _buy_emoji(h, tg, db, ctx, ids, pay) -> None:
     tg.add_custom_emoji("9001", "💎", "Gems")
     async with db.session() as s:
@@ -112,23 +137,31 @@ async def _buy_emoji(h, tg, db, ctx, ids, pay) -> None:
     await job_poll_invoices(ctx)
 
 
-async def test_posts_go_without_premium_emoji_and_the_admins_paste_them_back(h, tg, db, ctx):
-    ids, _pay, engine = await _setup(tg, db, ctx)
+async def test_imported_emoji_alone_make_no_task(h, tg, db, ctx):
+    ids, _pay, _engine = await _setup(tg, db, ctx)
     travel = tg.messages[MAIN][ids["travel"]]
     assert "TRAVEL CAT" in travel["text"] and not _emoji_ids(travel)  # published at once, without them
-    row = await _row(db, ids["travel"])
-    assert row.sent_hash.startswith("plain:")
+    assert (await _row(db, ids["travel"])).sent_hash.startswith("plain:")
+    await _task_out(ctx)  # the design and the emoji of the old channel: nobody bought them here
+    assert not _cards(tg) and not await _tasks(db)
 
+
+async def test_a_granted_emoji_comes_as_a_task_and_the_paste_is_recognised(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
     await emoji_tasks.job(ctx)
     assert not _cards(tg)  # a task waits until the post settles
     await emoji_tasks.job(ctx, now=utcnow() + LATER)
     [card] = _cards(tg, ids["travel_title"])
-    assert "\n•  🧪 перед «TRAVEL CAT» (строка 1)\n" in card["text"]  # the first task: nothing marked new
-    assert "🆕" not in card["text"] and "5001" in _emoji_ids(card)
-    assert "Наборы: Potions" in card["text"] and "Скопируйте следующее сообщение целиком" in card["text"]
+    assert "\n•  💎 перед «Tripmafia» (строка 6) — до " in card["text"]  # the first task: nothing new
+    assert "\n•  остальные премиум-эмодзи поста (оформление, старые из канала) — 3" in card["text"]
+    assert "🆕" not in card["text"] and "TRAVEL CAT" not in card["text"] and "9001" in _emoji_ids(card)
+    assert "Наборы: Gems · Potions" in card["text"] or "Наборы: Potions · Gems" in card["text"]
+    assert "Скопируйте следующее сообщение целиком" in card["text"]
     assert h.button(card, "Открыть пост")["url"] == f"https://t.me/servicelist/{ids['travel']}"
     text = _reply(tg, card)
-    assert "TRAVEL CAT" in text["text"] and set(_emoji_ids(text)) == {"5001"}
+    assert "TRAVEL CAT" in text["text"] and set(_emoji_ids(text)) == {"5001", "9001"}
     await emoji_tasks.job(ctx, now=utcnow() + LATER)  # nothing new for the same post
     assert len(_cards(tg, ids["travel_title"])) == 1
 
@@ -147,8 +180,9 @@ async def test_posts_go_without_premium_emoji_and_the_admins_paste_them_back(h, 
 
 async def test_a_bought_emoji_and_its_end_come_as_new_tasks(h, tg, db, ctx):
     ids, pay, engine = await _setup(tg, db, ctx)
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    await _grant(db, tg, "Hannibal Lecter", ("5002", "🔥", "Potions"))
+    await engine.run_once(ids["channel_id"])
+    await _task_out(ctx)
     [first] = _cards(tg, ids["travel_title"])
     await _paste(h, tg, ids["travel"], _reply(tg, first))
 
@@ -158,8 +192,7 @@ async def test_a_bought_emoji_and_its_end_come_as_new_tasks(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     post = tg.messages[MAIN][ids["travel"]]
     assert "💎Tripmafia" in post["text"] and not _emoji_ids(post)  # the pasted emoji went with the change
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    await _task_out(ctx)
     card = _cards(tg, ids["travel_title"])[-1]
     assert card["message_id"] != first["message_id"]
     async with db.session() as s:
@@ -169,9 +202,8 @@ async def test_a_bought_emoji_and_its_end_come_as_new_tasks(h, tg, db, ctx):
     until = emoji_tasks._until(feature.expires_at, ctx.config.timezone)
     line = next(x for x in card["text"].split("\n") if "Tripmafia" in x)
     assert line == f"🆕 💎 перед «Tripmafia» (строка 6) — до {until}"
-    assert "•  🧪 перед «TRAVEL CAT» (строка 1)" in card["text"]  # was there before: not new
+    assert "\n•  🔥 перед «Hannibal Lecter» (строка 4)" in card["text"]  # was there before: not new
     assert "9001" in _emoji_ids(card)  # the bought emoji itself, to see
-    assert h.button(card, "Открыть пост")
     assert any(e.get("url") == "https://t.me/addemoji/Gems" for e in card.get("entities", []))
     assert "9001" in _emoji_ids(_reply(tg, card))
 
@@ -185,18 +217,40 @@ async def test_a_bought_emoji_and_its_end_come_as_new_tasks(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     assert "💎Tripmafia" not in tg.messages[MAIN][ids["travel"]]["text"]
     reply = _reply(tg, card)
-    await emoji_tasks.job(ctx)  # the open task is out of date at once
-    old = tg.messages[GROUP][card["message_id"]]
-    assert old["text"].startswith("🔄 Устарело") and reply["message_id"] not in tg.messages[GROUP]
+    await emoji_tasks.job(ctx)  # the open task is out of date at once: it goes from the chat
+    assert card["message_id"] not in tg.messages[GROUP] and reply["message_id"] not in tg.messages[GROUP]
     await emoji_tasks.job(ctx, now=utcnow() + LATER)
     card = _cards(tg, ids["travel_title"])[-1]
-    assert "⌛ Снято: 💎 у «Tripmafia»" in card["text"] and "9001" not in _emoji_ids(_reply(tg, card))
+    assert "⌛ Снято: 💎 у «Tripmafia»" in card["text"] and "🔥 перед «Hannibal Lecter»" in card["text"]
+    assert "9001" not in _emoji_ids(_reply(tg, card))
+
+
+async def test_a_task_no_longer_needed_goes_from_the_chat(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    await _task_out(ctx)
+    [card] = _cards(tg, ids["travel_title"])
+    text = _reply(tg, card)
+    async with db.session() as s:  # the admins take the option back
+        feature = (
+            await s.execute(select(Feature).where(Feature.service_id == ids["trip"], Feature.kind == "emoji"))
+        ).scalar_one()
+        feature.status = "revoked"
+        await s.commit()
+    await engine.run_once(ids["channel_id"])
+    await emoji_tasks.job(ctx)
+    assert card["message_id"] not in tg.messages[GROUP] and text["message_id"] not in tg.messages[GROUP]
+    assert [t.status for t in await _tasks(db)] == ["dropped"]
+    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    assert not _cards(tg)
 
 
 async def test_a_short_paste_and_another_text_are_told_apart(h, tg, db, ctx):
-    ids, _pay, _engine = await _setup(tg, db, ctx)
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    await _task_out(ctx)
     [card] = _cards(tg, ids["travel_title"])
     text = _reply(tg, card)
     need = len(_emoji_ids(text))
@@ -254,8 +308,7 @@ async def test_names_of_emoji_letters_and_glowing_names_go_as_names_meanwhile(h,
     post = tg.messages[MAIN][ids["travel"]]
     trip_line = next(x for x in post["text"].split("\n") if "Tripmafia" in x)
     assert "✨" not in trip_line and "[тык.]" not in trip_line
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    await _task_out(ctx)
     card = _cards(tg, ids["travel_title"])[-1]
     assert "светящийся ник «Tripmafia» (строка " in card["text"]
     assert any(
@@ -266,20 +319,23 @@ async def test_names_of_emoji_letters_and_glowing_names_go_as_names_meanwhile(h,
 
 
 async def test_without_premium_for_the_bots_owner_the_card_says_so(h, tg, db, ctx):
-    ids, _pay, _engine = await _setup(tg, db, ctx)
-    tg.custom_emoji_in_groups = False
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
-    card = _cards(tg, ids["travel_title"])[0]
-    assert "⚠️ Бот не смог показать здесь премиум-эмодзи" in card["text"] and "Наборы: Potions" in card["text"]
-
-
-async def test_tasks_end_when_the_bot_can_put_the_emoji_or_the_mode_is_off(h, tg, db, ctx):
     ids, _pay, engine = await _setup(tg, db, ctx)
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    tg.custom_emoji_in_groups = False
+    await _task_out(ctx)
+    card = _cards(tg, ids["travel_title"])[0]
+    assert "⚠️ Бот не смог показать здесь премиум-эмодзи" in card["text"] and "Наборы: " in card["text"]
+
+
+async def test_tasks_end_when_the_bot_can_put_the_emoji_itself(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _grant(db, tg, "Tripmafia")
+    await _grant(db, tg, "Sirop", ("5001", "🧪", "Potions"))
+    await engine.run_once(ids["channel_id"])
+    await _task_out(ctx)
     cards = _cards(tg)
-    assert len(cards) == 3  # the three categories (the navigation has no premium emoji)
+    assert len(cards) == 2  # the two posts with a granted emoji; the VPN one has none
 
     # the Fragment username arrives: the self-test passes, the bot redraws the posts with the emoji itself
     tg.custom_emoji_in_channels = True
@@ -289,15 +345,15 @@ async def test_tasks_end_when_the_bot_can_put_the_emoji_or_the_mode_is_off(h, tg
     await engine.run_once(ids["channel_id"])
     assert _emoji_ids(tg.messages[MAIN][ids["travel"]])
     await emoji_tasks.job(ctx)
-    for card in cards:
-        assert "бот снова ставит премиум-эмодзи сам" in tg.messages[GROUP][card["message_id"]]["text"]
+    assert all(card["message_id"] not in tg.messages[GROUP] for card in cards)
     assert {t.status for t in await _tasks(db)} == {"dropped"}
 
 
 async def test_the_owner_switches_it_off_in_diagnostics(h, tg, db, ctx):
-    ids, _pay, _engine = await _setup(tg, db, ctx)
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    await _task_out(ctx)
     card = _cards(tg, ids["travel_title"])[0]
     await h.say(OWNER_ID, "/admin")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Диагностика")
@@ -308,25 +364,27 @@ async def test_the_owner_switches_it_off_in_diagnostics(h, tg, db, ctx):
     async with db.session() as s:
         assert not (await get_settings(s, Runtime)).manual_emoji
     await emoji_tasks.job(ctx)
-    assert "выключены (🩺 Диагностика)" in tg.messages[GROUP][card["message_id"]]["text"]
+    assert card["message_id"] not in tg.messages[GROUP]
 
 
 async def test_tasks_go_to_their_own_topic(h, tg, db, ctx):
-    ids, _pay, _engine = await _setup(tg, db, ctx)
+    ids, _pay, engine = await _setup(tg, db, ctx)
     tg.add_user(OWNER_ID, "Owner", "owner")
     await h.group_say(GROUP, OWNER_ID, "/bind emoji", thread_id=77)
     assert "✅ Привязано: премиум-эмодзи вручную (тема #77)" in h.last(GROUP)["text"]
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    await _task_out(ctx)
     card = _cards(tg, ids["travel_title"])[0]
     assert card.get("message_thread_id") == 77
 
 
 async def test_without_a_group_the_admins_get_them_in_private(h, tg, db, ctx):
-    await _setup(tg, db, ctx, group=False)
-    await emoji_tasks.job(ctx)
-    await emoji_tasks.job(ctx, now=utcnow() + LATER)
+    ids, _pay, engine = await _setup(tg, db, ctx, group=False)
+    await _grant(db, tg, "Tripmafia")
+    await engine.run_once(ids["channel_id"])
+    await _task_out(ctx)
     cards = [m for m in tg.bot_messages(OWNER_ID) if (m.get("text") or "").startswith("✨ Премиум-эмодзи")]
-    assert len(cards) == 3
+    assert len(cards) == 1
     text = next(m for m in tg.bot_messages(OWNER_ID) if m.get("_reply_to") == cards[0]["message_id"])
     assert _emoji_ids(text)

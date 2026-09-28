@@ -80,7 +80,7 @@ def test_the_card_marks_what_is_new_and_what_went():
     assert first.text.startswith("✨ Премиум-эмодзи вручную · «Travel»")
     assert "\n•  💎 перед «Coco» (строка 1) — до 12.11" in first.text and "🆕" not in first.text
     assert "\n•  светящийся ник «Trip» (строка 2)" in first.text
-    assert "\n•  оформление поста — 3 эмодзи" in first.text
+    assert "\n•  остальные премиум-эмодзи поста (оформление, старые из канала) — 3" in first.text
     assert [e.url for e in first.entities if e.type == "text_link"] == [
         "https://t.me/addemoji/Gems",
         "https://t.me/addemoji/sl2g1_by_bot",
