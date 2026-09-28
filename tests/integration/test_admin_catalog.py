@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.bot.routers.admin import diagnostics as diagnostics_screen
 from app.db.base import utcnow
-from app.db.models import Category, ChannelPost, Service
+from app.db.models import Category, ChannelPost, Notification, Service
 from app.domain.richtext import RichText
 from app.services import catalog, render_db
+from app.services.notify import claim_notification
 from app.services.settings import Runtime, get_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.helpers import MAIN, engine_for, imported_channel
@@ -133,6 +134,77 @@ async def test_manual_post_after_nav_and_manual_edit(h, tg, db, ctx):
         assert row.sent_hash is None
     await engine.run_once(ids["channel_id"])
     assert "Tripmafia" in tg.messages[MAIN][ids["travel"]]["text"]
+
+
+async def _told_minutes_ago(db, minutes: int) -> None:
+    """The alerts about posts after the navigation went out this many minutes ago."""
+    async with db.session() as s:
+        await s.execute(
+            update(Notification)
+            .where(Notification.dedup_key.startswith("after_nav:"))
+            .values(created_at=utcnow() - timedelta(minutes=minutes))
+        )
+        await s.commit()
+
+
+async def test_every_new_post_after_the_navigation_is_told_about(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    first = tg.post(MAIN, "реклама")
+    await h.feed({"channel_post": tg._export(first)})
+    alert = h.last(OWNER_ID)
+    assert f"после навигации: https://t.me/servicelist/{first['message_id']}" in alert["text"]
+    # an album and another post right after it: the same series, no second alert
+    await h.feed(
+        {"channel_post": tg._export(tg.post(MAIN, photo=True, caption="Альбом", media_group_id="a1"))}
+    )
+    await h.feed({"channel_post": tg._export(tg.post(MAIN, photo=True, media_group_id="a1"))})
+    await h.feed({"channel_post": tg._export(tg.post(MAIN, "и ещё"))})
+    assert h.last(OWNER_ID)["message_id"] == alert["message_id"]
+
+    # later another ad, the navigation still where it was: a new alert, the earlier one without its button
+    await _told_minutes_ago(db, 3)
+    second = tg.post(MAIN, "новая реклама")
+    await h.feed({"channel_post": tg._export(second)})
+    fresh = h.last(OWNER_ID)
+    assert fresh["message_id"] != alert["message_id"]
+    assert f"после навигации: https://t.me/servicelist/{second['message_id']}" in fresh["text"]
+    earlier = tg.messages[OWNER_ID][alert["message_id"]]
+    assert "актуальное уведомление ниже" in earlier["text"] and "reply_markup" not in earlier
+    await h.press(OWNER_ID, fresh, "Перенести навигацию вниз")
+    assert "⬇️ Навигация переносится вниз — @owner" in tg.messages[OWNER_ID][fresh["message_id"]]["text"]
+    await engine.run_once(ids["channel_id"])
+    last = max(tg.messages[MAIN])
+    assert last > second["message_id"] and tg.messages[MAIN][last]["text"].startswith("Навигационная панель")
+
+    # a post after the navigation in its new place is told about at once
+    third = tg.post(MAIN, "реклама под новой навигацией")
+    await h.feed({"channel_post": tg._export(third)})
+    assert f"/{third['message_id']}" in h.last(OWNER_ID)["text"]
+
+
+async def test_posts_coming_at_once_raise_one_alert(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    await engine_for(ctx).run_once(ids["channel_id"])
+    posts = [tg.post(MAIN, f"реклама {n}") for n in range(3)]
+    await asyncio.gather(*(h.feed({"channel_post": tg._export(post)}) for post in posts))
+    alerts = [m for m in tg.bot_messages(OWNER_ID) if "после навигации" in (m.get("text") or "")]
+    assert len(alerts) == 1
+
+
+async def test_an_alert_from_before_the_update_does_not_hold_back_the_next(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    await engine_for(ctx).run_once(ids["channel_id"])
+    async with db.session() as s:  # an ad told about when there was one alert per place of the navigation
+        assert await claim_notification(s, f"after_nav:{ids['channel_id']}:{ids['nav']}")
+        await s.commit()
+    await h.feed({"channel_post": tg._export(tg.post(MAIN, "реклама"))})
+    assert not any("после навигации" in (m.get("text") or "") for m in tg.bot_messages(OWNER_ID))
+    await _told_minutes_ago(db, 60)
+    ad = tg.post(MAIN, "реклама через час")
+    await h.feed({"channel_post": tg._export(ad)})
+    assert f"после навигации: https://t.me/servicelist/{ad['message_id']}" in h.last(OWNER_ID)["text"]
 
 
 def _links(message: dict) -> list[str]:

@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.enums import ContentType
 from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import RoleFilter
 from app.bot.i18n import h
 from app.context import AppContext
-from app.db.models import Channel, ChannelPost
+from app.db.base import utcnow
+from app.db.models import Channel, ChannelPost, Notification
 from app.domain.render import compare
 from app.domain.richtext import Fragment
 from app.domain.symbols import channel_post_base
@@ -34,6 +36,11 @@ router = Router(name="channel_events")
 # Telegram sends the bot its own channel posts and edits too. By this many seconds later the engine has saved
 # them (the post's id, the edit's snapshot), so they are not taken for somebody else's.
 OWN_POST_GRACE = 3.0
+# every post of the admins after the navigation is told about; posts this close together (an album, a series)
+# get one alert
+AFTER_NAV_QUIET = timedelta(minutes=2)
+AFTER_NAV_LOCK = 0x4E415649  # "NAVI": a channel's posts after the navigation are looked at one at a time
+AFTER_NAV_AGAIN = "🔁 После навигации появился ещё пост — актуальное уведомление ниже."
 SERVICE_TYPES = {
     ContentType.PINNED_MESSAGE,
     ContentType.NEW_CHAT_TITLE,
@@ -62,8 +69,11 @@ def _title(channel: Channel) -> str:
     return h(channel.title or str(channel.chat_id))
 
 
-def after_nav_text(channel: Channel) -> str:
-    return f"📝 В канале «{_title(channel)}» появился пост после навигации. Навигация больше не последняя."
+def after_nav_text(channel: Channel, url: str | None = None) -> str:
+    """The alert about a post after the navigation (``url``: that post)."""
+    text = f"📝 В канале «{_title(channel)}» появился пост после навигации"
+    text += f": {url}\n" if url else ". "
+    return text + "Навигация больше не последняя."
 
 
 def edit_alert_text(channel: Channel, row: ChannelPost) -> str:
@@ -127,14 +137,27 @@ async def on_channel_post(message: Message, session: AsyncSession, **data: Any) 
         return
     if await _owned(session, channel.id, message.message_id):  # the bot's own post (a new block)
         return
-    if not await claim_notification(session, f"after_nav:{channel.id}:{nav.message_id}"):
+    # held till this update is committed: the parts of an album coming at once see each other's alert
+    await session.execute(select(func.pg_advisory_xact_lock(AFTER_NAV_LOCK, channel.id)))
+    key = f"after_nav:{channel.id}:{nav.message_id}"  # alone: an alert from before every post was told
+    told = await session.scalar(
+        select(func.max(Notification.created_at)).where(
+            or_(Notification.dedup_key == key, Notification.dedup_key.startswith(f"{key}:", autoescape=True))
+        )
+    )
+    if told is not None and utcnow() - told < AFTER_NAV_QUIET:  # the alert of this series is out already
         return
+    if not await claim_notification(session, f"{key}:{message.message_id}"):
+        return
+    ctx: AppContext = data["ctx"]
+    await close_alert(ctx, "after_nav", nav.id, f"{after_nav_text(channel)}\n\n{AFTER_NAV_AGAIN}")
     builder = InlineKeyboardBuilder()
     builder.button(
         text="⬇️ Перенести навигацию вниз", callback_data=f"a:navdown:{channel.id}:{nav.message_id}"
     )
+    url = channel_post_base(channel.chat_id, channel.username) + str(message.message_id)
     sent = await notify_staff(
-        data["ctx"], after_nav_text(channel), reply_markup=builder.as_markup(), session=session
+        ctx, after_nav_text(channel, url), reply_markup=builder.as_markup(), session=session
     )
     remember_alert(session, "after_nav", nav.id, sent)
 
