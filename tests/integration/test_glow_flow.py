@@ -70,11 +70,16 @@ async def test_a_bought_glowing_name_is_drawn_into_a_pack_and_shown_in_the_chann
     await glownick.job(ctx)
     feature = await _feature(db, ids["trip"])
     pack = feature.params["glow_set"]
-    assert pack.endswith("_by_servicelist_bot") and feature.params["glow_drawn"] == ["Tripmafia", "neon"]
+    assert pack.endswith("_by_servicelist_bot") and feature.params["glow_drawn"] == [
+        "Tripmafia",
+        "neon",
+        glow.STYLE,
+    ]
     emoji = [glyph[0] for glyph in feature.params["glyphs"]]
     assert emoji == tg.sticker_sets[pack] and len(emoji) == 4
     create = tg.called("createNewStickerSet")[-1]
     assert create["user_id"] == OWNER_ID and create["sticker_type"] == "custom_emoji"
+    assert create["title"] == "Tripmafia · @servicelist_bot"  # the bot's link in the pack's title
     assert [tg.sticker_uploads[e] for e in emoji] == [f"Tripmafia|neon|{i}".encode() for i in range(4)]
     assert "Светящийся ник для «Tripmafia» готов" in h.last(USER)["text"]
 
@@ -107,6 +112,24 @@ async def test_with_the_premium_account_the_owner_hears_it_is_in_the_channel(h, 
     assert "Светящийся ник для «Tripmafia» готов — он уже в канале" in h.last(USER)["text"]
 
 
+async def test_a_name_in_the_old_lettering_is_drawn_again_without_telling_its_owner(h, tg, db, ctx):
+    ids, _engine = await _bought(h, tg, db, ctx)
+    await glownick.job(ctx)
+    old = (await _feature(db, ids["trip"])).params["glow_set"]
+    told = len(tg.bot_messages(USER))
+    async with db.session() as s:  # drawn before the letters became lighter and larger
+        feature = await s.get(Feature, (await _feature(db, ids["trip"])).id)
+        feature.params = {**feature.params, "glow_drawn": ["Tripmafia", "neon"]}
+        await s.commit()
+    await glownick.job(ctx)
+    feature = await _feature(db, ids["trip"])
+    assert feature.params["glow_drawn"] == ["Tripmafia", "neon", glow.STYLE]
+    assert feature.params["glow_set"] != old and len(tg.called("createNewStickerSet")) == 2
+    assert len(tg.bot_messages(USER)) == told  # the owner is not told «ready» again
+    await glownick.job(ctx)  # drawn once
+    assert len(tg.called("createNewStickerSet")) == 2
+
+
 async def test_a_new_name_is_drawn_again_and_the_old_pack_goes_later(h, tg, db, ctx):
     ids, engine = await _bought(h, tg, db, ctx)
     await glownick.job(ctx)
@@ -117,7 +140,7 @@ async def test_a_new_name_is_drawn_again_and_the_old_pack_goes_later(h, tg, db, 
     await glownick.job(ctx)
     feature = await _feature(db, ids["trip"])
     new = feature.params["glow_set"]
-    assert new != old and feature.params["glow_drawn"] == ["Trip Mafia Pro", "neon"]
+    assert new != old and feature.params["glow_drawn"] == ["Trip Mafia Pro", "neon", glow.STYLE]
     assert old in tg.sticker_sets  # the posts still show it until they are updated
     await engine.run_once(ids["channel_id"])
     assert set(tg.sticker_sets[new]) <= set(_post_emoji(tg, ids["travel"]))
@@ -188,7 +211,7 @@ async def test_the_colours_of_a_glowing_name_change_for_free(h, tg, db, ctx):
         feature.params["glow"] == "rainbow" and len(feature.params["glyphs"]) == 4
     )  # the gold one meanwhile
     await glownick.job(ctx)
-    assert (await _feature(db, ids["trip"])).params["glow_drawn"] == ["Tripmafia", "rainbow"]
+    assert (await _feature(db, ids["trip"])).params["glow_drawn"] == ["Tripmafia", "rainbow", glow.STYLE]
 
 
 async def test_the_admins_grant_a_glowing_name_and_no_emoji_letters(h, tg, db, ctx):
@@ -218,7 +241,10 @@ async def test_the_admins_grant_a_glowing_name_and_no_emoji_letters(h, tg, db, c
 
     await glownick.job(ctx)  # drawn like a bought one, then shown in the post
     feature = await _feature(db, ids["trip"])
-    assert feature.params["glow_drawn"] == ["Tripmafia", "rainbow"] and len(feature.params["glyphs"]) == 4
+    assert (
+        feature.params["glow_drawn"] == ["Tripmafia", "rainbow", glow.STYLE]
+        and len(feature.params["glyphs"]) == 4
+    )
     await engine.run_once(ids["channel_id"])
     assert {g[0] for g in feature.params["glyphs"]} <= set(_post_emoji(tg, ids["travel"]))
 

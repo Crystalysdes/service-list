@@ -26,7 +26,7 @@ from app.services.channels import remember_chat
 from app.services.notify import claim_notification, close_alert, notify_staff, remember_alert
 from app.services.settings import Runtime, get_settings
 from app.services.sync import manual as kept_edits
-from app.services.sync.engine import OWNER_RANK, request_nav_move
+from app.services.sync.engine import OWNER_RANK, is_own_edit, request_nav_move
 from app.services.sync.foreign import OWN_POSTS, remember_album, remember_pin
 
 router = Router(name="channel_events")
@@ -127,6 +127,8 @@ async def on_channel_post(message: Message, session: AsyncSession, **data: Any) 
 @router.edited_channel_post()
 async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) -> None:
     await asyncio.sleep(OWN_POST_GRACE)  # the bot's own edit matches the saved snapshot by then
+    if is_own_edit(data["ctx"], message.chat.id, message.message_id, message.edit_date):
+        return  # made by the bot or the Premium account
     channel = await _channel(session, message.chat.id)
     if channel is None:
         return

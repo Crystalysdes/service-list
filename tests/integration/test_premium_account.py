@@ -331,3 +331,25 @@ async def test_emoji_taken_out_of_a_link_after_all_bring_the_marker_back(h, tg, 
     await engine.run_once(ids["channel_id"])  # the account writes the name with «[тык.]» again
     line, fragment = _trip_line(tg, ids["travel"])
     assert "[тык.]" in line and {"7701", "7702"} <= {e.custom_emoji_id for e in fragment.entities}
+
+
+async def test_two_quick_edits_of_a_post_by_the_account_raise_no_alert(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _glow(db, tg, ids)
+    client = connect(ctx, tg, keeps_links=False)
+    await pa.check(ctx)
+    await engine.run_once(ids["channel_id"])
+    first = dict(tg.messages[MAIN][ids["travel"]])  # the account's edit, with «[тык.]»
+    client.keeps_links = True
+    await pa.check(ctx, force=True)  # the links are kept now: the post is written again at once
+    await engine.run_once(ids["channel_id"])
+    second = tg.messages[MAIN][ids["travel"]]
+    assert first["edit_date"] != second["edit_date"] and "[тык.]" not in second["text"]
+    # Telegram's word of both edits reaches the bot after the second: the first no longer matches the post
+    await h.feed({"edited_channel_post": tg._export(first)})
+    await h.feed({"edited_channel_post": tg._export(_bot_view(second))})
+    assert not _staff(tg, "отредактирован вручную")
+    # a person's edit is still told
+    edited = dict(second, text=second["text"].replace("TRAVEL CAT", "TRAVEL DOG"), edit_date=tg.tick())
+    await h.feed({"edited_channel_post": tg._export(edited)})
+    assert _staff(tg, "отредактирован вручную")

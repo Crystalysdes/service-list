@@ -12,7 +12,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from aiogram.exceptions import (
@@ -1383,6 +1383,8 @@ class SyncEngine:
                         channel_id,
                     )
                 message = edited if isinstance(edited, Message) else None
+                if message is not None:
+                    remember_own_edit(self.ctx, chat_id, message_id, message.edit_date)
                 break
             except TelegramRetryAfter as exc:
                 await asyncio.sleep(exc.retry_after + 0.5)
@@ -1591,6 +1593,7 @@ class SyncEngine:
             else:  # the account itself: its screen and the staff say what (premium_account.announce)
                 log.warning("the Premium account did not edit %s: %s", key, exc.kind)
             return "fallback"
+        remember_own_edit(self.ctx, chat_id, message_id, edited.edit_date)
         wanted = fragment.custom_emoji_count()
         if edited.custom_emoji is not None and edited.custom_emoji < wanted:
             if fragment.as_bot_sees() != fragment:  # Telegram took them out of the links after all
@@ -1614,9 +1617,11 @@ class SyncEngine:
             assert bot is not None
             await limiter.acquire()
             with contextlib.suppress(TelegramAPIError):  # "not modified": they are there
-                await bot.edit_message_reply_markup(
+                restored = await bot.edit_message_reply_markup(
                     chat_id=chat_id, message_id=message_id, reply_markup=markup
                 )
+                if isinstance(restored, Message):
+                    remember_own_edit(self.ctx, chat_id, message_id, restored.edit_date)
         return "ok"
 
     async def _call(self, coro: Any, channel_id: int) -> Any:
@@ -1676,6 +1681,35 @@ class SyncEngine:
             await session.commit()
         if first:
             await notify_staff(self.ctx, text)
+
+
+OWN_EDITS = "channel_own_edits"  # ctx.services: (chat, message, edit date) of the edits the engine made
+OWN_EDITS_KEPT = 1000
+
+
+def _edit_stamp(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    return int(value)
+
+
+def remember_own_edit(ctx: AppContext, chat_id: int, message_id: int, edit_date: Any) -> None:
+    """Telegram tells the bot of its own edits and of the Premium account's too: they are known by their
+    edit date, whatever the post looks like to the bot by then (a second quick edit, emoji inside links)."""
+    stamp = _edit_stamp(edit_date)
+    if stamp is None:
+        return
+    edits: dict[tuple[int, int, int], None] = ctx.services.setdefault(OWN_EDITS, {})
+    edits[(chat_id, message_id, stamp)] = None
+    while len(edits) > OWN_EDITS_KEPT:
+        edits.pop(next(iter(edits)))
+
+
+def is_own_edit(ctx: AppContext, chat_id: int, message_id: int, edit_date: Any) -> bool:
+    stamp = _edit_stamp(edit_date)
+    return stamp is not None and (chat_id, message_id, stamp) in ctx.services.get(OWN_EDITS, {})
 
 
 def nav_move_key(channel_id: int, message_id: int) -> str:

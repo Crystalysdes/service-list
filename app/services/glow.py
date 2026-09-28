@@ -29,12 +29,14 @@ FPS = 30
 SECONDS = 2.0
 MAX_BYTES = 64 * 1024  # Telegram's limit for one video emoji
 MIN_SEGMENTS, MAX_SEGMENTS = 2, 8
-TEXT_SIZE = 64  # letters are drawn this high when the name fits; a longer name gets smaller letters
+TEXT_SIZE = 72  # letters are drawn this high when the name fits; a longer name gets smaller letters
+STROKE = 1  # the regular face with a thin outline: a little lighter than bold, still clear at text size
+STYLE = 2  # the lettering: a name drawn in an older one is drawn again (glownick.py)
 CRF_STEPS = (24, 30, 36, 42, 50)  # better quality first; a larger number shrinks the file
 ALT = "✨"  # the plain emoji a custom emoji stands for
 FONT_PATHS = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
 )
 
 # colour stops of the gradient sliding across the letters
@@ -116,7 +118,7 @@ def layout(name: str) -> Layout:
 
 
 def _text_width(font: Any, text: str) -> int:
-    box = font.getbbox(text)
+    box = font.getbbox(text, stroke_width=STROKE)
     return int(box[2] - box[0])
 
 
@@ -128,13 +130,15 @@ def _mask(name: str, spec: Layout) -> Any:
     width = spec.segments * TILE
     while _text_width(font, name) > width - 2 * MARGIN and font.size > 12:  # still too long: smaller
         font = ImageFont.truetype(font_path() or "", font.size - 2)
-    box = font.getbbox(name)
+    box = font.getbbox(name, stroke_width=STROKE)
     mask = Image.new("L", (width, TILE), 0)
     ImageDraw.Draw(mask).text(
         ((width - (box[2] - box[0])) / 2 - box[0], (TILE - (box[3] - box[1])) / 2 - box[1]),
         name,
         font=font,
         fill=255,
+        stroke_width=STROKE,
+        stroke_fill=255,
     )
     return mask
 
@@ -250,6 +254,12 @@ def preview_png(name: str, palette: str = DEFAULT_PALETTE) -> bytes:
     buffer = io.BytesIO()
     _preview_frame(strip[len(strip) // 3], spec).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def pack_title(name: str, bot_username: str | None) -> str:
+    """The pack's title: the service's name and the bot's @username (Telegram shows it as a link there)."""
+    tail = f" · @{bot_username}" if bot_username else " · Service List"
+    return name[: 64 - len(tail)].rstrip() + tail
 
 
 def pack_name(service_id: int, version: str, bot_username: str) -> str:

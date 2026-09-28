@@ -7,7 +7,8 @@ pack no active option uses any more is deleted a little later, when the posts sh
 first pack is ready the name shows as before.
 
 Feature params: ``glow`` palette, ``glyphs``, ``plain``, ``glow_set`` (the pack shown), ``glow_drawn``
-([text, palette] of that pack), ``glow_fails`` / ``glow_next`` / ``glow_error`` (retries).
+([text, palette, lettering style] of that pack: a new style of the letters draws every name again, without
+telling its owner), ``glow_fails`` / ``glow_next`` / ``glow_error`` (retries).
 """
 
 from __future__ import annotations
@@ -86,11 +87,15 @@ async def draw(ctx: AppContext, feature_id: int) -> bool:
             return False
         palette = str(feature.params["glow"])
         text = glow.drawable(service.name)
-        if feature.params.get("glow_drawn") == [text, palette]:
+        drawn = feature.params.get("glow_drawn")
+        if drawn == [text, palette, glow.STYLE]:
             return True
+        restyle = isinstance(drawn, list) and drawn[:2] == [text, palette]  # only the letters look new
         service_id, owner_id, name = service.id, service.owner_id, service.name
     if not text:  # nothing the font can draw (only emoji, say): the name shows as plain text
-        await _save(ctx, feature_id, {"glyphs": [], "glow_set": None, "glow_drawn": [text, palette]})
+        await _save(
+            ctx, feature_id, {"glyphs": [], "glow_set": None, "glow_drawn": [text, palette, glow.STYLE]}
+        )
         return True
     if not ctx.config.owner_ids:
         await _failed(ctx, feature_id, "OWNER_IDS не задан: паку эмодзи нужен владелец", now)
@@ -99,7 +104,7 @@ async def draw(ctx: AppContext, feature_id: int) -> bool:
     await _register(ctx, set_name, now)  # before Telegram has it: a crash in between still gets it cleaned
     try:
         glyphs = await glow.publish(
-            ctx.bot, ctx.config.owner_ids[0], set_name, f"{name} · Service List", text, palette
+            ctx.bot, ctx.config.owner_ids[0], set_name, glow.pack_title(name, ctx.bot_username), text, palette
         )
     except TelegramRetryAfter as exc:
         await _failed(ctx, feature_id, "Telegram просит подождать", now, retry_after=exc.retry_after)
@@ -110,7 +115,7 @@ async def draw(ctx: AppContext, feature_id: int) -> bool:
     changed = await _save(
         ctx,
         feature_id,
-        {"glyphs": glyphs_to_json(glyphs), "glow_set": set_name, "glow_drawn": [text, palette]},
+        {"glyphs": glyphs_to_json(glyphs), "glow_set": set_name, "glow_drawn": [text, palette, glow.STYLE]},
         expect=[text, palette],
     )
     if not changed:  # renamed or recoloured while drawing: the next round draws it again
@@ -118,7 +123,7 @@ async def draw(ctx: AppContext, feature_id: int) -> bool:
     from app.services.catalog import request_sync
 
     request_sync(ctx)
-    if owner_id:
+    if owner_id and not restyle:  # drawn again only in the new lettering: nothing to tell the owner
         from app.services.emoji_tasks import by_hand
 
         async with ctx.db.session() as session:

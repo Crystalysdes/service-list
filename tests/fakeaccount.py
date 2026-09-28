@@ -70,7 +70,7 @@ class FakeAccountClient:
         message["edit_date"] = self.tg.clock
         self.edits.append((chat_id, message_id))
         emoji = sum(1 for e in entities if e["type"] == "custom_emoji")
-        return pa.Edited(emoji, "reply_markup" in message)
+        return pa.Edited(emoji, "reply_markup" in message, self.tg.clock)
 
     async def probe(self, emoji: list[tuple[str, str]]) -> list[bool]:
         self._check()

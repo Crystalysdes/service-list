@@ -158,6 +158,7 @@ class Edited:
 
     custom_emoji: int | None = None
     markup: bool | None = None
+    edit_date: int | None = None  # the same the bot is told in the edited post (its own edit, then)
 
 
 class AccountError(Exception):
@@ -243,7 +244,10 @@ def edited_from(result: Any, message_id: int) -> Edited:
             and getattr(message, "id", None) == message_id
         ):
             emoji = sum(isinstance(e, types.MessageEntityCustomEmoji) for e in message.entities or ())
-            return Edited(emoji, message.reply_markup is not None)
+            date = getattr(message, "edit_date", None)
+            return Edited(
+                emoji, message.reply_markup is not None, int(date.timestamp()) if date is not None else None
+            )
     return Edited()
 
 

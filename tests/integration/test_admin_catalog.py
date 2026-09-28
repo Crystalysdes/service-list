@@ -116,7 +116,7 @@ async def test_manual_post_after_nav_and_manual_edit(h, tg, db, ctx):
 
     edited = dict(tg.messages[MAIN][ids["travel"]])
     edited["text"] = edited["text"].replace("Tripmafia", "Trip mafia")
-    edited["edit_date"] = tg.clock
+    edited["edit_date"] = tg.tick()  # a person edits later than the bot did
     tg.messages[MAIN][ids["travel"]] = edited
     await h.feed({"edited_channel_post": tg._export(edited)})
     alert = h.last(OWNER_ID)
