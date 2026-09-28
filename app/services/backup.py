@@ -513,6 +513,8 @@ ARCHIVE_UPGRADES = {
         "FROM services WHERE services.id = features.service_id AND features.kind = 'font' "
         "AND NOT (features.params ? 'glow')",
     ),
+    # 0015: emoji before names only as given in the admin panel or bought (as in that migration)
+    15: "DELETE FROM features WHERE kind = 'emoji' AND source = 'import'",
 }
 
 
@@ -530,7 +532,7 @@ async def _after_restore(session: AsyncSession, manifest: dict[str, Any] | None 
         if revision.isdigit() and int(revision) < since:
             for statement in sql if isinstance(sql, tuple) else (sql,):
                 await session.execute(text(statement))
-    if revision.isdigit() and int(revision) < 14:  # 0014: names without emoji, lines lined up
+    if revision.isdigit() and int(revision) < 15:  # 0014/0015: names without emoji, lines lined up
         from app.services.catalog import tidy_names
 
         await tidy_names(session)

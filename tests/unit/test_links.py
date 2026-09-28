@@ -158,8 +158,8 @@ def test_a_name_as_the_channel_shows_it_and_the_start_of_its_line():
     assert tidy_name("\u2800Spike\u200b ") == "Spike"  # a blank filler and a zero-width space
     assert tidy_name("  Daddy\u00a0 Goose ") == "Daddy Goose"
     assert tidy_name("🚀") == "🚀"  # nothing else: the name stays as it is
-    assert tidy_prefix("      ↳  ") == " ↳ "  # the arrow at the edge, the name right after it
-    assert tidy_prefix("\u3164\u00a0↳\u2002") == " ↳ "  # fillers and odd spaces: plain ones
+    assert tidy_prefix("      ↳  ") == "     ↳     "  # five plain spaces on each side of the arrow
+    assert tidy_prefix("\u3164\u00a0↳\u2002") == "     ↳     "  # fillers and odd spaces: plain ones
     assert tidy_prefix("• ↳ ") == "• ↳ "  # not a single arrow: left as it is
 
 

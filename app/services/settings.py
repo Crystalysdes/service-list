@@ -99,7 +99,7 @@ class Reminders(SettingsGroup):
 class Templates(SettingsGroup):
     KEY: ClassVar[str] = "templates"
 
-    item_prefix: str = " ↳ "
+    item_prefix: str = "     ↳     "
     item_sep: str = "\n\n"
     header_sep: str = "\n\n"
     footer_sep: str = "\n\n"

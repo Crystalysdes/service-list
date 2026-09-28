@@ -142,11 +142,14 @@ def shorten_name(value: str, limit: int = NAME_MAX) -> str:
     return cut.rstrip(TRIM_TAIL) or value[:limit].rstrip()
 
 
+LINE_GAP = " " * 5  # before the arrow of a service's line and between it and the name
+
+
 def tidy_prefix(prefix: str) -> str:
-    """The start of a service's line as a space, its arrow and a space: the arrows close to the edge, every
-    name the same short distance after them (more room for it on a phone). Any other start stays as it is."""
+    """The start of a service's line as five plain spaces, its arrow and five plain spaces: every arrow at the
+    same place and every name the same distance after it. Any other start stays as it is."""
     visible = [c for c in prefix if not (c.isspace() or is_invisible(c))]
-    return f" {visible[0]} " if len(visible) == 1 else prefix
+    return f"{LINE_GAP}{visible[0]}{LINE_GAP}" if len(visible) == 1 else prefix
 
 
 def clean_text(value: str, *, allow_newlines: bool = False) -> str:

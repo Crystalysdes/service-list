@@ -254,6 +254,13 @@ def test_names_lose_their_emoji_and_the_arrows_move_closer_to_the_edge():
             f"source, updated_at, created_at) VALUES ({ids[4]}, {category}, 'font', 'active', now(), "
             """now() + interval '10 days', '{"glyphs": [], "glow": "gold"}', 'order', now(), now())"""
         )
+        for sid, source in ((ids[0], "import"), (ids[1], "import"), (ids[4], "admin"), (ids[2], "order")):
+            sql(  # 0015: premium emoji before names taken over from the old channel go
+                "INSERT INTO features (service_id, category_id, kind, status, started_at, params, source, "
+                f"updated_at, created_at) VALUES ({sid}, {category}, 'emoji', 'active', now(), "
+                """'{"emoji_id": "1", "alt": "🔥"}', """
+                f"'{source}', now(), now())"
+            )
         sql(
             "INSERT INTO settings (key, value, updated_at) VALUES "
             """('templates', '{"item_prefix": "      ↳  ", "item_sep": "\\n\\n"}', now()), """
@@ -263,12 +270,14 @@ def test_names_lose_their_emoji_and_the_arrows_move_closer_to_the_edge():
         names = sql("SELECT name FROM services ORDER BY id").splitlines()
         assert names == ["FRAUD ENROLL", "Ракета Rocket", "kingenroll.cc", "🚀", "Ded CC | Buy credit"]
         prefix = sql("SELECT '[' || (value->>'item_prefix') || ']' FROM settings WHERE key = 'templates'")
-        assert prefix == "[ ↳ ]"
+        assert prefix == "[     ↳     ]"
         assert (
             sql("SELECT value->>'max_name_len', value->>'description_min' FROM settings WHERE key = 'limits'")
             == "20|20"
         )
-        assert sql("SELECT params->>'glow_quiet' FROM features") == "true"  # drawn again, its owner not told
+        assert sql("SELECT params->>'glow_quiet' FROM features WHERE kind = 'font'") == "true"  # not told
+        emoji = sql("SELECT source FROM features WHERE kind = 'emoji' ORDER BY service_id").splitlines()
+        assert emoji == ["order", "admin"]  # granted in the admin panel or bought: they stay
         assert _alembic("downgrade", "0013").returncode == 0  # data only: nothing to undo
     finally:
         _psql(f"DROP DATABASE IF EXISTS {NAME}")
