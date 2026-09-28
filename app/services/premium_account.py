@@ -33,7 +33,7 @@ from app.db.base import utcnow
 from app.db.models import Channel
 from app.domain.richtext import AUTO_DETECTED, Fragment, RichText
 from app.services.channels import INACTIVE_STATUSES
-from app.services.notify import notify_staff
+from app.services.notify import claim_notification, notify_staff
 from app.services.redact import add_secrets
 from app.services.settings import Runtime, get_settings, update_settings
 
@@ -79,6 +79,9 @@ CHAT_TEXT = {
     NOT_ADMIN: "аккаунт не администратор канала",
     NO_EDIT_RIGHT: "у аккаунта нет права «Редактировать чужие публикации»",
 }
+# the Service List Info channel: the account joins it and the bot makes it an admin (``_make_admins``)
+INVITE_TTL = timedelta(minutes=10)
+RIGHTS_NEEDED = "боту нужно право «Добавление администраторов» в этом канале"
 
 
 # ------------------------------------------------------------------------------------------ the file
@@ -182,6 +185,8 @@ class Client(Protocol):
 
     async def rights(self, chats: list[tuple[int, str | None]]) -> dict[int, str | None]: ...
 
+    async def join(self, chat_id: int, username: str | None, invite: str | None) -> None: ...
+
     async def edit(
         self, chat_id: int, message_id: int, fragment: Fragment, preview: bool | None
     ) -> Edited: ...
@@ -253,6 +258,12 @@ def edited_from(result: Any, message_id: int) -> Edited:
 
 def _rpc(exc: BaseException) -> str:
     return getattr(exc, "message", None) or type(exc).__name__
+
+
+def invite_hash(link: str) -> str:
+    """The hash of an invitation link (t.me/+HASH or t.me/joinchat/HASH)."""
+    tail = link.rstrip("/").rsplit("/", 1)[-1]
+    return tail[1:] if tail.startswith("+") else tail
 
 
 class TelethonClient:
@@ -359,6 +370,31 @@ class TelethonClient:
         except errors.RPCError as exc:
             raise AccountError(FAILING, _rpc(exc)) from exc
         return result
+
+    async def join(self, chat_id: int, username: str | None, invite: str | None) -> None:
+        """The account joins a channel: a public one by its @username, a private one by ``invite``."""
+        from telethon import errors
+        from telethon.tl import functions
+
+        try:
+            if username:
+                entity = await self._client.get_input_entity(username)
+                await self._client(functions.channels.JoinChannelRequest(entity))
+            elif invite:
+                await self._client(functions.messages.ImportChatInviteRequest(invite_hash(invite)))
+            else:
+                raise AccountError(NOT_MEMBER, "нет ссылки в канал")
+        except errors.UserAlreadyParticipantError:
+            pass
+        except (errors.UnauthorizedError, errors.AuthKeyDuplicatedError) as exc:
+            raise AccountError(LOGGED_OUT, _rpc(exc)) from exc
+        except errors.FloodWaitError as exc:
+            raise AccountError(FAILING, _rpc(exc), retry_after=exc.seconds) from exc
+        except errors.RPCError as exc:  # too many channels, the link expired...
+            raise AccountError(NOT_MEMBER, _rpc(exc)) from exc
+        except ValueError as exc:  # no such @username
+            raise AccountError(NOT_MEMBER, str(exc)) from exc
+        self._peers.pop(chat_id, None)  # found among its chats from now on
 
     async def edit(self, chat_id: int, message_id: int, fragment: Fragment, preview: bool | None) -> Edited:
         """``preview``: show a link preview; None for a caption (a post with media)."""
@@ -476,6 +512,7 @@ class ChatInfo:
     title: str
     username: str | None
     main: bool
+    info: bool = False  # the Service List Info channel: the bot makes the account its admin by itself
 
 
 class PremiumAccount:
@@ -499,6 +536,9 @@ class PremiumAccount:
         self.distrust_until: datetime | None = None
         self.failures = 0  # checks in a row that failed
         self.gave_up: set[tuple[int, int, str]] = set()  # (post row, message, content) it could not write
+        # the Info channel: when the bot last tried to make the account its admin, and what stood in the way
+        self.admin_tried: dict[int, datetime] = {}
+        self.admin_trouble: dict[int, str] = {}
         # kind of premium emoji -> Telegram keeps one inside a link the account sends (checked on its server)
         self.links: dict[str, bool] = {}
         self.links_at: datetime | None = None
@@ -619,6 +659,13 @@ class PremiumAccount:
                 self.distrust_until = None
             distrusted = self.distrust_until is not None and now < self.distrust_until
             self.state = READY if me.premium and not distrusted else NO_PREMIUM
+
+    async def join(self, chat_id: int, username: str | None, invite: str | None) -> None:
+        """The account joins a channel (the Service List Info channel, to be made its admin)."""
+        async with self._lock:
+            if self.client is None:
+                raise AccountError(FAILING, "аккаунт не подключён")
+            await asyncio.wait_for(self.client.join(chat_id, username, invite), TIMEOUT)
 
     def wants_probe(self, now: datetime, *, force: bool = False) -> bool:
         """Time to check again whether Telegram keeps premium emoji inside links: once a day, every ten
@@ -769,8 +816,10 @@ class PremiumAccount:
             title = h(self.titles.get(chat_id, str(chat_id)))
             if problem is None:
                 lines.append(f"✅ «{title}»: ставит премиум-эмодзи в посты")
-            else:
-                lines.append(f"⛔️ «{title}»: {CHAT_TEXT.get(problem, problem)}")
+            else:  # the Info channel: why the bot could not make the account its admin by itself
+                trouble = self.admin_trouble.get(chat_id)
+                extra = f" — {h(trouble)}" if trouble else ""
+                lines.append(f"⛔️ «{title}»: {CHAT_TEXT.get(problem, problem)}{extra}")
         if self.links:
             kinds = ", ".join(
                 f"{KIND_TEXT.get(kind, kind)} — {'✅' if ok else '⛔️'}"
@@ -816,7 +865,9 @@ async def _chats(ctx: AppContext) -> list[ChatInfo]:
             )
         ).scalars()
         return [
-            ChatInfo(c.chat_id, c.id, c.title or str(c.chat_id), c.username, c.role == "main")
+            ChatInfo(
+                c.chat_id, c.id, c.title or str(c.chat_id), c.username, c.role == "main", c.role == "info"
+            )
             for c in channels
         ]
 
@@ -882,6 +933,8 @@ async def check(ctx: AppContext, *, force: bool = False) -> PremiumAccount | Non
     before = {chat.chat_id for chat in chats if account.can_edit(chat.chat_id)}
     linked = account.links_ok
     await account.refresh(chats, force=force)
+    if await _make_admins(ctx, account, chats):  # the Info channel: its rights there are looked at again
+        await account.refresh(chats, force=True)
     if account.wants_probe(utcnow(), force=force):
         await account.probe_links(await _probe_emoji(ctx))
     engine = ctx.get("sync")
@@ -895,6 +948,94 @@ async def check(ctx: AppContext, *, force: bool = False) -> PremiumAccount | Non
 
 async def job(ctx: AppContext) -> None:
     await check(ctx)
+
+
+def retry_admin(ctx: AppContext, chat_id: int) -> None:
+    """The bot's rights in a channel changed: the next check tries to make the account its admin again."""
+    account = get(ctx)
+    if account is not None:
+        account.admin_tried.pop(chat_id, None)
+
+
+async def _make_admins(ctx: AppContext, account: PremiumAccount, chats: list[ChatInfo]) -> bool:
+    """The account becomes an admin of the Service List Info channel by itself, so that the premium emoji are
+    there too: it joins the channel and the bot gives it the right to edit the posts (at most every ten
+    minutes a channel). True when it was tried (its rights are looked at again: they may have changed)."""
+    if ctx.bot is None or account.state != READY or account.me is None:
+        return False
+    now = utcnow()
+    tried = False
+    for chat in chats:
+        problem = account.chats.get(chat.chat_id)
+        if not chat.info or problem not in CHAT_PROBLEMS:
+            continue
+        last = account.admin_tried.get(chat.chat_id)
+        if last is not None and now - last < CHECK_EVERY:
+            continue
+        account.admin_tried[chat.chat_id] = now
+        trouble = await _make_admin(ctx, account, chat, problem or "")
+        if trouble is None:
+            account.admin_trouble.pop(chat.chat_id, None)
+        else:
+            account.admin_trouble[chat.chat_id] = trouble
+        tried = True
+    return tried
+
+
+async def _make_admin(ctx: AppContext, account: PremiumAccount, chat: ChatInfo, problem: str) -> str | None:
+    """None: the account is the channel's admin with the right to edit; else what stood in the way."""
+    from aiogram.exceptions import TelegramAPIError
+
+    bot = ctx.bot
+    assert bot is not None and account.me is not None
+    if problem == NOT_MEMBER:
+        invite = None
+        if not chat.username:  # a private channel: a link of its own, one join, a few minutes
+            try:
+                link = await bot.create_chat_invite_link(
+                    chat.chat_id, name="Аккаунт с Premium", expire_date=utcnow() + INVITE_TTL, member_limit=1
+                )
+            except TelegramAPIError as exc:
+                return await _admin_trouble(
+                    ctx, account, chat, "invite", f"нет ссылки в канал: {exc.message}"
+                )
+            invite = link.invite_link
+        try:
+            await account.join(chat.chat_id, chat.username, invite)
+        except (AccountError, TimeoutError) as exc:
+            detail = (exc.detail or exc.kind) if isinstance(exc, AccountError) else "нет ответа"
+            return await _admin_trouble(ctx, account, chat, "join", f"аккаунт не смог вступить: {detail}")
+    try:
+        await bot.promote_chat_member(chat.chat_id, account.me.user_id, can_edit_messages=True)
+    except TelegramAPIError as exc:
+        text = exc.message.lower()
+        if problem != NO_EDIT_RIGHT and ("not enough rights" in text or "right_forbidden" in text):
+            return await _admin_trouble(ctx, account, chat, "rights", RIGHTS_NEEDED)
+        return await _admin_trouble(ctx, account, chat, "promote", f"бот не смог выдать право: {exc.message}")
+    return None
+
+
+async def _admin_trouble(
+    ctx: AppContext, account: PremiumAccount, chat: ChatInfo, reason: str, text: str
+) -> str:
+    """The staff hear it once a day; the Info screen shows it until it is solved."""
+    async with ctx.db.session() as session:
+        first = await claim_notification(session, f"acct_admin:{chat.chat_id}:{reason}:{utcnow():%Y%m%d}")
+        await session.commit()
+    if first:
+        hint = (
+            "Дайте боту это право (в канале: Администраторы → бот) — дальше бот сам сделает аккаунт "
+            "администратором. "
+            if reason == "rights"
+            else ""
+        )
+        await notify_staff(
+            ctx,
+            f"👤 Аккаунт с Premium пока не ставит премиум-эмодзи в канале «{h(chat.title)}»: {h(text)}. "
+            f"{hint}Или сделайте аккаунт {h(account.name)} администратором канала с правом «Редактировать "
+            "чужие публикации» вручную.",
+        )
+    return text
 
 
 async def announce(ctx: AppContext, account: PremiumAccount) -> None:

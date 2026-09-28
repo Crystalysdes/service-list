@@ -321,7 +321,11 @@ async def on_my_member(update: ChatMemberUpdated, session: AsyncSession, **data:
                 "подключите новый: /admin → 📡 Каналы → 🚚 Переезд.",
                 session=session,
             )
-    elif status in ("administrator", "creator") and channel.status == "broken":
+    elif status in ("administrator", "creator") and channel.role == "info":
+        from app.services import premium_account
+
+        premium_account.retry_admin(ctx, channel.chat_id)  # it may make the Premium account an admin now
+    if status in ("administrator", "creator") and channel.status == "broken":
         runtime = await get_settings(session, Runtime)
         channel.status = "live" if runtime.live else "setup"
         channel.last_error = None

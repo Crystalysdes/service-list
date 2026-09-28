@@ -31,6 +31,7 @@ RIGHT_NAMES = {
     "can_edit_messages": "редактирование сообщений",
     "can_delete_messages": "удаление сообщений",
     "can_invite_users": "приглашение пользователей",
+    "can_promote_members": "добавление администраторов",
 }
 REQUIRED_RIGHTS: dict[str, tuple[str, ...]] = {
     "main": ("can_post_messages", "can_edit_messages", "can_delete_messages", "can_invite_users"),
@@ -58,6 +59,9 @@ REQUEST_IDS = {
     "community": 106,
     "info": 107,
 }
+# asked for when connecting, though the channel works without: in the Info channel the bot makes the Premium
+# account an admin (the premium emoji of its posts), app/services/premium_account.py
+WANTED_RIGHTS: dict[str, tuple[str, ...]] = {"info": (*REQUIRED_RIGHTS["info"], "can_promote_members")}
 GROUP_ROLES = ("moderation", "community")
 RIGHT_FLAGS = (
     "can_manage_chat",
@@ -278,7 +282,7 @@ def _admin_rights(flags: tuple[str, ...]) -> ChatAdministratorRights:
 def request_chat_keyboard(role: str, request_id: int) -> ReplyKeyboardMarkup:
     """Telegram's own chat picker: lists the admin's channels / groups and adds the bot with the rights."""
     is_channel = role not in GROUP_ROLES
-    rights = _admin_rights(REQUIRED_RIGHTS.get(role, ()))
+    rights = _admin_rights(WANTED_RIGHTS.get(role) or REQUIRED_RIGHTS.get(role, ()))
     button = KeyboardButton(
         text="📋 Выбрать канал" if is_channel else "👥 Выбрать группу",
         request_chat=KeyboardButtonRequestChat(

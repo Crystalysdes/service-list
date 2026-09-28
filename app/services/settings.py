@@ -162,6 +162,8 @@ class InfoFeed(SettingsGroup):
     sound: bool = False  # the bot's news with a notification sound
     # a kind switched on again: what happened while it was off is not caught up with
     since: dict[str, datetime] = Field(default_factory=dict)
+    # the premium emoji the news of a kind starts with (the usual icon stays under it), kind -> emoji id
+    icons: dict[str, str] = Field(default_factory=dict)
 
 
 class ChannelLayout(SettingsGroup):

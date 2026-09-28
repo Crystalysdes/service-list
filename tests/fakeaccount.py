@@ -22,6 +22,10 @@ class FakeAccountClient:
     logged_out: bool = False
     fail: pa.AccountError | None = None  # every call raises this
     problems: dict[int, str] = field(default_factory=dict)  # chat id -> what it is not there
+    # chats where it is what FakeTelegram says: a member, an admin with the right to edit or not
+    from_members: set[int] = field(default_factory=set)
+    join_error: pa.AccountError | None = None  # Telegram does not let it join (too many channels...)
+    joins: list[tuple[int, str | None, str | None]] = field(default_factory=list)
     keeps_links: bool = True  # Telegram keeps a premium emoji inside a link the account sends
     no_links_for: set[str] = field(default_factory=set)  # but not these emoji
     probes: list[list[tuple[str, str]]] = field(default_factory=list)
@@ -39,16 +43,50 @@ class FakeAccountClient:
         self._check()
         return pa.Me(self.user_id, self.name, self.premium)
 
+    def _problem(self, chat_id: int) -> str | None:
+        if chat_id not in self.from_members:
+            return self.problems.get(chat_id)
+        member = self.tg.chats.get(chat_id, {}).get("_members", {}).get(self.user_id)
+        if member is None or member["status"] in ("left", "kicked"):
+            return pa.NOT_MEMBER
+        if member["status"] == "creator":
+            return None
+        if member["status"] != "administrator":
+            return pa.NOT_ADMIN
+        return None if member.get("can_edit_messages") else pa.NO_EDIT_RIGHT
+
     async def rights(self, chats: list[tuple[int, str | None]]) -> dict[int, str | None]:
         self._check()
-        return {chat_id: self.problems.get(chat_id) for chat_id, _ in chats}
+        return {chat_id: self._problem(chat_id) for chat_id, _ in chats}
+
+    async def join(self, chat_id: int, username: str | None, invite: str | None) -> None:
+        self._check()
+        self.joins.append((chat_id, username, invite))
+        if self.join_error is not None:
+            raise self.join_error
+        chat = self.tg.chats.get(chat_id)
+        if chat is None:
+            raise pa.AccountError(pa.NOT_MEMBER, "CHANNEL_PRIVATE")
+        if username:
+            if chat.get("username") != username:
+                raise pa.AccountError(pa.NOT_MEMBER, "USERNAME_NOT_OCCUPIED")
+        else:
+            link = chat.get("_links", {}).get(invite or "")
+            used = link.get("_used", 0) if link else 0
+            if link is None or link.get("is_revoked") or used >= (link.get("member_limit") or 10**9):
+                raise pa.AccountError(pa.NOT_MEMBER, "INVITE_HASH_EXPIRED")
+            link["_used"] = used + 1
+        members = chat.setdefault("_members", {})
+        if self.user_id not in members or members[self.user_id]["status"] in ("left", "kicked"):
+            members[self.user_id] = {"status": "member"}
 
     async def edit(
         self, chat_id: int, message_id: int, fragment: Fragment, preview: bool | None
     ) -> pa.Edited:
         self._check()
-        if self.problems.get(chat_id):
-            raise pa.AccountError(self.problems[chat_id], "CHAT_ADMIN_REQUIRED")
+        problem = self._problem(chat_id)
+        if problem:
+            raise pa.AccountError(problem, "CHAT_ADMIN_REQUIRED")
         message = self.tg.messages.get(chat_id, {}).get(message_id)
         if message is None:
             raise pa.AccountError(pa.MISSING, "MESSAGE_ID_INVALID")

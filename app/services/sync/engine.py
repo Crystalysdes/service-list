@@ -1473,7 +1473,8 @@ class SyncEngine:
             await self._restored(channel_id, kind, block_id, post_url)
         elif status == "unchanged":
             result.unchanged += 1
-        elif status == "missing" and kind != "spare":
+        # a post of the Info feed deleted by hand stays deleted (infofeed._refresh_news)
+        elif status == "missing" and kind not in ("spare", "info"):
             async with self.ctx.db.session() as session:
                 title = await self._block_title(session, kind, block_id)
             self._restoring.add((channel_id, kind, block_id))

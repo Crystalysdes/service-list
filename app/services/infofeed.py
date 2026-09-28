@@ -47,13 +47,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot.i18n import h
 from app.db.base import utcnow
 from app.db.models import Category, Channel, ChannelPost, Deal, InfoPost, ScamEntry, Service
+from app.domain.links import is_emoji
+from app.domain.render import RenderTemplates, render_item
 from app.domain.richtext import Fragment, RichText
 from app.domain.symbols import LinkContext
-from app.services import render_db
+from app.services import premium_account, render_db
 from app.services.announce import short
 from app.services.channels import INACTIVE_STATUSES
 from app.services.published import SHOWN_STATES, shows
-from app.services.settings import Chats, Escrow, InfoFeed, Templates, get_settings, update_settings
+from app.services.settings import Chats, Escrow, InfoFeed, Runtime, Templates, get_settings, update_settings
+from app.services.sync.manual import PLAIN as PLAIN_SENT
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +74,7 @@ STORAGE_BATCH = 5  # posts copied to the storage channel per pass
 AUDIT_BATCH = 2  # posts checked per pass: still in the channel?
 AUDIT_EVERY = timedelta(hours=12)
 MOVE_BATCH = 15  # posts published per pass in a channel a move is filling
-RELINK_BATCH = 10  # old news whose links are renewed per pass (after the main channel moved)
+REFRESH_BATCH = 10  # posts per pass that get their premium emoji afterwards (or their links renewed)
 SUMMARY_MAX = 600
 REMOVED = "✅ Запись снята из Scam list."
 
@@ -136,76 +139,176 @@ async def after_restore(session: AsyncSession) -> None:
 
 
 # ------------------------------------------------------------------------------------- the news' texts
+# the icons of the news (the admins set premium ones on the Info screen: InfoFeed.icons)
+ICONS = {SERVICE: "🆕", CATEGORY: "📂", CLAIM: "✅", DEAL: "🛡", SCAM: "🚫"}
+ORDER = (SERVICE, CATEGORY, CLAIM, DEAL, SCAM)  # the order the admins send the premium icons in
+FULL, PLAIN, LINKED = "full", "plain", "linked"  # with premium emoji; without them; glowing names as links
+STYLES = frozenset(
+    {"bold", "italic", "underline", "strikethrough", "spoiler", "blockquote", "expandable_blockquote", "code"}
+)
+
+
 def _open(service: Service) -> list[str] | None:
     if service.url_kind != "note" and service.url.startswith(("https://", "http://")):
         return ["🔗 Открыть", service.url]
     return None
 
 
-def _service_news(service: Service, category: Category | None) -> dict[str, Any]:
-    rt = RichText().text("🆕 Новый сервис в Service List", "bold").text("\n\n").text(service.name, "bold")
-    if category is not None:
-        rt.text("\n📂 ").link(category.title, f"post:cat:{category.id}")
-    about = short(service.description)
-    if about:
-        rt.text("\n\n").text(about)
-    rt.text("\n\n#новый_сервис")
+def _headline(rt: RichText, event: str, icons: dict[str, str], title: str) -> None:
+    """The news' first line: its icon (a premium one when the admins set it: the usual one under it is seen
+    where premium emoji are not) and its title in bold."""
+    icon = ICONS[event]
+    if icons.get(event):
+        rt.emoji(icons[event], icon)
+    else:
+        rt.text(icon)
+    rt.text(" ").text(title, "bold")
+
+
+def _linked_text(rt: RichText, text: str, url: str) -> None:
+    core = text.strip()
+    if not core:
+        rt.text(text)
+        return
+    lead = text[: len(text) - len(text.lstrip())]
+    rt.text(lead).link(core, url).text(text[len(lead) + len(core) :])
+
+
+def category_line(category: Category, *, folder: bool = True) -> Fragment:
+    """The category as its post in the list heads it: its premium emoji, its name leading to its post (only
+    the words: Telegram keeps no premium emoji inside a link). ``folder``: «📂» before a header that does not
+    start with an emoji of its own."""
+    header = Fragment.from_json(category.header).without(STYLES).strip()
+    if not header.text:
+        header = Fragment.plain(category.title)
+    url = f"post:cat:{category.id}"
+    emoji = sorted((e for e in header.entities if e.type == "custom_emoji"), key=lambda e: e.offset)
+    rt = RichText()
+    if folder and not emoji and not is_emoji(header.text[:1] or " "):
+        rt.text("📂 ")
+    position = 0
+    for entity in emoji:
+        if entity.offset < position:
+            continue
+        _linked_text(rt, header.slice(position, entity.offset).text, url)
+        rt.fragment(header.slice(entity.offset, entity.end))
+        position = entity.end
+    _linked_text(rt, header.slice(position).text, url)
+    return rt.build()
+
+
+def _variants(build: Callable[[str], Fragment], *, linked: bool) -> dict[str, Any]:
+    """The news with its premium emoji, without them (a glowing name written as the name) and, when there is a
+    glowing name, with it as its service's link (for the Premium account when Telegram keeps such links)."""
+    full = build(FULL)
+    content: dict[str, Any] = {"fragment": full.to_json()}
+    if full.custom_emoji_count():
+        content["plain"] = build(PLAIN).without({"custom_emoji"}).to_json()
+    if linked:
+        content["linked"] = build(LINKED).to_json()
+    return content
+
+
+def _service_line(service: Service, tpl: RenderTemplates, variant: str) -> Fragment:
+    """The service as its line in the list shows it: its premium emoji, its glowing name, its link."""
+    item = render_db.item_from_service(service)
+    return render_item(item, tpl, plain=variant == PLAIN, linked=variant == LINKED)
+
+
+def _service_news(
+    service: Service, category: Category | None, tpl: RenderTemplates, icons: dict[str, str]
+) -> dict[str, Any]:
+    def build(variant: str) -> Fragment:
+        rt = RichText()
+        _headline(rt, SERVICE, icons, "Новый сервис в Service List")
+        rt.text("\n\n").fragment(_service_line(service, tpl, variant))
+        if category is not None:
+            rt.text("\n").fragment(category_line(category))
+        about = short(service.description)
+        if about:
+            rt.text("\n\n").text(about)
+        return rt.text("\n\n#новый_сервис").build()
+
+    content = _variants(build, linked=bool(render_db.item_from_service(service).glyphs))
     buttons = [button for button in [_open(service)] if button]
     if category is not None:
         buttons.append(["📋 В списке", f"post:cat:{category.id}"])
         if category.is_open:
             buttons.append(["➕ Добавить свой сервис", f"bot:start:add_{category.slug}"])
-    return {"fragment": rt.build().to_json(), "buttons": buttons}
+    return {**content, "buttons": buttons}
 
 
-def _category_news(category: Category) -> dict[str, Any]:
-    rt = RichText().text("📂 Новая категория в Service List", "bold").text("\n\n")
-    rt.link(category.title, f"post:cat:{category.id}", "bold")
-    if category.nav_label:
-        rt.text(f"  {category.nav_label}")
-    if category.is_open:
-        rt.text("\n\nМеста открыты — добавьте свой сервис первым.")
-    rt.text("\n\n#новая_категория")
+def _category_news(category: Category, icons: dict[str, str]) -> dict[str, Any]:
+    def build(variant: str) -> Fragment:
+        rt = RichText()
+        _headline(rt, CATEGORY, icons, "Новая категория в Service List")
+        rt.text("\n\n").fragment(category_line(category, folder=False))
+        if category.nav_label:
+            rt.text(f"  {category.nav_label}")
+        if category.is_open:
+            rt.text("\n\nМеста открыты — добавьте свой сервис первым.")
+        return rt.text("\n\n#новая_категория").build()
+
     buttons = [["📂 Открыть категорию", f"post:cat:{category.id}"]]
     if category.is_open:
         buttons.append(["➕ Занять место", f"bot:start:add_{category.slug}"])
-    return {"fragment": rt.build().to_json(), "buttons": buttons}
+    return {**_variants(build, linked=False), "buttons": buttons}
 
 
-def _claim_news(service: Service, category: Category | None) -> dict[str, Any]:
-    rt = RichText().text("✅ Владелец подтвердил сервис", "bold").text("\n\n").text(service.name, "bold")
-    if category is not None:
-        rt.text("\n📂 ").link(category.title, f"post:cat:{category.id}")
-    rt.text("\n\nЭтим сервисом в Service List управляет его владелец: он подтвердил, что сервис его.")
-    rt.text("\n\n#подтверждён")
+def _claim_news(
+    service: Service, category: Category | None, tpl: RenderTemplates, icons: dict[str, str]
+) -> dict[str, Any]:
+    def build(variant: str) -> Fragment:
+        rt = RichText()
+        _headline(rt, CLAIM, icons, "Владелец подтвердил сервис")
+        rt.text("\n\n").fragment(_service_line(service, tpl, variant))
+        if category is not None:
+            rt.text("\n").fragment(category_line(category))
+        rt.text("\n\nЭтим сервисом в Service List управляет его владелец: он подтвердил, что сервис его.")
+        return rt.text("\n\n#подтверждён").build()
+
+    content = _variants(build, linked=bool(render_db.item_from_service(service).glyphs))
     buttons = [button for button in [_open(service)] if button]
     if category is not None:
         buttons.append(["📋 В списке", f"post:cat:{category.id}"])
-    return {"fragment": rt.build().to_json(), "buttons": buttons}
+    return {**content, "buttons": buttons}
 
 
-def _deal_news(ordinal: int) -> dict[str, Any]:
+def _deal_news(ordinal: int, icons: dict[str, str]) -> dict[str, Any]:
     """Only that a deal went well: no sum, no sides, not even the deal's number (it names its chat, and the
     numbers would show how many deals did not happen)."""
-    rt = RichText().text(f"🛡 Успешная сделка через Авто-гарант №{ordinal}", "bold")
-    rt.text("\n\nЕщё одна сделка прошла через гаранта и успешно завершена ✅")
-    rt.text("\nДеньги были у гаранта, пока сделка не завершилась.")
-    rt.text("\n\n#гарант")
-    return {"fragment": rt.build().to_json(), "buttons": [["🛡 Сделка через гаранта", render_db.GARANT_START]]}
+
+    def build(variant: str) -> Fragment:
+        rt = RichText()
+        _headline(rt, DEAL, icons, f"Успешная сделка через Авто-гарант №{ordinal}")
+        rt.text("\n\nЕщё одна сделка прошла через гаранта и успешно завершена ✅")
+        rt.text("\nДеньги были у гаранта, пока сделка не завершилась.")
+        return rt.text("\n\n#гарант").build()
+
+    return {**_variants(build, linked=False), "buttons": [["🛡 Сделка через гаранта", render_db.GARANT_START]]}
 
 
-def _scam_news(entry: ScamEntry, tpl: Templates) -> dict[str, Any]:
-    rt = RichText().text("🚫 Новая запись в Scam list", "bold").text("\n\n").text(entry.name, "bold")
-    rt.text("\n" + tpl.scam_label_link).text(entry.url or "—", "code")  # not clickable, as in the card
-    if entry.category_title:
-        label = f" {entry.category_label}" if entry.category_label else ""
-        rt.text("\n" + tpl.scam_label_category + entry.category_title + label)
-    summary = short(entry.summary, SUMMARY_MAX)
-    if summary:
-        rt.text("\n\n").text(summary)
-    rt.text("\n\n#scam")
+def _scam_news(entry: ScamEntry, tpl: Templates, icons: dict[str, str]) -> dict[str, Any]:
+    def build(variant: str) -> Fragment:
+        rt = RichText()
+        _headline(rt, SCAM, icons, "Новая запись в Scam list")
+        rt.text("\n\n").text(entry.name, "bold")
+        rt.text("\n" + tpl.scam_label_link).text(entry.url or "—", "code")  # not clickable, as in the card
+        if entry.category_title:
+            label = f" {entry.category_label}" if entry.category_label else ""
+            rt.text("\n" + tpl.scam_label_category + entry.category_title + label)
+        summary = short(entry.summary, SUMMARY_MAX)
+        if summary:
+            rt.text("\n\n").text(summary)
+        return rt.text("\n\n#scam").build()
+
     buttons = [["📸 Карточка и скриншоты", f"scam:card:{entry.id}"], ["🚫 Весь Scam list", "channel:scam"]]
-    return {"fragment": rt.build().to_json(), "buttons": buttons}
+    return {**_variants(build, linked=False), "buttons": buttons}
+
+
+def is_news(post: InfoPost) -> bool:
+    """The bot's own news (one the admins edited by hand is theirs now: kept and moved as they wrote it)."""
+    return post.kind == EVENT and not (post.content or {}).get("edited")
 
 
 async def render_block(
@@ -213,9 +316,15 @@ async def render_block(
 ) -> render_db.RenderedBlock | None:
     """The bot's news as the engine publishes it (``render_db.render_block`` of kind "info")."""
     post = await session.get(InfoPost, post_id)
-    if post is None or post.kind != EVENT or not (post.content or {}).get("fragment"):
+    if post is None or not is_news(post) or not (post.content or {}).get("fragment"):
         return None
-    fragment = Fragment.from_json(post.content["fragment"]).map_links(ctx.resolve)
+
+    def variant(key: str) -> Fragment | None:
+        data = post.content.get(key)
+        return Fragment.from_json(data).map_links(ctx.resolve) if data else None
+
+    fragment = variant("fragment")
+    assert fragment is not None
     escrow_on: bool | None = None
     buttons: list[tuple[str, str]] = []
     for text, url in post.content.get("buttons") or []:
@@ -228,7 +337,15 @@ async def render_block(
         if text and resolved:
             buttons.append((str(text)[:64], resolved))
     sound = (await get_settings(session, InfoFeed)).sound
-    return render_db.RenderedBlock("info", post_id, fragment, buttons=tuple(buttons), silent=not sound)
+    return render_db.RenderedBlock(
+        "info",
+        post_id,
+        fragment,
+        buttons=tuple(buttons),
+        silent=not sound,
+        plain=variant("plain"),
+        linked=variant("linked"),
+    )
 
 
 # ------------------------------------------------------------------------------------------ Telegram
@@ -416,7 +533,7 @@ async def reconcile_info(engine: Any, channel_id: int, limiter: Any, result: Any
         await _place_events(engine, channel_id, chat_id, limiter, result)
         await _to_storage(engine, channel_id, chat_id, limiter)
         await _audit(engine, chat_id, channel_id, limiter)
-        await _relink(engine, channel_id, chat_id, limiter, result)
+        await _refresh_news(engine, channel_id, chat_id, limiter, result)
     await _withdraw(engine, limiter)
 
 
@@ -604,6 +721,8 @@ async def _advance(session: AsyncSession, feed: InfoFeed, now: datetime) -> None
     main = await _current(session, "main")
     scam = await _current(session, "scam")
     tpl = await get_settings(session, Templates)
+    rtpl = await render_db.templates(session)
+    icons = feed.icons
     for post in waiting:
         event = post.event or ""
         at = post.event_at or now
@@ -622,11 +741,11 @@ async def _advance(session: AsyncSession, feed: InfoFeed, now: datetime) -> None
                 if str(service.owner_id) != post.key.rsplit(":", 1)[-1]:  # someone else's by now
                     post.state = DROPPED
                     continue
-                content = _claim_news(service, category)
+                content = _claim_news(service, category, rtpl, icons)
             elif category.is_visible:
                 shown = shows(await _main_post(session, main, category.id), service)
                 if main is None or waited or shown:
-                    content = _service_news(service, category)
+                    content = _service_news(service, category, rtpl, icons)
         elif event == CATEGORY:
             category = await session.get(Category, post.ref_id)
             if category is None:
@@ -635,7 +754,7 @@ async def _advance(session: AsyncSession, feed: InfoFeed, now: datetime) -> None
             if category.is_visible:
                 placed = _settled(await _main_post(session, main, category.id))
                 if main is None or waited or placed:
-                    content = _category_news(category)
+                    content = _category_news(category, icons)
         elif event == DEAL:
             deal = await session.get(Deal, post.ref_id)
             if deal is None or deal.status != "completed" or deal.closed_at is None:
@@ -652,7 +771,7 @@ async def _advance(session: AsyncSession, feed: InfoFeed, now: datetime) -> None
                     ),
                 )
             )
-            content = _deal_news(int(ordinal or 1))
+            content = _deal_news(int(ordinal or 1), icons)
         elif event == SCAM:
             entry = await session.get(ScamEntry, post.ref_id)
             if entry is None or entry.status != "published":
@@ -670,7 +789,7 @@ async def _advance(session: AsyncSession, feed: InfoFeed, now: datetime) -> None
                     )
                 ).scalar_one_or_none()
             if scam is None or waited or (card is not None and card.message_id):
-                content = _scam_news(entry, tpl)
+                content = _scam_news(entry, tpl, icons)
         if content is not None:
             post.content = content
             post.state = READY
@@ -976,73 +1095,113 @@ async def _withdraw(engine: Any, limiter: Any) -> None:
                 await session.commit()
 
 
-async def _relink(engine: Any, channel_id: int, chat_id: int, limiter: Any, result: Any) -> None:
-    """After the main channel moved: the links of the news already out lead into the new one."""
-    from app.services.sync.engine import NO_PREVIEW, buttons_markup, remember_own_edit
+async def _refresh_news(engine: Any, channel_id: int, chat_id: int, limiter: Any, result: Any) -> None:
+    """Posts that went out without their premium emoji get them once they can be put (the Premium account
+    became an admin of the channel), and after the main channel moved the bot's news lead into the new one, a
+    portion a pass. The engine writes the bot's news again; the admins' posts a move copied (a copy the bot
+    makes loses the premium emoji) get their text back as the database keeps it, from the account. A post
+    deleted by hand meanwhile is not brought back."""
+    from app.services.sync.engine import emoji_allowed
 
     ctx = engine.ctx
-    bot = ctx.bot
+    account = premium_account.for_chat(ctx, chat_id)
     async with ctx.db.session() as session:
-        rows = list(
-            (
-                await session.execute(
-                    select(ChannelPost)
-                    .join(InfoPost, InfoPost.id == ChannelPost.block_id)
-                    .where(
-                        ChannelPost.channel_id == channel_id,
-                        ChannelPost.kind == "info",
-                        ChannelPost.dirty.is_(True),
-                        ChannelPost.message_id.is_not(None),
-                        InfoPost.kind == EVENT,
-                        InfoPost.state == LIVE,
-                    )
-                    .order_by(ChannelPost.message_id)
-                    .limit(RELINK_BATCH)
+        bot_emoji = emoji_allowed(await get_settings(session, Runtime))
+        wanted = [ChannelPost.dirty.is_(True)]
+        if account is not None or bot_emoji:
+            wanted.append(ChannelPost.sent_hash.startswith(PLAIN_SENT))
+        pairs = (
+            await session.execute(
+                select(ChannelPost, InfoPost)
+                .join(InfoPost, InfoPost.id == ChannelPost.block_id)
+                .where(
+                    ChannelPost.channel_id == channel_id,
+                    ChannelPost.kind == "info",
+                    ChannelPost.message_id.is_not(None),
+                    InfoPost.state == LIVE,
+                    or_(*wanted),
                 )
-            ).scalars()
-        )
-        todo = []
-        for row in rows:
-            block = await engine._render(session, channel_id, "info", row.block_id)
-            if block is None or block.content_hash() == row.sent_hash:
-                row.dirty = False
-                continue
-            todo.append((row.id, row.block_id, row.message_id, block))
-        await session.commit()
-    for row_id, post_id, message_id, block in todo:
-        await limiter.acquire()
-        gone = False
-        try:
-            edited = await _tg(
-                engine,
-                channel_id,
-                lambda b=block, m=message_id: bot.edit_message_text(
-                    text=b.fragment.text,
-                    chat_id=chat_id,
-                    message_id=m,
-                    entities=b.fragment.to_entities() or None,
-                    parse_mode=None,
-                    link_preview_options=NO_PREVIEW,
-                    reply_markup=buttons_markup(b.buttons),
-                ),
+                .order_by(ChannelPost.message_id)
             )
-            if isinstance(edited, Message):
-                remember_own_edit(ctx, chat_id, message_id, edited.edit_date)
-                result.edited += 1
-        except TelegramBadRequest as exc:
-            gone = _gone(exc)
-            if not gone and "not modified" not in exc.message.lower():
-                log.warning("the links of Info post %s were not renewed: %s", message_id, exc.message)
+        ).all()
+        todo: list[tuple[int, bool]] = []  # (post, the bot's news)
+        for row, post in pairs:
+            if is_news(post):
+                sent = row.sent_hash or ""
+                given_up = account is not None and (
+                    (row.id, row.message_id, sent.removeprefix(PLAIN_SENT)) in account.gave_up
+                )
+                if row.dirty or not given_up:
+                    todo.append((post.id, True))
+            elif row.dirty:
+                if post.forward or bot_emoji or not _premium(_messages(post)):
+                    row.dirty = False  # a forward cannot be edited; the bot's copies keep them now
+                elif account is not None:
+                    todo.append((post.id, False))
+        await session.commit()
+    for post_id, news in todo[:REFRESH_BATCH]:
+        if news:
+            await engine._edit_block(channel_id, "info", post_id, limiter, result)
+        elif not await _rewrite(engine, account, channel_id, chat_id, post_id, limiter):
+            continue  # the account could not just now: once it can again
         async with ctx.db.session() as session:
-            row = await session.get(ChannelPost, row_id)
-            if row is not None:
+            row = await _placement(session, channel_id, post_id)
+            if row is None:
+                continue
+            if row.message_id is None:  # deleted by hand: it stays deleted, a move leaves it out
+                post = await session.get(InfoPost, post_id)
+                if post is not None:
+                    post.state = DELETED
+                await session.delete(row)
+            else:
                 row.dirty = False
-                row.sent_hash = block.content_hash()
-                row.snapshot = block.fragment.to_json()
-            post = await session.get(InfoPost, post_id)
-            if gone and post is not None:
-                post.state = DELETED
             await session.commit()
+    if len(todo) > REFRESH_BATCH:
+        engine.wake(channel_id)  # the next portion soon
+
+
+def _premium(messages: list[Message]) -> bool:
+    return any(Fragment.from_message(m).custom_emoji_count() for m in messages)
+
+
+async def _rewrite(
+    engine: Any, account: Any, channel_id: int, chat_id: int, post_id: int, limiter: Any
+) -> bool:
+    """The Premium account writes the text (or captions) of a copied post again with its premium emoji, as the
+    database keeps them; the buttons stay. A post it cannot write so stays as it is. False: the account could
+    not just now (tried again once it can)."""
+    async with engine.ctx.db.session() as session:
+        post = await session.get(InfoPost, post_id)
+        row = await _placement(session, channel_id, post_id)
+        if post is None or row is None or not row.message_id:
+            return True
+        messages = _messages(post)
+        ids = [row.message_id, *(row.extra_message_ids or [])]
+        row_id = row.id
+    if len(messages) != len(ids):  # an album put together again without some of its items
+        return True
+    for message, message_id in zip(messages, ids, strict=True):
+        fragment = Fragment.from_message(message)
+        if not fragment.custom_emoji_count():
+            continue
+        preview = None
+        if message.text is not None:
+            options = message.link_preview_options
+            preview = not (options is not None and options.is_disabled)
+        status = await engine._edit_by_account(
+            account,
+            chat_id,
+            message_id,
+            fragment,
+            preview=preview,
+            markup=_link_markup(message) if len(messages) == 1 else None,
+            gave_up=(row_id, message_id, fragment.content_hash()),
+            key=f"info:{post_id}",
+            limiter=limiter,
+        )
+        if status == "fallback":  # this post (given up), or the account itself (paused, not an admin...)
+            return account.can_edit(chat_id)
+    return True
 
 
 # ------------------------------------------------------------------------------------------ a move
@@ -1111,7 +1270,7 @@ async def _fill_one(
         if row is None:
             row = ChannelPost(channel_id=channel_id, kind="info", block_id=post_id, state="new", dirty=False)
             session.add(row)
-        kind, forward, pinned = post.kind, post.forward, post.pinned
+        news, forward, pinned = is_news(post), post.forward, post.pinned
         messages = _messages(post)
         markup = _link_markup(messages[0]) if len(messages) == 1 else None
         copies = list(post.storage_ids or []) if storage and post.storage_chat_id == storage else []
@@ -1119,13 +1278,13 @@ async def _fill_one(
         origin_ids = (
             [m for m in [origin.message_id, *(origin.extra_message_ids or [])] if m] if origin else []
         )
-        if kind == ADMIN:  # a crash before its id is saved: found again by its text
+        if not news:  # a crash before its id is saved: found again by its text
             row.state = "sending"
             text = Fragment.from_message(messages[0]).text if messages else ""
             row.snapshot = Fragment.plain(text).to_json() if text else None
         await session.commit()
     sent: list[int] = []
-    if kind == EVENT:  # written anew: its links lead into the current main channel
+    if news:  # written anew: its links lead into the current main channel
         await engine._send_new(channel_id, "info", post_id, limiter, result)
         async with ctx.db.session() as session:
             row = await _placement(session, channel_id, post_id)
@@ -1158,6 +1317,8 @@ async def _fill_one(
         if row is not None:
             if sent:
                 row.message_id, row.extra_message_ids, row.state = sent[0], sent[1:], "ok"
+                # a copy the bot made loses the premium emoji: the account puts them back (_refresh_news)
+                row.dirty = not news and not forward and _premium(messages)
             else:  # not tried again in this channel: the admins hear which one
                 row.state, row.last_error = FAILED, row.last_error or "не удалось опубликовать"
                 result.errors.append(f"info #{post_id}: {row.last_error}")
@@ -1332,11 +1493,11 @@ async def on_edit(session: AsyncSession, channel: Channel, message: Message) -> 
         dumps.append(dump)
     post.messages = dumps
     post.version += 1
-    if post.kind == EVENT:  # the admins' words from now on (a move publishes them so)
+    if post.kind == EVENT:  # the admins' words from now on: not written anew, a move copies them
         fragment = Fragment.from_message(message)
         markup = _link_markup(message)
         buttons = [[b.text, b.url] for line in (markup.inline_keyboard if markup else []) for b in line]
-        post.content = {"fragment": fragment.to_json(), "buttons": buttons}
+        post.content = {"edited": True, "fragment": fragment.to_json(), "buttons": buttons}
     else:
         post.content = _content(dumps)
     await session.commit()

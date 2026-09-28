@@ -158,14 +158,15 @@ async def test_a_new_service_is_news_once_the_list_shows_it(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     await engine.run_once(ids["info_id"])
     news = _posts(tg, INFO)[-1]
-    assert news["text"].startswith("🆕 Новый сервис в Service List\n\nSky Tours\n📂 ")
+    # the category as its post heads it (its own emoji: no «📂» before it)
+    assert news["text"].startswith("🆕 Новый сервис в Service List\n\nSky Tours\n🗺️Travel [путешествия]\n")
     assert "Туры по всему миру." in news["text"] and news["text"].endswith("#новый_сервис")
     buttons = _buttons(news)
     assert buttons["🔗 Открыть"] == "https://t.me/skytours"
     assert buttons["📋 В списке"] == f"https://t.me/servicelist/{ids['travel']}"
     assert buttons["➕ Добавить свой сервис"] == f"https://t.me/servicelist_bot?start=add_{travel.slug}"
-    category_links = [e["url"] for e in news["entities"] if e["type"] == "text_link"]
-    assert category_links == [f"https://t.me/servicelist/{ids['travel']}"]
+    links = [e["url"] for e in news["entities"] if e["type"] == "text_link"]
+    assert links == ["https://t.me/skytours", f"https://t.me/servicelist/{ids['travel']}"]  # as in the list
     assert tg.called("sendMessage")[-1]["disable_notification"] is True  # without a sound by default
 
     again = await engine.run_once(ids["info_id"])

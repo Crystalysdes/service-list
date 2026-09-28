@@ -439,8 +439,8 @@ async def _info_after(ctx: Any, session: AsyncSession, live: bool) -> str:
     account = premium_account.get(ctx)
     if account is not None and account.state != premium_account.OFF:
         lines.append(
-            "👤 Чтобы в закрепе были премиум-эмодзи, сделайте аккаунт с Premium администратором этого канала "
-            "с правом редактировать сообщения."
+            "👤 Премиум-эмодзи в закрепе и новостях ставит аккаунт с Premium: бот сам сделает его "
+            "администратором канала, если у бота есть право «Добавление администраторов»."
         )
     lines.append("Настройки: 📡 Каналы → 📰 Service List Info.")
     return "\n\n".join(lines)

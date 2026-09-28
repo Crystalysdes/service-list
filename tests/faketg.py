@@ -706,6 +706,28 @@ class FakeTelegram:
         chat.setdefault("_links", {})[link["invite_link"]] = link
         return dict(link)
 
+    def m_promoteChatMember(self, params: dict, files: dict) -> bool:
+        """Like Telegram: the bot needs «Добавление администраторов», gives only rights it has itself and
+        changes only the admins it made."""
+        chat = self._chat(params["chat_id"])
+        self._require(chat, "can_promote_members")
+        uid = int(params["user_id"])
+        member = chat.get("_members", {}).get(uid)
+        if member is None or member["status"] in ("left", "kicked"):
+            raise FakeError(400, "Bad Request: USER_NOT_PARTICIPANT")
+        if member["status"] == "creator" or (
+            member["status"] == "administrator" and member.get("_by") != self.bot_user["id"]
+        ):
+            raise FakeError(400, "Bad Request: CHAT_ADMIN_REQUIRED")
+        rights = {k: v in (True, "true") for k, v in params.items() if k.startswith("can_")}
+        bot = self._bot_member(chat) or {}
+        if bot.get("status") == "administrator" and any(v and not bot.get(k) for k, v in rights.items()):
+            raise FakeError(400, "Bad Request: RIGHT_FORBIDDEN")
+        granted = {k: True for k, v in rights.items() if v}
+        admin = {"status": "administrator", "_by": self.bot_user["id"], **granted}
+        chat["_members"][uid] = admin if granted else {"status": "member"}
+        return True
+
     def m_revokeChatInviteLink(self, params: dict, files: dict) -> dict:
         chat = self._chat(params["chat_id"])
         self._require(chat, "can_invite_users")
