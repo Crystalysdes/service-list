@@ -56,7 +56,7 @@ async def _submit(h, tg, name="Fly Cheap", url="@flycheap_bot", branch="Travel")
     await h.say(USER, "Дешёвые авиабилеты по всему миру, поддержка 24/7, оплата криптой.")
     await h.say(USER, url)
     preview = h.last(USER)
-    await h.press(USER, preview, "Отправить на модерацию")
+    await h.press(USER, preview, "Отправить на проверку")
 
 
 async def test_submit_approve_pay_publish(h, tg, db, ctx):
@@ -457,7 +457,7 @@ async def test_emoji_in_a_name_are_not_taken_they_are_a_paid_option(h, tg, db, c
     assert "Название: «Fly Cheap». Эмодзи из названия убраны" in h.last(USER)["text"]
     await h.say(USER, "Дешёвые авиабилеты по всему миру, поддержка 24/7, оплата криптой.")
     await h.say(USER, "@flycheap_bot")
-    await h.press(USER, h.last(USER), "Отправить на модерацию")
+    await h.press(USER, h.last(USER), "Отправить на проверку")
     async with db.session() as s:
         service = (await s.execute(select(Service).where(Service.owner_id == USER))).scalar_one()
         assert service.name == "Fly Cheap"

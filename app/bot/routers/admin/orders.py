@@ -20,7 +20,7 @@ from app.db.models import Order, Service
 from app.services import billing
 from app.services.audit import audit
 from app.services.billing import PaidResult, money
-from app.services.purchases import after_paid, option_title
+from app.services.purchases import after_paid, option_title, part_title
 
 router = Router(name="admin_orders")
 router.callback_query.filter(RoleFilter("admin"))
@@ -91,6 +91,13 @@ async def _show_order(call: CallbackQuery, session: AsyncSession, order_id: int)
         f"Пользователь: {order.user_id}",
         f"Статус: {STATUS_RU.get(order.status, order.status)}",
     ]
+    if order.kind == "bundle":  # its parts, what each is worth in the total, what could not be carried out
+        skipped = {item["kind"] for item in order.params.get("skipped") or []}
+        pct = int(order.params.get("discount_pct") or 0)
+        lines.append("Состав" + (f" (пакет −{pct}%)" if pct else "") + ":")
+        for item in order.params.get("items") or []:
+            mark = " — ⚠️ не выполнено" if item["kind"] in skipped else ""
+            lines.append(f"• {h(part_title(t, item))} — {money(int(item.get('cents') or 0))}{mark}")
     if order.note:
         lines.append(f"Примечание: {h(order.note)}")
     builder = InlineKeyboardBuilder()

@@ -20,7 +20,7 @@ from app.db.base import utcnow
 from app.db.models import Category, CustomEmoji, Service
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
-from app.services import billing, glow, moderation, options, purchases, render_db
+from app.services import billing, bundles, glow, moderation, options, purchases, render_db
 from app.services.catalog import request_sync
 from app.services.glownick import placeholder_glyphs
 from app.services.settings import Limits, Prices, Templates, get_settings
@@ -529,7 +529,11 @@ async def on_listing_choice(call: CallbackQuery, session: AsyncSession, **data: 
     if not purchases.listing_renewable(service):
         await call.answer(_why_not_listing(t, service), show_alert=True)
         return
-    text, markup = await purchases.listing_choice(session, service, t, data["ctx"].config.timezone)
+    bundle = await billing.open_bundle_order(session, service.id) if service.status == "approved" else None
+    if bundle is not None and bundle.params.get("listing"):  # with the options chosen with the application
+        text, markup = await purchases.bundle_choice(session, service, bundle, t)
+    else:
+        text, markup = await purchases.listing_choice(session, service, t, data["ctx"].config.timezone)
     await call.answer()
     assert call.message is not None
     await show_screen(call.message, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
@@ -575,3 +579,96 @@ async def on_listing_period(call: CallbackQuery, session: AsyncSession, **data: 
     await call.answer()
     assert call.message is not None
     await send_invoice(call.message, {**data, "session": session}, order)
+
+
+# ---------------------------------------------------------------------------- the options of the application
+@router.callback_query(F.data.regexp(r"^my:\d+:wb$"))
+async def on_bundle(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """The options chosen with the application (with the listing, or alone after a free approval): what they
+    cost and the terms to pay them for."""
+    t: Translator = data["t"]
+    service = await _service(session, call, data["user"].id)
+    if service is None:
+        return
+    order = await billing.open_bundle_order(session, service.id)
+    if order is None:
+        await call.answer(t("bnd.gone"), show_alert=True)
+        return
+    text, markup = await purchases.bundle_choice(session, service, order, t)
+    await call.answer()
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+
+@router.callback_query(F.data.regexp(r"^my:\d+:wb:\d+$"))
+async def on_bundle_period(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """One invoice for the listing and the options (or the options alone) for the chosen term."""
+    t: Translator = data["t"]
+    service = await _service(session, call, data["user"].id)
+    if service is None:
+        return
+    months = int((call.data or "").split(":")[3])
+    prices = await get_settings(session, Prices)
+    if months not in prices.periods:  # a button of an older price list
+        await call.answer(t("lst.gone"), show_alert=True)
+        return
+    if service.status in billing.CLOSED_SERVICE:
+        await call.answer(t("lst.not_now"), show_alert=True)
+        return
+    choice = await bundles.order_for(session, data["user"].id, service, months)
+    order = choice.order
+    notice = purchases.dropped_lines(t, [item.to_json() for item in choice.dropped])
+    assert call.message is not None
+    if order is None:
+        await call.answer(t("bnd.gone"), show_alert=True)
+        if notice:
+            await call.message.answer(notice)
+        return
+    if order.params.get("listing") and service.status != "approved":  # its listing is settled already
+        order.status, order.note = "cancelled", "размещение уже не ждёт оплаты"
+        await call.answer(t("bnd.gone"), show_alert=True)
+        return
+    if notice:  # something was taken out: the owner sees the new sum before paying
+        text, markup = await purchases.bundle_choice(session, service, order, t, notice=notice)
+        await call.answer()
+        await show_screen(call.message, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+        return
+    if not order.amount_cents:  # nothing to pay (a free branch, options at no price): carried out at once
+        now = utcnow()
+        order.status, order.provider, order.paid_at = "paid", "free", now
+        try:
+            await billing.fulfil(session, order, now)
+        except billing.FulfilError as exc:
+            order.status, order.note = "cancelled", str(exc)[:250]
+            await call.answer(str(exc), show_alert=True)
+            return
+        order.status, order.fulfilled_at = "fulfilled", now
+        await session.commit()
+        request_sync(data["ctx"])
+        await call.answer(t("lst.free_done"), show_alert=True)
+        return
+    await call.answer()
+    await send_invoice(call.message, {**data, "session": session}, order)
+
+
+@router.callback_query(F.data.regexp(r"^my:\d+:wbx$"))
+async def on_bundle_none(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """Without the options: the listing alone (while it waits for payment), or nothing more."""
+    t: Translator = data["t"]
+    service = await _service(session, call, data["user"].id)
+    if service is None:
+        return
+    order = await billing.open_bundle_order(session, service.id)
+    if order is not None:
+        order.status, order.note = "cancelled", "владелец отказался от опций"
+        await session.flush()
+    assert call.message is not None
+    if service.status == "approved":
+        text, markup = await purchases.listing_choice(session, service, t, data["ctx"].config.timezone)
+        await call.answer()
+        await show_screen(call.message, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+        return
+    from app.bot.routers.user.my_services import show_card
+
+    await call.answer(t("bnd.declined"))
+    await show_card(call, {**data, "session": session}, service)

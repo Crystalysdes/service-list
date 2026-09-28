@@ -130,13 +130,16 @@ async def card_text(session: AsyncSession, service: Service, t: Translator, tz: 
     return "\n".join(lines)
 
 
-def card_keyboard(service: Service, t: Translator) -> Any:
+def card_keyboard(service: Service, t: Translator, *, options_offer: bool = False) -> Any:
+    """``options_offer``: the options chosen with the application wait to be paid (after a free approval)."""
     builder = InlineKeyboardBuilder()
     sid = service.id
     if service.status == "approved":
         builder.button(text=t("my.btn_pay"), callback_data=f"my:{sid}:pay", style="success")
     elif listing_renewable(service):  # a listing with a term: running, in grace or over
         builder.button(text=t("my.btn_renew"), callback_data=f"my:{sid}:renew", style="success")
+    if options_offer and service.status == "active":
+        builder.button(text=t("my.btn_bundle"), callback_data=f"my:{sid}:wb", style="success")
     if service.status == "active":
         builder.button(text=t("my.btn_top"), callback_data=f"opt:{sid}:top", style="primary")
         builder.button(text=t("my.btn_emoji"), callback_data=f"opt:{sid}:emoji")
@@ -153,7 +156,8 @@ def card_keyboard(service: Service, t: Translator) -> Any:
 async def show_card(target: CallbackQuery | Message, data: dict[str, Any], service: Service) -> None:
     t: Translator = data["t"]
     text = await card_text(data["session"], service, t, data["ctx"].config.timezone)
-    markup = card_keyboard(service, t)
+    offer = await billing.open_bundle_order(data["session"], service.id)
+    markup = card_keyboard(service, t, options_offer=offer is not None and not offer.params.get("listing"))
     if isinstance(target, CallbackQuery) and target.message is not None:
         await target.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
     else:

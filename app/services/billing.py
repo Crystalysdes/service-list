@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext
@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 MONTH = timedelta(days=30)
 LISTING_LOCK = 3  # first key of pg_advisory_xact_lock(int, int): one listing payment at a time per service
-KINDS = ("listing", "top", "emoji", "font")
+KINDS = ("listing", "top", "emoji", "font", "bundle")  # bundle: the listing and options of an application
 OPEN_ORDER = ("created", "invoiced")  # an invoice of an order in any other state must not be paid any more
 CLOSED_SERVICE = ("banned", "removed", "rejected")
 SERVICE_STATE_RU = {
@@ -69,6 +69,25 @@ async def cancel_open_orders(
         where.append(Order.kind == kind)
     rows = await session.execute(
         update(Order).where(*where).values(status="cancelled", note=note[:250]).returning(Order.id)
+    )
+    return len(rows.all())
+
+
+async def cancel_listing_orders(session: AsyncSession, service_id: int, note: str) -> int:
+    """The service's unpaid orders for its listing are closed: a plain listing order and a bundle with the
+    listing in it (only one of them may be paid, the listing must not come twice)."""
+    rows = await session.execute(
+        update(Order)
+        .where(
+            Order.service_id == service_id,
+            Order.status.in_(OPEN_ORDER),
+            or_(
+                Order.kind == "listing",
+                and_(Order.kind == "bundle", Order.params["listing"].as_boolean().is_(True)),
+            ),
+        )
+        .values(status="cancelled", note=note[:250])
+        .returning(Order.id)
     )
     return len(rows.all())
 
@@ -190,7 +209,18 @@ async def active_invoice(
     ).scalar_one_or_none()
 
 
+PART_RU = {
+    "listing": "размещение",
+    "emoji": "премиум-эмодзи",
+    "font": "светящийся ник",
+    "top": "топ-{position}",
+}
+
+
 def order_title(order: Order, service_name: str) -> str:
+    if order.kind == "bundle":
+        parts = [PART_RU[item["kind"]].format(**item) for item in order.params.get("items") or []]
+        return f"Пакет для «{service_name}»: {' + '.join(parts)}, {order.months} мес."
     if order.kind == "listing":
         days = int(order.params.get("days") or 0)
         term = f" на {term_ru(days)}" if days else ""
@@ -429,41 +459,59 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
     ).scalar_one_or_none()
     if service is None:
         raise FulfilError("сервис удалён")
-    notes: list[str] = []
+    if order.kind == "bundle":
+        return await _fulfil_bundle(session, service, order, now)
     if order.kind != "listing" and service.status in CLOSED_SERVICE:
         raise FulfilError(f"сервис {service_state(service)}: опция не выполнена")
     if order.kind == "listing":
-        days = int(order.params.get("days") or 0)  # an order made when listings had no term keeps none
-        refusal = await listing_refusal(session, service, days=days, payer_id=order.user_id)
-        if refusal:
-            raise FulfilError(refusal)
-        prices = await get_settings(session, Prices)
-        was_active = service.status == "active"
-        first_time = service.published_at is None  # a submitted service, never shown before
-        if days:
-            base = listing_base(service, prices.listing_grace_days, now)
-            service.listing_expires_at = base + timedelta(days=days)
-        else:  # listings without a term: paid once, shown until removed
-            service.listing_expires_at = None
-        service.status = "active"
-        service.hidden_reason = None
-        service.published_at = service.published_at or now
-        if not was_active:
-            from app.services.catalog import next_position
+        # an order made when listings had no term keeps none
+        await _fulfil_listing(session, service, order, int(order.params.get("days") or 0), now)
+        return []
+    await _fulfil_feature(session, service, order.kind, order.months, order.params, now)
+    return []
 
-            service.position = await next_position(session, service.category_id)
-            service.publish_notice_at = now  # the owner hears "added" once the post shows it (published.py)
-            order.params = {**(order.params or {}), "came_in": True}
-            if first_time:  # everyone in the bot hears about it (app/services/announce.py)
-                from app.services.announce import enqueue_new_service
 
-                await enqueue_new_service(session, service)
-        await session.flush()
-        return notes
-    duration = MONTH * max(1, order.months)
-    feature = await feature_row(session, service.id, order.kind)
-    if order.kind == "top":
-        position = int(order.params["position"])
+async def _fulfil_listing(
+    session: AsyncSession, service: Service, order: Order, days: int, now: datetime
+) -> None:
+    """The service comes into the channel for ``days`` (0: no term), or its term is extended. FulfilError
+    (nothing changed) when it cannot be."""
+    refusal = await listing_refusal(session, service, days=days, payer_id=order.user_id)
+    if refusal:
+        raise FulfilError(refusal)
+    prices = await get_settings(session, Prices)
+    was_active = service.status == "active"
+    first_time = service.published_at is None  # a submitted service, never shown before
+    if days:
+        base = listing_base(service, prices.listing_grace_days, now)
+        service.listing_expires_at = base + timedelta(days=days)
+    else:  # listings without a term: paid once, shown until removed
+        service.listing_expires_at = None
+    service.status = "active"
+    service.hidden_reason = None
+    service.published_at = service.published_at or now
+    if not was_active:
+        from app.services.catalog import next_position
+
+        service.position = await next_position(session, service.category_id)
+        service.publish_notice_at = now  # the owner hears "added" once the post shows it (published.py)
+        order.params = {**(order.params or {}), "came_in": True}
+        if first_time:  # everyone in the bot hears about it (app/services/announce.py)
+            from app.services.announce import enqueue_new_service
+
+            await enqueue_new_service(session, service)
+    await session.flush()
+
+
+async def _fulfil_feature(
+    session: AsyncSession, service: Service, kind: str, months: int, params: dict[str, Any], now: datetime
+) -> None:
+    """An option for ``months``: started, or extended while it runs. FulfilError when its top position is
+    held by another service."""
+    duration = MONTH * max(1, months)
+    feature = await feature_row(session, service.id, kind)
+    if kind == "top":
+        position = int(params["position"])
         holder = await top_position_holder(session, service.category_id, position)
         if holder is not None and holder.service_id != service.id:
             raise FulfilError(f"топ-{position} уже занят другим сервисом")
@@ -471,7 +519,7 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
         feature = Feature(
             service_id=service.id,
             category_id=service.category_id,
-            kind=order.kind,
+            kind=kind,
             status="active",
             started_at=now,
             expires_at=now + duration,
@@ -489,18 +537,79 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
         feature.status = "active"
         feature.category_id = service.category_id
         feature.source = "order"
-    if order.kind == "top":
-        feature.top_position = int(order.params["position"])
-    elif order.kind == "emoji":
-        feature.params = {"emoji_id": order.params["emoji_id"], "alt": order.params.get("alt", "⭐")}
-    elif order.kind == "font":  # a glowing name: the bot draws it (glownick)
+    if kind == "top":
+        feature.top_position = int(params["position"])
+    elif kind == "emoji":
+        feature.params = {"emoji_id": params["emoji_id"], "alt": params.get("alt", "⭐")}
+    elif kind == "font":  # a glowing name: the bot draws it (glownick)
         from app.services.glownick import glow_params
 
         # an older order for a name of emoji letters (no more) is paid with a glowing name
-        palette = str(order.params.get("glow") or "rainbow")
+        palette = str(params.get("glow") or "rainbow")
         feature.params = glow_params(feature.params, palette, service.name)
     await session.flush()
-    return notes
+
+
+SKIPPED_RU = {
+    "glow_off": "бот сейчас не может рисовать светящиеся ники",
+    "no_room": "в посте ветки нет места",
+    "top_taken": "место занято другим сервисом",
+    "top_moved": "сервис перенесли в другую ветку",
+}
+
+
+async def _fulfil_bundle(session: AsyncSession, service: Service, order: Order, now: datetime) -> list[str]:
+    """The listing first (refused: nothing is done, staff decide), then the options. An option that cannot
+    be carried out any more (its top position taken, no room in the post) is left out: the rest is done, the
+    order is carried out, and ``skipped`` says what to give back (the notes say it to staff)."""
+    from app.services import glow
+    from app.services.glownick import placeholder_glyphs
+    from app.services.options import trial_fits
+
+    items = list(order.params.get("items") or [])
+    listing = next((item for item in items if item["kind"] == "listing"), None)
+    if listing is None and service.status in CLOSED_SERVICE:
+        raise FulfilError(f"сервис {service_state(service)}: опции не выполнены")
+    if listing is not None:
+        await _fulfil_listing(session, service, order, int(listing.get("days") or 0), now)
+    # one at a time per branch: the room in the post, a top position
+    await session.execute(select(func.pg_advisory_xact_lock(service.category_id)))
+    by_kind = {item["kind"]: item for item in items if item["kind"] != "listing"}
+    skipped: list[dict[str, Any]] = []
+
+    def skip(kind: str, why: str) -> None:
+        item = by_kind.pop(kind)
+        skipped.append({**{k: v for k, v in item.items() if k != "full"}, "why": why})
+
+    if "font" in by_kind and not glow.available():
+        skip("font", "glow_off")
+    while "emoji" in by_kind or "font" in by_kind:
+        emoji = by_kind.get("emoji")
+        glyphs = placeholder_glyphs(service.name) if "font" in by_kind else None
+        pair = (str(emoji["emoji_id"]), str(emoji.get("alt") or "⭐")) if emoji else None
+        if await trial_fits(session, service, emoji=pair, glyphs=glyphs):
+            break
+        skip("font" if "font" in by_kind else "emoji", "no_room")
+    top = by_kind.get("top")
+    if top is not None:
+        holder = await top_position_holder(session, service.category_id, int(top["position"]))
+        if order.params.get("category_id") not in (None, service.category_id):
+            skip("top", "top_moved")
+        elif holder is not None and holder.service_id != service.id:
+            skip("top", "top_taken")
+    for kind in ("emoji", "font", "top"):
+        if kind in by_kind:
+            await _fulfil_feature(session, service, kind, order.months, by_kind[kind], now)
+    if not skipped:
+        return []
+    back = sum(int(item.get("cents") or 0) for item in skipped)
+    what = "; ".join(
+        f"{PART_RU[item['kind']].format(**item)} — {SKIPPED_RU.get(item['why'], item['why'])}"
+        for item in skipped
+    )
+    order.params = {**(order.params or {}), "skipped": skipped}
+    order.note = f"не выполнено: {what}. Верните {money(back)}"[:500]
+    return [order.note]
 
 
 async def gift_listing(
@@ -514,7 +623,7 @@ async def gift_listing(
     if refusal:
         raise FulfilError(refusal)
     if service.status != "active" or not days:
-        await cancel_open_orders(session, service.id, "размещение выдано администрацией", kind="listing")
+        await cancel_listing_orders(session, service.id, "размещение выдано администрацией")
     order = Order(
         user_id=service.owner_id or staff_id,
         service_id=service.id,
@@ -538,18 +647,36 @@ async def gift_listing(
 
 async def take_back(session: AsyncSession, order: Order, now: datetime) -> None:
     """A refunded order: the months it paid for come off the option (all of it, if nothing is left), the
-    days of a listing come off its term (the usual grace and hiding follow if it is over)."""
-    if order.kind == "listing":
-        service = await session.get(Service, order.service_id)
-        days = int(order.params.get("days") or 0)
-        if service is not None and days and service.listing_expires_at is not None:
-            service.listing_expires_at -= timedelta(days=days)
+    days of a listing come off its term (the usual grace and hiding follow if it is over); a bundle's
+    parts each (not those it could not carry out)."""
+    if order.kind == "bundle":
+        skipped = {item["kind"] for item in order.params.get("skipped") or []}
+        for item in order.params.get("items") or []:
+            if item["kind"] == "listing":
+                await _take_back_listing(session, order.service_id, int(item.get("days") or 0))
+            elif item["kind"] not in skipped:
+                await _take_back_feature(session, order.service_id, item["kind"], order.months, now)
         return
-    feature = await feature_row(session, order.service_id, order.kind)
+    if order.kind == "listing":
+        await _take_back_listing(session, order.service_id, int(order.params.get("days") or 0))
+        return
+    await _take_back_feature(session, order.service_id, order.kind, order.months, now)
+
+
+async def _take_back_listing(session: AsyncSession, service_id: int, days: int) -> None:
+    service = await session.get(Service, service_id)
+    if service is not None and days and service.listing_expires_at is not None:
+        service.listing_expires_at -= timedelta(days=days)
+
+
+async def _take_back_feature(
+    session: AsyncSession, service_id: int, kind: str, months: int, now: datetime
+) -> None:
+    feature = await feature_row(session, service_id, kind)
     if feature is None or feature.status != "active":
         return
-    if feature.expires_at is not None and order.months:
-        feature.expires_at = feature.expires_at - MONTH * order.months
+    if feature.expires_at is not None and months:
+        feature.expires_at = feature.expires_at - MONTH * months
         if feature.expires_at > now:
             return
     feature.status = "revoked"
@@ -677,6 +804,18 @@ async def paid_total(session: AsyncSession, service_id: int) -> int:
     return int(value or 0)
 
 
+async def open_bundle_order(session: AsyncSession, service_id: int) -> Order | None:
+    """The unpaid order for the listing and the options chosen with the application (or the options alone)."""
+    return (
+        await session.execute(
+            select(Order)
+            .where(Order.service_id == service_id, Order.kind == "bundle", Order.status.in_(OPEN_ORDER))
+            .order_by(Order.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
 async def open_listing_order(session: AsyncSession, service_id: int) -> Order | None:
     return (
         await session.execute(
@@ -710,4 +849,5 @@ async def listing_order(session: AsyncSession, user_id: int, service: Service, m
         and int(order.params.get("days") or 0) == days
     ):
         return order
+    await cancel_listing_orders(session, service.id, "выбран другой срок или размещение без опций")
     return await create_order(session, user_id=user_id, service=service, kind="listing", months=months)

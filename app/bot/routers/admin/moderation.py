@@ -17,13 +17,13 @@ from app.bot.filters import PromptReply, RoleFilter
 from app.bot.i18n import Translator, h
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
-from app.db.models import Category, ModerationRequest, Service, User
+from app.db.models import Category, ModerationRequest, Order, Service, User
 from app.domain.links import LinkError, clean_text, normalize, without_emoji
 from app.services import billing, moderation
 from app.services.catalog import request_sync
 from app.services.escrow.deals import open_deal_count
 from app.services.notify import notify_user
-from app.services.purchases import listing_choice, listing_offer, listing_term
+from app.services.purchases import bundle_choice, dropped_lines, listing_choice, listing_offer, listing_term
 from app.services.settings import Limits, Prices, get_settings
 from app.services.users import get_role, has_role
 
@@ -102,11 +102,16 @@ async def _notify_decision(
         limits = await get_settings(session, Limits)
         t = Translator(user.lang if user else None)
         choice = price = None
-        if approved and request.kind == "new" and follow and not follow.get("published"):
+        bundle = await session.get(Order, follow["bundle_id"]) if follow and follow.get("bundle_id") else None
+        offer = None
+        if bundle is not None:  # the options chosen with the application: one invoice for all of it
+            offer = await bundle_choice(session, service, bundle, t)
+        elif approved and request.kind == "new" and follow and not follow.get("published"):
             _text, choice = await listing_choice(session, service, t, ctx.config.timezone)
             price = await listing_offer(session, service, t)
     name = h(service.name)
     builder = InlineKeyboardBuilder()
+    dropped = dropped_lines(t, (follow or {}).get("dropped") or []) if request.kind == "new" else ""
     if approved:
         if request.kind == "new" and follow and follow.get("published"):
             days = int(follow.get("days") or 0)
@@ -116,7 +121,21 @@ async def _notify_decision(
                 category=h(category.title if category else ""),
                 gift=t("add.gift_term", term=listing_term(t, days)) if days else t("add.gift_forever"),
             )
+            if offer is not None:  # the listing is a gift, the options are paid
+                text += "\n\n" + t("bnd.offer") + "\n\n" + offer[0]
+                await notify_user(ctx, request.user_id, _with(text, dropped), reply_markup=offer[1])
+                return
             builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
+        elif request.kind == "new" and offer is not None:
+            text = t(
+                "add.approved_bundle",
+                name=name,
+                category=h(category.title if category else ""),
+                days=limits.approval_ttl_days,
+            )
+            text += "\n\n" + offer[0]
+            await notify_user(ctx, request.user_id, _with(text, dropped), reply_markup=offer[1])
+            return
         elif request.kind == "new" and follow and choice is not None:
             text = t(
                 "add.approved",
@@ -125,7 +144,7 @@ async def _notify_decision(
                 category=h(category.title if category else ""),
                 days=limits.approval_ttl_days,
             )
-            await notify_user(ctx, request.user_id, text, reply_markup=choice)
+            await notify_user(ctx, request.user_id, _with(text, dropped), reply_markup=choice)
             return
         elif request.kind == "edit":
             text = t("edit.approved", name=name)
@@ -152,7 +171,12 @@ async def _notify_decision(
         else:
             text = t("edit.rejected", name=name, reason=h(reason))
     builder.adjust(1)
-    await notify_user(ctx, request.user_id, text, reply_markup=builder.as_markup())
+    await notify_user(ctx, request.user_id, _with(text, dropped), reply_markup=builder.as_markup())
+
+
+def _with(text: str, dropped: str) -> str:
+    """The approval and, under it, the options that could not be kept."""
+    return f"{text}\n\n{dropped}" if dropped else text
 
 
 @router.callback_query(F.data.startswith("mod:ok:"))

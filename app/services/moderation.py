@@ -16,6 +16,7 @@ from app.bot.i18n import gettext
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import BlacklistEntry, Category, ModerationCard, ModerationRequest, Order, Service, User
+from app.domain.fonts import Glyph
 from app.domain.links import blacklist_keys, check_keys, try_normalize
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
@@ -111,8 +112,15 @@ async def gate_problem(session: AsyncSession, user_id: int, t: Any, *, cooldown:
 
 # ------------------------------------------------------------------------------------------ submit
 async def submit_new(
-    session: AsyncSession, user: User, category: Category, name: str, description: str, url: str
+    session: AsyncSession,
+    user: User,
+    category: Category,
+    name: str,
+    description: str,
+    url: str,
+    options: dict[str, Any] | None = None,
 ) -> tuple[Service, ModerationRequest]:
+    """``options``: the paid options chosen with the application (bundles.Wish), paid with the listing."""
     link = try_normalize(url)
     assert link is not None
     service = Service(
@@ -129,16 +137,17 @@ async def submit_new(
     )
     session.add(service)
     await session.flush()
+    payload: dict[str, Any] = {"name": name, "description": description, "url": link.url}
+    if options:
+        payload["options"] = options
     request = ModerationRequest(
-        kind="new",
-        service_id=service.id,
-        user_id=user.id,
-        payload={"name": name, "description": description, "url": link.url},
-        status="pending",
+        kind="new", service_id=service.id, user_id=user.id, payload=payload, status="pending"
     )
     session.add(request)
     await session.flush()
-    await audit(session, user.id, "request.new", "request", request.id)
+    await audit(
+        session, user.id, "request.new", "request", request.id, {"options": options} if options else None
+    )
     return service, request
 
 
@@ -207,10 +216,16 @@ async def card_fragment(
 
     field("Ветка", category.title if category else "?")
     payload = request.payload or {}
+    wish = None
     if request.kind == "new":
         field("Название", payload.get("name", service.name))
         field("Описание", payload.get("description") or "—")
         field("Ссылка", payload.get("url", service.url))
+        from app.services.bundles import Wish
+
+        wish = Wish.from_json(payload.get("options"))
+        if not wish.empty and category is not None:
+            await _options_line(session, rt, category, wish)
     elif request.kind == "edit":
         field("Сервис", service.name)
         for key, label in (("name", "Название"), ("url", "Ссылка"), ("description", "Описание")):
@@ -249,11 +264,36 @@ async def card_fragment(
         )
     if request.kind in ("new", "edit"):
         tpl = await render_db.templates(session)
-        item = ItemView(name=payload.get("name", service.name), url=payload.get("url", service.url))
+        name = payload.get("name", service.name)
+        item = ItemView(
+            name=name,
+            url=payload.get("url", service.url),
+            emoji=wish.emoji if wish is not None else None,
+            glyphs=[Glyph(None, name)] if wish is not None and wish.glow else None,  # drawn after payment
+        )
         rt.text("\n\nТак будет в канале:\n", "bold")
         rt.text(tpl.item_prefix)
         rt.fragment(render_item(item, tpl))
     return rt.build()
+
+
+async def _options_line(session: AsyncSession, rt: RichText, category: Category, wish: Any) -> None:
+    """The options chosen with a new application and what they cost with the listing for a month."""
+    from app.services import bundles
+
+    rt.text("\nОпции: ", "bold")
+    first = True
+    if wish.emoji is not None:
+        rt.text("эмодзи ").emoji(wish.emoji[0], wish.emoji[1])
+        first = False
+    if wish.glow:
+        rt.text(("" if first else " · ") + f"светящийся ник ({gettext('ru', f'bnd.color_{wish.glow}')})")
+        first = False
+    if wish.top:
+        rt.text(("" if first else " · ") + f"топ-{wish.top}")
+    offer = await bundles.quote(session, category, wish, 1, listing=True)
+    package = f", пакет −{offer.pct}%" if offer.pct else ""
+    rt.text(f" — {billing.money(offer.total)} за месяц вместе с размещением{package}")
 
 
 def card_keyboard(request: ModerationRequest) -> InlineKeyboardMarkup:
@@ -491,6 +531,7 @@ async def approve(
         raise StaleRequest("сервис удалён")
     await check_still_valid(session, request, service)
     if request.kind == "new":
+        from app.services import bundles
         from app.services.options import trial_fits
 
         category = await session.get(Category, service.category_id)
@@ -498,6 +539,16 @@ async def approve(
             raise NoRoom(hidden=True)
         if not await trial_fits(session, service):  # a post over the limits could not be updated at all
             raise NoRoom()
+        # the options chosen with it: what can still be had (the branch may be another one by now)
+        kept, dropped = await bundles.check(
+            session,
+            category,
+            bundles.Wish.from_json((request.payload or {}).get("options")),
+            name=service.name,
+            url=service.url,
+            service_id=service.id,
+            strict=False,
+        )
     request.status = "approved"
     request.moderator_id = moderator_id
     request.decided_at = now
@@ -507,28 +558,37 @@ async def approve(
         service.approved_at = now
         service.approved_by = moderator_id
         prices = await get_settings(session, Prices)
-        order = await billing.create_order(  # one term; the owner may choose a longer one when paying
-            session,
-            user_id=request.user_id,
-            service=service,
-            kind="listing",
-            months=1,
-            amount_cents=0 if free else None,
-            # free: the days staff chose are a gift (one term unless they said otherwise)
-            params={"days": prices.listing_days if days is None else days} if free else None,
-        )
-        if free:
-            order.provider = "free"
-            order.note = "одобрено бесплатно"
-        follow["order_id"] = order.id
-        follow["amount"] = order.amount_cents
-        follow["days"] = int(order.params.get("days") or 0)
-        if order.amount_cents == 0:
-            order.status = "paid"
-            await billing.fulfil(session, order, now)
-            order.status = "fulfilled"
-            order.fulfilled_at = now
-            follow["published"] = True
+        assert category is not None
+        # a listing that costs nothing comes in now; the options chosen with it are paid on their own
+        listing_free = free or not await billing.base_price(session, category, "listing")
+        if listing_free or kept.empty:
+            order = await billing.create_order(  # one term; the owner may choose a longer one when paying
+                session,
+                user_id=request.user_id,
+                service=service,
+                kind="listing",
+                months=1,
+                amount_cents=0 if free else None,
+                # free: the days staff chose are a gift (one term unless they said otherwise)
+                params={"days": prices.listing_days if days is None else days} if free else None,
+            )
+            if free:
+                order.provider = "free"
+                order.note = "одобрено бесплатно"
+            follow["order_id"] = order.id
+            follow["amount"] = order.amount_cents
+            follow["days"] = int(order.params.get("days") or 0)
+            if order.amount_cents == 0:
+                order.status = "paid"
+                await billing.fulfil(session, order, now)
+                order.status = "fulfilled"
+                order.fulfilled_at = now
+                follow["published"] = True
+        if not kept.empty:  # one invoice for the listing and the options (or the options alone)
+            offer = await bundles.quote(session, category, kept, 1, listing=not listing_free)
+            bundle = await bundles.create(session, user_id=request.user_id, service=service, offer=offer)
+            follow["bundle_id"] = bundle.id
+        follow["dropped"] = [item.to_json() for item in dropped]
     elif request.kind == "edit":
         payload = request.payload or {}
         if "name" in payload:
@@ -650,5 +710,11 @@ async def expire_unpaid(ctx: AppContext) -> list[tuple[int, int, str]]:
                 .values(status="expired")
             )
             dropped.append((service.owner_id or 0, service.id, service.name))
+        # the options offered after a free approval and not paid: the offer ends like an unpaid approval
+        await session.execute(
+            update(Order)
+            .where(Order.kind == "bundle", Order.status == "created", Order.created_at < cutoff)
+            .values(status="expired")
+        )
         await session.commit()
     return dropped

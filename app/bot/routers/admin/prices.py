@@ -29,6 +29,10 @@ FIELDS = {
     "emoji": "Цена премиум-эмодзи за месяц в долларах:",
     "font": "Цена светящегося ника за месяц в долларах:",
     "periods": "Периоды в месяцах через пробел, со скидкой через двоеточие. Например: 1 3:5 6:10",
+    "bundle": (
+        "Скидка пакета в процентах (0–90): когда в заявке выбраны и премиум-эмодзи, и светящийся ник, она "
+        "действует на всё — размещение и все опции. 0 — без скидки:"
+    ),
     "reminders": "За сколько дней напоминать об окончании, через пробел (например 3 1):",
     "assets": "Криптовалюты для оплаты через пробел (из USDT, TON, BTC):",
 }
@@ -56,6 +60,8 @@ async def _screen(session: AsyncSession, apirone_ready: bool = False) -> tuple[s
         f"Премиум-эмодзи: {money(prices.emoji_cents)} / мес.",
         f"Светящийся ник: {money(prices.font_cents)} / мес.",
         f"Периоды: {periods}",
+        "Пакет в заявке (эмодзи + светящийся ник): "
+        + (f"−{prices.bundle_discount_pct}% на всё" if prices.bundle_discount_pct else "без скидки"),
         f"Напоминания: за {', '.join(map(str, reminders.days_before))} дн.",
         f"Оплата через CryptoBot: {', '.join(payments.accepted_assets)}",
         "Оплата USDT BEP20 через Apirone (аккаунт гаранта): "
@@ -74,6 +80,7 @@ async def _screen(session: AsyncSession, apirone_ready: bool = False) -> tuple[s
         ("emoji", "Эмодзи"),
         ("font", "Светящийся ник"),
         ("periods", "Периоды и скидки"),
+        ("bundle", "Скидка пакета"),
         ("reminders", "Напоминания"),
         ("assets", "Криптовалюты"),
     ):
@@ -164,6 +171,10 @@ async def input_price(message: Message, data: dict[str, Any], fsm: dict[str, Any
                 raise ValueError
             prices.periods = sorted(set(periods))
             prices.period_discount_pct = discounts
+        elif key == "bundle":
+            prices.bundle_discount_pct = int(raw.rstrip("%").strip())
+            if not 0 <= prices.bundle_discount_pct <= 90:
+                raise ValueError
         elif key == "reminders":
             days = sorted({int(v) for v in raw.split()}, reverse=True)
             if not days or any(d < 0 or d > 30 for d in days):

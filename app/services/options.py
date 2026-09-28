@@ -46,12 +46,12 @@ async def top_slots(
         if holder is not None and (holder.expires_at is None or holder.expires_at > now):
             slot.holder_service_id = holder.service_id
             slot.until = holder.expires_at
-        reserved_orders = await session.execute(
+        reserved_orders = await session.execute(  # an unpaid invoice for the position (a bundle's too)
             select(Order.service_id)
             .join(Invoice, Invoice.order_id == Order.id)
             .join(Service, Service.id == Order.service_id)
             .where(
-                Order.kind == "top",
+                Order.kind.in_(("top", "bundle")),
                 Order.status == "invoiced",
                 Invoice.status == "active",
                 Invoice.expires_at > now,
@@ -116,22 +116,32 @@ async def trial_fits(
     """Render the category as if the option were active and check Telegram limits."""
     category = await session.get(Category, service.category_id)
     assert category is not None
+    line = ItemView(name=service.name, url=service.url, emoji=emoji, glyphs=glyphs, service_id=service.id)
+    return await fits(session, category, line)
+
+
+async def fits(session: AsyncSession, category: Category, candidate: ItemView) -> bool:
+    """The category's post within Telegram's limits with ``candidate``'s line as it would be: the line of its
+    service changed (its emoji or glowing name added), or a new line (a service not listed yet, or one that
+    is not even submitted: ``service_id`` None)."""
     view = await render_db.category_view(session, category)
     replaced = False
     for index, item in enumerate(view.items):
-        if item.service_id == service.id:
+        if candidate.service_id is not None and item.service_id == candidate.service_id:
             view.items[index] = ItemView(
                 name=item.name,
                 url=item.url,
-                emoji=emoji or item.emoji,
-                glyphs=glyphs or item.glyphs,
+                emoji=candidate.emoji or item.emoji,
+                glyphs=candidate.glyphs or item.glyphs,
                 raw=None,
                 name_styles=item.name_styles,
                 service_id=item.service_id,
             )
             replaced = True
     if not replaced:
-        view.items.append(ItemView(name=service.name, url=service.url, emoji=emoji, glyphs=glyphs))
+        view.items.append(
+            ItemView(name=candidate.name, url=candidate.url, emoji=candidate.emoji, glyphs=candidate.glyphs)
+        )
     tpl = await render_db.templates(session)
     fragment = render_category(
         view, tpl, LinkContext(bot_username="x", post_base="https://t.me/x/", posts={"nav": 1})

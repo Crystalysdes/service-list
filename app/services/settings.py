@@ -65,6 +65,8 @@ class Prices(SettingsGroup):
     font_cents: int = 2000
     periods: list[int] = Field(default_factory=lambda: [1, 3, 6])  # months
     period_discount_pct: dict[str, int] = Field(default_factory=dict)  # {"3": 5, "6": 10}
+    # options taken with the application: an emoji and a glowing name together take this much off all of it
+    bundle_discount_pct: int = 15
 
 
 class Limits(SettingsGroup):
