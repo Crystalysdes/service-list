@@ -76,7 +76,7 @@ async def test_new_service_and_new_category_keep_nav_last(tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     travel_text = _posts(tg)[ids["travel"]]["text"]
     assert (
-        travel_text.index("Travel with Coco Jango")
+        travel_text.index("Coco Jango Travel")
         < travel_text.index("New Trip")
         < travel_text.index("занять место")
     )

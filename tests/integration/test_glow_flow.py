@@ -130,6 +130,21 @@ async def test_a_name_in_the_old_lettering_is_drawn_again_without_telling_its_ow
     assert len(tg.called("createNewStickerSet")) == 2
 
 
+async def test_a_name_the_admins_tidied_is_drawn_again_quietly(h, tg, db, ctx):
+    ids, _engine = await _bought(h, tg, db, ctx)
+    await glownick.job(ctx)
+    told = len(tg.bot_messages(USER))
+    async with db.session() as s:  # cut to one line of a phone by migration 0014
+        (await s.get(Service, ids["trip"])).name = "Tripmafia Pro"
+        feature = await s.get(Feature, (await _feature(db, ids["trip"])).id)
+        feature.params = {**feature.params, "glow_quiet": True}
+        await s.commit()
+    await glownick.job(ctx)
+    feature = await _feature(db, ids["trip"])
+    assert feature.params["glow_drawn"][0] == "Tripmafia Pro" and "glow_quiet" not in feature.params
+    assert len(tg.bot_messages(USER)) == told  # the owner is not told «ready»
+
+
 async def test_a_new_name_is_drawn_again_and_the_old_pack_goes_later(h, tg, db, ctx):
     ids, engine = await _bought(h, tg, db, ctx)
     await glownick.job(ctx)

@@ -97,16 +97,56 @@ EMOJI_RANGES = (
 )
 
 
-def _is_emoji(char: str) -> bool:
+def is_emoji(char: str) -> bool:
     code = ord(char)
     return any(low <= code <= high for low, high in EMOJI_RANGES)
 
 
+_is_emoji = is_emoji
+
+
+def is_invisible(char: str) -> bool:
+    """Prints nothing: zero-width and direction marks, fillers that pose as letters, control characters."""
+    return char in FORBIDDEN_CHARS or char in BLANK_CHARS or unicodedata.category(char) in ("Cf", "Cc")
+
+
 def without_emoji(value: str) -> tuple[str, bool]:
     """A service name as its owner may give it: emoji are a paid option, so they are simply dropped (a
-    premium emoji is a plain one in the text too); the spaces they leave are tidied. Also whether any went."""
-    kept = " ".join("".join(char for char in value if not _is_emoji(char)).split())
+    premium emoji is a plain one in the text too) — a space in their place keeps the words apart, and the
+    spaces are tidied. Also whether any went."""
+    kept = " ".join("".join(" " if is_emoji(char) else char for char in value).split())
     return kept, kept != " ".join(value.split())
+
+
+def tidy_name(value: str) -> str:
+    """A service's name as the channel shows it: no emoji and no invisible characters (a space in their
+    place), single spaces, nothing around it. The name as it is when nothing else would be left."""
+    kept = " ".join("".join(" " if is_emoji(c) or is_invisible(c) else c for c in value).split())
+    return kept or " ".join(value.split()) or value
+
+
+NAME_MAX = 20  # a name fits one line of a phone after the arrow, as a glowing name too (8 squares)
+TRIM_TAIL = " |-–—/·,.:;"
+
+
+def shorten_name(value: str, limit: int = NAME_MAX) -> str:
+    """Cut to ``limit`` characters: at the last space when the cut falls inside a word and that loses little,
+    without a separator left hanging at the end."""
+    if len(value) <= limit:
+        return value
+    cut = value[:limit]
+    if not value[limit].isspace():  # inside a word
+        space = cut.rfind(" ")
+        if space >= limit // 2:
+            cut = cut[:space]
+    return cut.rstrip(TRIM_TAIL) or value[:limit].rstrip()
+
+
+def tidy_prefix(prefix: str) -> str:
+    """The start of a service's line as a space, its arrow and a space: the arrows close to the edge, every
+    name the same short distance after them (more room for it on a phone). Any other start stays as it is."""
+    visible = [c for c in prefix if not (c.isspace() or is_invisible(c))]
+    return f" {visible[0]} " if len(visible) == 1 else prefix
 
 
 def clean_text(value: str, *, allow_newlines: bool = False) -> str:

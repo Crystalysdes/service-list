@@ -1,6 +1,16 @@
 import pytest
 
-from app.domain.links import LinkError, blacklist_keys, clean_text, normalize, same_target, without_emoji
+from app.domain.links import (
+    LinkError,
+    blacklist_keys,
+    clean_text,
+    normalize,
+    same_target,
+    shorten_name,
+    tidy_name,
+    tidy_prefix,
+    without_emoji,
+)
 from app.domain.symbols import LinkContext, channel_post_base
 
 
@@ -136,7 +146,26 @@ def test_link_context_resolution():
         ("Temp 20° ™ A→B", "Temp 20° ™ A→B", False),  # symbols that are text stay
         ("⭐️⭐️", "", True),
         ("Plain name", "Plain name", False),
+        ("FRAUD💳ENROLL", "FRAUD ENROLL", True),  # a space keeps the words apart
     ],
 )
 def test_emoji_are_dropped_from_names(typed, kept, dropped):
     assert without_emoji(typed) == (kept, dropped)
+
+
+def test_a_name_as_the_channel_shows_it_and_the_start_of_its_line():
+    assert tidy_name("Ракета 🐾 Rocket 🚀") == "Ракета Rocket"
+    assert tidy_name("\u2800Spike\u200b ") == "Spike"  # a blank filler and a zero-width space
+    assert tidy_name("  Daddy\u00a0 Goose ") == "Daddy Goose"
+    assert tidy_name("🚀") == "🚀"  # nothing else: the name stays as it is
+    assert tidy_prefix("      ↳  ") == " ↳ "  # the arrow at the edge, the name right after it
+    assert tidy_prefix("\u3164\u00a0↳\u2002") == " ↳ "  # fillers and odd spaces: plain ones
+    assert tidy_prefix("• ↳ ") == "• ↳ "  # not a single arrow: left as it is
+
+
+def test_a_name_is_cut_to_one_line_of_a_phone():
+    assert shorten_name("Crystalys") == "Crystalys"
+    assert shorten_name("Ded CC | Buy credit card") == "Ded CC | Buy credit"  # at a space, no «|» left
+    assert shorten_name("Travel with Coco Jango") == "Travel with Coco"
+    assert shorten_name("Supercalifragilisticexpialidocious") == "Supercalifragilistic"  # one long word
+    assert shorten_name("A B C D E F G H I J K L") == "A B C D E F G H I J"

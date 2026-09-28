@@ -41,7 +41,7 @@ from app.db.models import (
 )
 from app.domain.fonts import glyphs_from_json, learn_mapping, reverse_name
 from app.domain.import_plan import PlanInput, build_plan
-from app.domain.links import try_normalize
+from app.domain.links import shorten_name, tidy_name, try_normalize
 from app.domain.parse import ChannelInfo, Snapshot, snapshot_raw
 from app.domain.richtext import Fragment
 from app.services.audit import audit
@@ -443,6 +443,7 @@ async def apply_import(session: AsyncSession, run: ImportRun, actor_id: int | No
             raw = item.get("raw")
             # a name written in emoji letters comes as the plain name the admin typed in
             name = item.get("name") or (Fragment.from_json(raw).text.strip()[:128] if raw else "") or "—"
+            name = shorten_name(tidy_name(name))  # no emoji or invisible characters; one line of a phone
             service = Service(
                 category_id=category.id,
                 name=name[:128],

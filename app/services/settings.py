@@ -74,7 +74,7 @@ class Limits(SettingsGroup):
     max_custom_emoji_per_post: int = 100
     max_user_entities: int = 100
     warn_ratio: float = 0.85
-    max_name_len: int = 40
+    max_name_len: int = 20  # one line of a phone after the arrow (app/domain/links.py NAME_MAX)
     description_min: int = 20
     description_max: int = 1000
     max_pending_per_user: int = 3
@@ -99,7 +99,7 @@ class Reminders(SettingsGroup):
 class Templates(SettingsGroup):
     KEY: ClassVar[str] = "templates"
 
-    item_prefix: str = "      ↳  "
+    item_prefix: str = " ↳ "
     item_sep: str = "\n\n"
     header_sep: str = "\n\n"
     footer_sep: str = "\n\n"

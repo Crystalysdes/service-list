@@ -106,7 +106,7 @@ async def test_submit_approve_pay_publish(h, tg, db, ctx):
 
     await engine.run_once(ids["channel_id"])
     travel = tg.messages[MAIN][ids["travel"]]["text"]
-    assert travel.index("Travel with Coco Jango") < travel.index("Fly Cheap") < travel.index("занять место")
+    assert travel.index("Coco Jango Travel") < travel.index("Fly Cheap") < travel.index("занять место")
     done = h.last(USER)
     assert "🎉 Готово! «Fly Cheap» добавлен в ветку" in done["text"] and "Размещение до" in done["text"]
     assert h.button(done, "Открыть пост")["url"] == f"https://t.me/servicelist/{ids['travel']}"
@@ -170,7 +170,7 @@ async def test_approve_for_free_publishes_without_payment(h, tg, db, ctx):
 
     await engine.run_once(ids["channel_id"])
     travel = tg.messages[MAIN][ids["travel"]]["text"]
-    assert travel.index("Travel with Coco Jango") < travel.index("Fly Cheap") < travel.index("занять место")
+    assert travel.index("Coco Jango Travel") < travel.index("Fly Cheap") < travel.index("занять место")
     added = h.last(USER)
     assert "🎉 Готово! «Fly Cheap» добавлен" in added["text"]
     assert h.button(added, "Открыть пост")["url"] == f"https://t.me/servicelist/{ids['travel']}"

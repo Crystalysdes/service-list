@@ -90,7 +90,10 @@ async def draw(ctx: AppContext, feature_id: int) -> bool:
         drawn = feature.params.get("glow_drawn")
         if drawn == [text, palette, glow.STYLE]:
             return True
-        restyle = isinstance(drawn, list) and drawn[:2] == [text, palette]  # only the letters look new
+        # only the letters look new, or the admins' tidying changed the name: nothing to tell the owner
+        restyle = (isinstance(drawn, list) and drawn[:2] == [text, palette]) or bool(
+            feature.params.get("glow_quiet")
+        )
         service_id, owner_id, name = service.id, service.owner_id, service.name
     if not text:  # nothing the font can draw (only emoji, say): the name shows as plain text
         await _save(
@@ -153,7 +156,7 @@ async def _save(
             return False
         params = dict(feature.params)
         params.update(values)
-        for key in ("glow_fails", "glow_next", "glow_error"):
+        for key in ("glow_fails", "glow_next", "glow_error", "glow_quiet"):
             params.pop(key, None)
         feature.params = params
         await session.commit()

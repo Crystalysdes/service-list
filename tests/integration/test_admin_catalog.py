@@ -55,7 +55,9 @@ async def test_admin_creates_category_and_manages_service(h, tg, db, ctx):
     card = h.last(OWNER_ID)
     await h.press(OWNER_ID, card, "Сервисы")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Добавить сервис")
-    await h.say(OWNER_ID, "Proxy King")
+    await h.say(OWNER_ID, "Proxy King and the Fastest Friends")  # longer than one line of a phone
+    assert "до 20 символов, без эмодзи" in h.last(OWNER_ID)["text"]
+    await h.say(OWNER_ID, "🔥Proxy💎King")  # emoji are a paid option: they go
     await h.say(OWNER_ID, "t.me/proxyking_bot")
     card = h.last(OWNER_ID)
     assert "Proxy King" in card["text"] and "https://t.me/proxyking_bot" in card["text"]

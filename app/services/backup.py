@@ -530,6 +530,10 @@ async def _after_restore(session: AsyncSession, manifest: dict[str, Any] | None 
         if revision.isdigit() and int(revision) < since:
             for statement in sql if isinstance(sql, tuple) else (sql,):
                 await session.execute(text(statement))
+    if revision.isdigit() and int(revision) < 14:  # 0014: names without emoji, lines lined up
+        from app.services.catalog import tidy_names
+
+        await tidy_names(session)
     # the new server must prove premium emoji work again before posts with them are touched
     await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
     from app.services.announce import cancel_unfinished

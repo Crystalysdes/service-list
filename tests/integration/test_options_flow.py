@@ -29,7 +29,7 @@ async def _setup(tg, db, ctx):
         s.add(User(id=USER, username="seller", lang="ru", captcha_passed_at=utcnow()))
         s.add(User(id=OTHER, username="rival", lang="en", captcha_passed_at=utcnow()))
         trip = (await s.execute(select(Service).where(Service.name == "Tripmafia"))).scalar_one()
-        coco = (await s.execute(select(Service).where(Service.name == "Travel with Coco Jango"))).scalar_one()
+        coco = (await s.execute(select(Service).where(Service.name == "Coco Jango Travel"))).scalar_one()
         trip.owner_id = USER
         coco.owner_id = OTHER
         await s.commit()

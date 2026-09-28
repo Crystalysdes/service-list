@@ -12,8 +12,9 @@ from app.domain.render import (
     measure,
     render_category,
     render_nav,
+    tidy_line,
 )
-from app.domain.richtext import Fragment, validate
+from app.domain.richtext import Fragment, RichText, validate
 from app.domain.symbols import LinkContext
 from tests.fixtures.channel import DESIGN, LETTERS, POTION, PREFIX, TRAVEL, category_post, nav_post
 
@@ -228,3 +229,47 @@ def test_updated_intro_on_an_unexpected_text_adds_before_the_links():
     blocks = new.text.split("\n\n")
     assert blocks[0] == "Service List" and blocks[-1] == "Link: t.me/+abc"
     assert blocks[1].startswith("🛡 Auto-garant") and blocks[2].startswith("➕ Хотите добавить")
+
+
+def test_imported_lines_start_right_after_the_arrow_without_emoji():
+    tpl = RenderTemplates(item_prefix=PREFIX)
+    ctx = LinkContext(bot_username="servicelist_bot")
+    spaced = RichText().text("  ").link(" Spike ", "https://t.me/spike").text(" ").build()  # the old channel
+    fancy = (
+        RichText()
+        .link("FRAUD💳ENROLL", "https://t.me/fraud")
+        .text(" ")
+        .emoji("5001", "🧪")
+        .text("\u200b")
+        .link("chat", "https://t.me/fraud_chat")
+        .build()
+    )
+    view = CategoryView(
+        id=1,
+        slug="travel",
+        header=Fragment.plain("Travel"),
+        items=[
+            ItemView(name="Spike", url="https://t.me/spike", raw=spaced),
+            ItemView(name="FRAUD", url="https://t.me/fraud", raw=fancy),
+            ItemView(name="Ракета 🐾 Rocket 🚀", url="https://t.me/rocket"),
+        ],
+    )
+    post = render_category(view, tpl, ctx)
+    lines = [line for line in post.text.split("\n") if line.startswith(PREFIX)]
+    assert lines[:3] == [PREFIX + "Spike", PREFIX + "FRAUD ENROLL chat", PREFIX + "Ракета Rocket"]
+    links = {post.entity_text(e): e.url for e in post.entities if e.type == "text_link"}
+    assert links["Spike"] == "https://t.me/spike" and links["FRAUD ENROLL"] == "https://t.me/fraud"
+    assert links["chat"] == "https://t.me/fraud_chat" and links["Ракета Rocket"] == "https://t.me/rocket"
+    assert not post.custom_emoji_count()
+    assert tidy_line(Fragment.plain("  Sirop  ")) == Fragment.plain("Sirop")
+    # a line longer than one line of a phone: an unfinished note in brackets goes whole
+    long = (
+        RichText()
+        .link("CARD LOYAL PROJECTS", "https://t.me/card")
+        .text(" [Fullz / фуллки]", "italic")
+        .build()
+    )
+    cut = tidy_line(long)
+    assert cut.text == "CARD LOYAL PROJECTS" and [e.type for e in cut.entities] == ["text_link"]
+    kept = RichText().link("ELITE BANK", "https://t.me/elite").text(" [Brute BA]", "italic").build()
+    assert tidy_line(kept) == kept  # short enough: as it is

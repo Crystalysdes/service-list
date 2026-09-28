@@ -77,7 +77,7 @@ TRAVEL = [
     ("plain", "Hannibal Lecter", "https://t.me/hannibal_lecter"),
     ("plain", "LuckyManTravel", "https://t.me/luckymantravel"),
     ("plain", "Tripmafia", "https://t.me/tripmafia"),
-    ("plain", "Travel with Coco Jango", "https://t.me/cocojango"),
+    ("plain", "Coco Jango Travel", "https://t.me/cocojango"),
 ]
 VPN = [
     ("emoji", "LUGER OVPN", "https://t.me/luger_ovpn", FIRE),

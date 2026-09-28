@@ -207,3 +207,68 @@ def test_names_of_emoji_letters_go_and_a_bought_one_becomes_a_glowing_name():
         assert sql("SELECT to_regclass('fonts') IS NOT NULL") == "t"
     finally:
         _psql(f"DROP DATABASE IF EXISTS {NAME}")
+
+
+def test_names_lose_their_emoji_and_the_arrows_move_closer_to_the_edge():
+    """0014: emoji and invisible characters go from the services' names; the start of a line becomes three
+    spaces, its arrow and two spaces."""
+    if not _psql(f"DROP DATABASE IF EXISTS {NAME}") or not _psql(f"CREATE DATABASE {NAME}"):
+        pytest.skip("cannot create a scratch database")
+    url = _admin_url().rsplit("/", 1)[0] + f"/{NAME}"
+
+    def sql(statement: str) -> str:
+        result = subprocess.run(
+            ["psql", url, "-v", "ON_ERROR_STOP=1", "-At", "-c", statement],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        return result.stdout.strip()
+
+    try:
+        assert _alembic("upgrade", "0013").returncode == 0
+        category = sql(
+            "INSERT INTO categories (slug, title, nav_label, header, post_order, nav_order, top_slots, "
+            "updated_at, created_at) VALUES ('enroll', 'Enroll', '#enroll', '{}', 0, 0, 3, now(), now()) "
+            "RETURNING id"
+        ).splitlines()[0]
+        ids = []
+        for name in (
+            "FRAUD💳ENROLL",
+            "Ракета 🐾 Rocket 🚀",
+            "kingenroll.cc",
+            "🚀",
+            "Ded CC | Buy credit card",
+        ):
+            ids.append(
+                sql(
+                    "INSERT INTO services (category_id, name, url, url_kind, position, status, source, "
+                    "link_state, link_dead_streak, updated_at, created_at) VALUES "
+                    f"({category}, '{name}', 'https://t.me/x', 'telegram', 0, 'active', 'import', 'unknown', "
+                    "0, now(), now()) RETURNING id"
+                ).splitlines()[0]
+            )
+        sql(
+            "INSERT INTO features (service_id, category_id, kind, status, started_at, expires_at, params, "
+            f"source, updated_at, created_at) VALUES ({ids[4]}, {category}, 'font', 'active', now(), "
+            """now() + interval '10 days', '{"glyphs": [], "glow": "gold"}', 'order', now(), now())"""
+        )
+        sql(
+            "INSERT INTO settings (key, value, updated_at) VALUES "
+            """('templates', '{"item_prefix": "      ↳  ", "item_sep": "\\n\\n"}', now()), """
+            """('limits', '{"max_name_len": 40, "description_min": 20}', now())"""
+        )
+        assert _alembic("upgrade", "head").returncode == 0
+        names = sql("SELECT name FROM services ORDER BY id").splitlines()
+        assert names == ["FRAUD ENROLL", "Ракета Rocket", "kingenroll.cc", "🚀", "Ded CC | Buy credit"]
+        prefix = sql("SELECT '[' || (value->>'item_prefix') || ']' FROM settings WHERE key = 'templates'")
+        assert prefix == "[ ↳ ]"
+        assert (
+            sql("SELECT value->>'max_name_len', value->>'description_min' FROM settings WHERE key = 'limits'")
+            == "20|20"
+        )
+        assert sql("SELECT params->>'glow_quiet' FROM features") == "true"  # drawn again, its owner not told
+        assert _alembic("downgrade", "0013").returncode == 0  # data only: nothing to undo
+    finally:
+        _psql(f"DROP DATABASE IF EXISTS {NAME}")

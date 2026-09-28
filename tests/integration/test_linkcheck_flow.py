@@ -247,9 +247,9 @@ async def test_claim_by_username_code_and_manual_review(h, tg, db, ctx):
     await h.press(COCO, h.last(COCO), "My services")
     await h.press(COCO, h.last(COCO), "Это мой сервис")
     await h.press(COCO, h.last(COCO), "Travel")
-    await h.press(COCO, h.last(COCO), "Travel with Coco Jango")
+    await h.press(COCO, h.last(COCO), "Coco Jango Travel")
     assert "привязан к вашему аккаунту" in h.last(COCO)["text"]
-    coco = await _service(db, "Travel with Coco Jango")
+    coco = await _service(db, "Coco Jango Travel")
     assert coco.owner_id == COCO
     assert "привязан к @cocojango" in h.last(OWNER_ID)["text"]
 
@@ -287,7 +287,7 @@ async def test_claim_by_username_code_and_manual_review(h, tg, db, ctx):
         # each confirmed owner: everyone in the bot hears about the service (app/services/announce.py)
         claimed = (await s.execute(select(Broadcast.ref_id).where(Broadcast.kind == "claimed"))).scalars()
         names = {(await s.get(Service, ref_id)).name for ref_id in claimed}
-    assert names == {"Travel with Coco Jango", "LuckyManTravel", "Sirop"}
+    assert names == {"Coco Jango Travel", "LuckyManTravel", "Sirop"}
 
     # an owned service cannot be claimed again
     await h.click(OTHER, h.last(OTHER), f"claim:svc:{coco.id}")

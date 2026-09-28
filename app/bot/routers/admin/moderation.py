@@ -18,7 +18,7 @@ from app.bot.i18n import Translator, h
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.db.models import Category, ModerationRequest, Service, User
-from app.domain.links import LinkError, clean_text, normalize
+from app.domain.links import LinkError, clean_text, normalize, without_emoji
 from app.services import billing, moderation
 from app.services.catalog import request_sync
 from app.services.escrow.deals import open_deal_count
@@ -459,8 +459,8 @@ async def on_mod_input(message: Message, state: FSMContext, session: AsyncSessio
     payload = dict(request.payload or {})
     try:
         if purpose == "name":
-            value = clean_text(text)
-            if not value or len(value) > 60:
+            value = clean_text(without_emoji(text)[0])  # emoji before a name are a paid option
+            if not value or len(value) > (await get_settings(session, Limits)).max_name_len:
                 raise LinkError("bad_name")
             payload["name"] = value
             if request.kind == "new":

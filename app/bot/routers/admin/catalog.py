@@ -18,13 +18,13 @@ from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
 from app.db.base import utcnow
 from app.db.models import Category, Service, User
-from app.domain.links import LinkError, clean_text, normalize
+from app.domain.links import LinkError, clean_text, normalize, without_emoji
 from app.domain.richtext import Fragment
 from app.services import billing, catalog
 from app.services.audit import audit
 from app.services.purchases import listing_renewable
 from app.services.render_db import category_services
-from app.services.settings import Prices, get_settings
+from app.services.settings import Limits, Prices, get_settings
 from app.services.sync import own_links
 from app.services.timefmt import fmt_dt
 
@@ -504,14 +504,21 @@ async def on_service_add(call: CallbackQuery, state: FSMContext, **data: Any) ->
     )
 
 
+def _service_name(text: str) -> str:
+    """A service's name as typed by an admin: without emoji (a paid option) and invisible characters."""
+    name, _dropped = without_emoji(text)
+    try:
+        return clean_text(name)
+    except LinkError:
+        return ""
+
+
 @input_handler("svc_add_name")
 async def input_add_name(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
-    try:
-        name = clean_text(message.text or "")
-    except LinkError:
-        name = ""
-    if not name or len(name) > 60:
-        await message.answer("Название — одна строка до 60 символов.")
+    name = _service_name(message.text or "")
+    limit = (await get_settings(data["session"], Limits)).max_name_len
+    if not name or len(name) > limit:
+        await message.answer(f"Название — одна строка до {limit} символов, без эмодзи.")
         return False
     await data["state"].update_data(purpose="svc_add_url", name=name)
     await message.answer("Ссылка на сервис (@username, t.me/… или https://…):")
@@ -740,12 +747,10 @@ async def on_service_move(call: CallbackQuery, session: AsyncSession, **data: An
 
 @input_handler("svc_name")
 async def input_svc_name(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
-    try:
-        name = clean_text(message.text or "")
-    except LinkError:
-        name = ""
-    if not name or len(name) > 60:
-        await message.answer("Название — одна строка до 60 символов.")
+    name = _service_name(message.text or "")
+    limit = (await get_settings(data["session"], Limits)).max_name_len
+    if not name or len(name) > limit:
+        await message.answer(f"Название — одна строка до {limit} символов, без эмодзи.")
         return False
     session: AsyncSession = data["session"]
     service = await session.get(Service, fsm["service_id"])

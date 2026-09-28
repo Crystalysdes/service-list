@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Category, Feature, Service
-from app.domain.links import normalize
+from app.domain.links import NAME_MAX, normalize, shorten_name, tidy_name, tidy_prefix
 from app.domain.parse import make_slug
 from app.domain.richtext import Entity, Fragment
-from app.services.settings import Templates, get_settings
+from app.services.settings import Limits, Templates, get_settings, update_settings
 
 
 def style_fragment(fragment: Fragment, styles: list[str]) -> Fragment:
@@ -25,6 +25,30 @@ def style_fragment(fragment: Fragment, styles: list[str]) -> Fragment:
     extra = tuple(Entity(style, 0, length) for style in styles if style)
     existing = tuple(e for e in fragment.entities if e.type not in styles)
     return Fragment(fragment.text, existing + extra)
+
+
+async def tidy_names(session: AsyncSession) -> None:
+    """Services' names without emoji or invisible characters and on one line of a phone, every line's arrow
+    at the edge (what migration 0014 did, done again to a restored archive made before it)."""
+    changed = set()
+    for service in (await session.execute(select(Service))).scalars():
+        tidy = shorten_name(tidy_name(service.name))
+        if tidy != service.name:
+            service.name = tidy
+            changed.add(service.id)
+    if changed:
+        features = await session.execute(
+            select(Feature).where(Feature.service_id.in_(changed), Feature.kind == "font")
+        )
+        for feature in features.scalars():
+            if (feature.params or {}).get("glow"):  # drawn again with the new name: its owner is not told
+                feature.params = {**feature.params, "glow_quiet": True}
+    templates = await get_settings(session, Templates)
+    if tidy_prefix(templates.item_prefix) != templates.item_prefix:
+        await update_settings(session, Templates, item_prefix=tidy_prefix(templates.item_prefix))
+    limits = await get_settings(session, Limits)
+    if limits.max_name_len > NAME_MAX:
+        await update_settings(session, Limits, max_name_len=NAME_MAX)
 
 
 def request_sync(ctx: AppContext) -> None:

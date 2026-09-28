@@ -243,6 +243,30 @@ class Fragment:
     def without_auto(self) -> Fragment:
         return self.without(AUTO_DETECTED)
 
+    def rewrite(self, change: Callable[[int, str], str]) -> Fragment:
+        """Each character replaced by ``change(index, char)``: itself, another text or nothing. Entities keep
+        covering what became of their characters and go when nothing of them is left."""
+        offsets = u16_offsets(self.text)
+        pieces: list[str] = []
+        moved: list[int] = []  # the new UTF-16 offset of each old character; one more for the end
+        position = 0
+        for index, char in enumerate(self.text):
+            moved.append(position)
+            piece = change(index, char)
+            pieces.append(piece)
+            position += u16len(piece)
+        moved.append(position)
+
+        def at(offset: int) -> int:
+            return moved[min(bisect_left(offsets, offset), len(moved) - 1)]
+
+        entities = []
+        for entity in self.entities:
+            start, end = at(entity.offset), at(entity.end)
+            if end > start:
+                entities.append(replace(entity, offset=start, length=end - start))
+        return Fragment("".join(pieces), tuple(entities))
+
     def as_bot_sees(self) -> Fragment:
         """This text as the Bot API shows it to a bot: a premium emoji inside a link is dropped there (the
         link stays). Only a person's account can put one inside a link (premium_account.py)."""

@@ -8,7 +8,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app.domain.fonts import Glyph
-from app.domain.richtext import AUTO_DETECTED, Entity, Fragment, RichText, u16len
+from app.domain.links import TRIM_TAIL, is_emoji, is_invisible, tidy_name
+from app.domain.richtext import AUTO_DETECTED, Entity, Fragment, RichText, u16_offsets, u16len
 from app.domain.symbols import LinkContext
 
 MAX_TEXT = 4096
@@ -147,6 +148,36 @@ class NavItem:
     key: str  # "cat:5" / "static:2"
 
 
+LINE_MAX = 24  # an imported line (a name and a note after it) fits one line of a phone after the arrow
+
+
+def tidy_line(line: Fragment, limit: int = LINE_MAX) -> Fragment:
+    """An imported service line as the channel shows it: no emoji (premium ones too) or invisible characters,
+    single spaces and nothing before or after the name, so that it starts right after the arrow like every
+    other line; cut to ``limit`` characters (an unfinished «[…]» goes whole) so that it keeps to one line."""
+    offsets = u16_offsets(line.text)
+    spans = [(e.offset, e.end) for e in line.entities if e.type == "custom_emoji"]
+
+    def blank(index: int, char: str) -> bool:
+        return is_emoji(char) or is_invisible(char) or any(s <= offsets[index] < t for s, t in spans)
+
+    spaced = line.without({"custom_emoji"}).rewrite(lambda i, c: " " if blank(i, c) or c.isspace() else c)
+    text = spaced.text
+    tidy = spaced.rewrite(lambda i, c: "" if c == " " and i and text[i - 1] == " " else c).strip()
+    text = tidy.text
+    if len(text) <= limit:
+        return tidy
+    end = limit
+    if text.count("[", 0, end) > text.count("]", 0, end):  # a note in brackets cut short: it goes whole
+        end = text.rfind("[", 0, end)
+    elif not text[end].isspace():  # inside a word: at the last space when that loses little
+        space = text.rfind(" ", 0, end)
+        if space >= limit // 2:
+            end = space
+    end = len(text[:end].rstrip(TRIM_TAIL)) or limit
+    return tidy.slice(0, u16_offsets(text)[end])
+
+
 def render_item(
     item: ItemView, tpl: RenderTemplates, *, plain: bool = False, linked: bool = False
 ) -> Fragment:
@@ -156,7 +187,7 @@ def render_item(
     if item.note:
         return item.raw or Fragment.plain(item.name)
     if item.raw is not None and not item.emoji and not item.glyphs:
-        return item.raw
+        return tidy_line(item.raw)
     rt = RichText()
     if item.emoji:
         rt.emoji(item.emoji[0], item.emoji[1])
@@ -172,7 +203,7 @@ def render_item(
             rt.text(tpl.emoji_name_gap)
             rt.fragment(tpl.marker.map_links(lambda url: item.url if url == "service:url" else url))
     else:
-        rt.link(item.name, item.url, *item.name_styles)
+        rt.link(tidy_name(item.name), item.url, *item.name_styles)
     return rt.build()
 
 
