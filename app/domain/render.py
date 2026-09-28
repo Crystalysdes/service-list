@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -146,9 +147,12 @@ class NavItem:
     key: str  # "cat:5" / "static:2"
 
 
-def render_item(item: ItemView, tpl: RenderTemplates, *, plain: bool = False) -> Fragment:
+def render_item(
+    item: ItemView, tpl: RenderTemplates, *, plain: bool = False, linked: bool = False
+) -> Fragment:
     """A service's line. ``plain``: for a post that goes without premium emoji — a name made of emoji letters
-    (or a glowing one) is written as the name itself, not as the letters' stand-ins."""
+    (or a glowing one) is written as the name itself, not as the letters' stand-ins. ``linked``: the glowing
+    name itself is the link (only the Premium account can send that, when Telegram keeps it), no «[тык.]»."""
     if item.note:
         return item.raw or Fragment.plain(item.name)
     if item.raw is not None and not item.emoji and not item.glyphs:
@@ -158,13 +162,15 @@ def render_item(item: ItemView, tpl: RenderTemplates, *, plain: bool = False) ->
         rt.emoji(item.emoji[0], item.emoji[1])
         rt.text(tpl.emoji_gap)
     if item.glyphs and not plain:
-        for glyph in item.glyphs:
-            if glyph.emoji_id:
-                rt.emoji(glyph.emoji_id, glyph.alt)
-            else:
-                rt.text(glyph.alt)
-        rt.text(tpl.emoji_name_gap)
-        rt.fragment(tpl.marker.map_links(lambda url: item.url if url == "service:url" else url))
+        with rt.wrap("text_link", url=item.url) if linked and item.url else contextlib.nullcontext(rt):
+            for glyph in item.glyphs:
+                if glyph.emoji_id:
+                    rt.emoji(glyph.emoji_id, glyph.alt)
+                else:
+                    rt.text(glyph.alt)
+        if not (linked and item.url):
+            rt.text(tpl.emoji_name_gap)
+            rt.fragment(tpl.marker.map_links(lambda url: item.url if url == "service:url" else url))
     else:
         rt.link(item.name, item.url, *item.name_styles)
     return rt.build()
@@ -196,7 +202,7 @@ def nav_footer(footer: Fragment) -> Fragment:
 
 
 def render_category(
-    view: CategoryView, tpl: RenderTemplates, ctx: LinkContext, *, plain: bool = False
+    view: CategoryView, tpl: RenderTemplates, ctx: LinkContext, *, plain: bool = False, linked: bool = False
 ) -> Fragment:
     rt = RichText()
     rt.fragment(view.header)
@@ -206,7 +212,7 @@ def render_category(
             rt.text(tpl.item_sep)
         if not item.note:
             rt.text(tpl.item_prefix)
-        rt.fragment(render_item(item, tpl, plain=plain))
+        rt.fragment(render_item(item, tpl, plain=plain, linked=linked))
     if view.items:
         rt.text(tpl.item_sep)
     rt.text(tpl.item_prefix)

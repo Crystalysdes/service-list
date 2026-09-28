@@ -5,11 +5,14 @@ once."""
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from sqlalchemy import select
 
-from app.db.models import ChannelPost, StaticPost
-from app.domain.richtext import RichText
-from app.services import emoji_tasks
+from app.db.base import utcnow
+from app.db.models import ChannelPost, Feature, Service, StaticPost
+from app.domain.richtext import Fragment, RichText
+from app.services import emoji_tasks, options
 from app.services import premium_account as pa
 from app.services.sync.engine import PassResult, RateLimiter
 from tests.conftest import OWNER_ID
@@ -217,3 +220,114 @@ async def test_the_admins_see_the_account_and_the_owner_disconnects_it(h, tg, db
     assert _staff(tg, "Аккаунт с Premium отключён от бота")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Назад")
     assert "👤 Аккаунт с Premium: не подключён" in h.last(OWNER_ID)["text"]
+
+
+async def _glow(db, tg, ids) -> None:
+    """A glowing name for «Tripmafia», drawn into the bot's own pack (video emoji)."""
+    tg.add_custom_emoji("7701", "✨", "sl1g1_by_servicelist_bot")
+    tg.add_custom_emoji("7702", "✨", "sl1g1_by_servicelist_bot")
+    async with db.session() as s:
+        trip = await s.get(Service, ids["trip"])
+        s.add(
+            Feature(
+                service_id=trip.id,
+                category_id=trip.category_id,
+                kind="font",
+                status="active",
+                source="order",
+                expires_at=utcnow() + timedelta(days=30),
+                params={
+                    "glow": "neon",
+                    "plain": "Tripmafia",
+                    "font_id": None,
+                    "glyphs": [["7701", "✨"], ["7702", "✨"]],
+                    "glow_set": "sl1g1_by_servicelist_bot",
+                },
+            )
+        )
+        await s.commit()
+
+
+def _bot_view(message: dict) -> dict:
+    """The post as the Bot API shows it to the bot: premium emoji inside a link are dropped there."""
+    fragment = Fragment.from_json({"text": message["text"], "entities": message.get("entities", [])})
+    return {**message, "entities": fragment.as_bot_sees().to_json()["entities"]}
+
+
+def _trip_line(tg, message_id: int) -> tuple[str, Fragment]:
+    post = tg.messages[MAIN][message_id]
+    fragment = Fragment.from_json({"text": post["text"], "entities": post.get("entities", [])})
+    return next(x for x in post["text"].split("\n") if "✨✨" in x), fragment
+
+
+async def test_a_glowing_name_is_its_services_link_when_telegram_keeps_one(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _glow(db, tg, ids)
+    client = connect(ctx, tg)
+    await pa.check(ctx)
+    assert client.probes == [[("7701", "✨")]]  # checked on Telegram with a glowing name's own emoji
+    [told] = _staff(tg, "👤 Аккаунт с Premium")
+    assert "видео (webm) — ✅" in told and "✅ Светящийся ник сам ведёт на сервис" in told
+
+    await engine.run_once(ids["channel_id"])
+    line, fragment = _trip_line(tg, ids["travel"])
+    assert "[тык.]" not in line
+    [link] = [e for e in fragment.entities if e.type == "text_link" and e.url == "https://t.me/tripmafia"]
+    inside = [
+        e.custom_emoji_id
+        for e in fragment.entities
+        if e.type == "custom_emoji" and link.offset <= e.offset and e.end <= link.end
+    ]
+    assert inside == ["7701", "7702"] and fragment.entity_text(link) == "✨✨"
+    # the bot is shown the post without the emoji inside the link: it is still the bot's own post
+    await h.feed({"edited_channel_post": tg._export(_bot_view(tg.messages[MAIN][ids["travel"]]))})
+    assert not _staff(tg, "отредактирован вручную")
+    edits = list(client.edits)
+    await engine.run_once(ids["channel_id"])
+    await pa.check(ctx)  # checked once a day, not on every look
+    assert client.edits == edits and len(client.probes) == 1
+
+
+async def test_without_links_on_video_emoji_the_glowing_name_keeps_its_marker(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _glow(db, tg, ids)
+    tg.add_custom_emoji("9001", "💎", "Gems")
+    async with db.session() as s:
+        await options.add_to_catalog(s, [("9001", "💎", "Gems")])
+        await s.commit()
+    client = connect(ctx, tg, no_links_for={"7701"})  # Telegram drops the link over a video emoji only
+    await pa.check(ctx)
+    assert client.probes == [[("7701", "✨"), ("9001", "💎")]]
+    [told] = _staff(tg, "👤 Аккаунт с Premium")
+    assert "анимированные (tgs) — ✅, видео (webm) — ⛔️" in told
+    assert "Светящийся ник не кликабелен: ссылка — «[тык.]» рядом с ним" in told
+    await engine.run_once(ids["channel_id"])
+    line, fragment = _trip_line(tg, ids["travel"])
+    assert "[тык.]" in line and {"7701", "7702"} <= {e.custom_emoji_id for e in fragment.entities}
+
+    client.no_links_for.clear()  # Telegram keeps them after all: the admins check again
+    await pa.check(ctx, force=True)
+    await engine.run_once(ids["channel_id"])
+    line, _fragment = _trip_line(tg, ids["travel"])
+    assert "[тык.]" not in line
+    assert len(_staff(tg, "✅ Светящийся ник сам ведёт на сервис")) == 1
+
+
+async def test_emoji_taken_out_of_a_link_after_all_bring_the_marker_back(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    await _glow(db, tg, ids)
+    client = connect(ctx, tg)
+    await pa.check(ctx)
+    real_edit = client.edit
+
+    async def drops_emoji_in_links(chat_id, message_id, fragment, preview):
+        return await real_edit(chat_id, message_id, fragment.as_bot_sees(), preview)
+
+    client.edit = drops_emoji_in_links  # Telegram does not keep them there after all
+    await engine.run_once(ids["channel_id"])
+    assert not pa.get(ctx).links_ok
+    assert _staff(tg, "Telegram убрал премиум-эмодзи из ссылки")
+    client.edit = real_edit
+    await engine.run_once(ids["channel_id"])  # the account writes the name with «[тык.]» again
+    line, fragment = _trip_line(tg, ids["travel"])
+    assert "[тык.]" in line and {"7701", "7702"} <= {e.custom_emoji_id for e in fragment.entities}

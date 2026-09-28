@@ -59,6 +59,31 @@ def test_the_posts_formatting_as_the_account_sends_it():
     assert pa.mtproto_entities(Fragment("Coco", (Entity("text_mention", 0, 4, user_id=5),))) is None
 
 
+def test_a_glowing_name_as_its_services_link_and_what_the_bot_is_shown():
+    from app.domain.fonts import Glyph
+    from app.domain.render import ItemView, RenderTemplates, render_item
+
+    item = ItemView(
+        name="Coco",
+        url="https://t.me/coco",
+        emoji=("9001", "💎"),
+        glyphs=[Glyph("11", "✨"), Glyph("12", "✨")],
+    )
+    tpl = RenderTemplates()
+    usual = render_item(item, tpl)
+    assert usual.text.endswith(tpl.marker.text) and "✨✨" in usual.text  # the name, then «[тык.]»
+    linked = render_item(item, tpl, linked=True)
+    assert linked.text == "💎" + tpl.emoji_gap + "✨✨"  # no marker: the name itself leads there
+    [link] = [e for e in linked.entities if e.type == "text_link"]
+    assert link.url == "https://t.me/coco" and linked.entity_text(link) == "✨✨"
+    assert [e.custom_emoji_id for e in linked.entities if e.type == "custom_emoji"] == ["9001", "11", "12"]
+    # the Bot API shows a bot the link without the emoji inside it; the one before the name stays
+    seen = linked.as_bot_sees()
+    assert [e.custom_emoji_id for e in seen.entities if e.type == "custom_emoji"] == ["9001"]
+    assert [e.type for e in seen.entities].count("text_link") == 1
+    assert usual.as_bot_sees() == usual  # nothing inside a link: shown as it is
+
+
 def test_what_telegram_answers_to_the_accounts_edit():
     message = tl.Message(
         id=5,
@@ -82,6 +107,41 @@ def test_what_telegram_answers_to_the_accounts_edit():
 
     client = pa.TelethonClient(pa.AccountData(1, "0" * 32, StringSession().save()))
     assert not client._client.is_connected()
+
+
+async def test_the_check_of_links_over_emoji_reads_what_telegram_kept_and_cleans_up():
+    from telethon.sessions import StringSession
+
+    class Saved:
+        """The account's Saved Messages: Telegram keeps the first emoji inside its link, drops the second."""
+
+        def __init__(self) -> None:
+            self.sent: list = []
+            self.text = ""
+            self.deleted: list = []
+
+        async def send_message(self, peer, text, *, formatting_entities, link_preview, silent):
+            assert peer == "me" and not link_preview and silent
+            self.text, self.sent = text, list(formatting_entities)
+            return SimpleNamespace(id=42)
+
+        async def get_messages(self, peer, ids):
+            first_link, second_link, first_emoji, _second_emoji = self.sent
+            return SimpleNamespace(id=ids, entities=[first_link, second_link, first_emoji])
+
+        async def delete_messages(self, peer, ids, revoke):
+            self.deleted.append((peer, ids, revoke))
+
+    client = pa.TelethonClient(pa.AccountData(1, "0" * 32, StringSession().save()))
+    saved = Saved()
+    client._client = saved
+    assert await client.probe([("7701", "✨"), ("9001", "💎")]) == [True, False]
+    assert saved.text == "Service List: ✨ 💎" and saved.deleted == [("me", [42], True)]
+    links = [e for e in saved.sent if isinstance(e, tl.MessageEntityTextUrl)]
+    emoji = [e for e in saved.sent if isinstance(e, tl.MessageEntityCustomEmoji)]
+    assert (
+        [(e.offset, e.length) for e in links] == [(e.offset, e.length) for e in emoji] == [(14, 1), (16, 2)]
+    )
 
 
 async def _account(tmp_path, **options) -> tuple[pa.PremiumAccount, FakeAccountClient]:

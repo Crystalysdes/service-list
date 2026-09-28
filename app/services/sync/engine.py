@@ -1280,7 +1280,16 @@ class SyncEngine:
                 ):
                     account = None
             emoji_ok = bot_emoji or account is not None
-            if row.state in SETTLED and kept_edits.up_to_date(row.sent_hash, content_hash, emoji_ok):
+            # the account writes each glowing name as its service's link, when Telegram keeps such a link
+            wire = target.fragment
+            if account is not None and block.linked is not None and target.fragment is block.fragment:
+                wire = block.linked if account.links_ok else block.fragment
+            relinked = row.sent_hash == content_hash and row.snapshot not in (None, wire.to_json())
+            if (
+                row.state in SETTLED
+                and kept_edits.up_to_date(row.sent_hash, content_hash, emoji_ok)
+                and not (account is not None and block.linked is not None and relinked)
+            ):
                 if target.manual != row.manual:  # a just kept edit got its data fingerprint
                     row.manual = target.manual
                     await session.commit()
@@ -1288,7 +1297,7 @@ class SyncEngine:
                 return
             plain = block.plain if target.fragment is block.fragment else None
             if account is not None:
-                fragment: Fragment | None = target.fragment
+                fragment: Fragment | None = wire
             else:
                 fragment = await self._gate(
                     session,
@@ -1301,7 +1310,7 @@ class SyncEngine:
                 )
             if fragment is None:
                 return
-            if fragment is block.fragment or fragment is block.plain:  # not an admin's kept edit
+            if fragment is block.fragment or fragment is block.plain or fragment is block.linked:  # not kept
                 report = measure(fragment, await render_db.limits(session))
                 if not report.ok:
                     result.errors.append(f"{kind}:{block_id}: {report.describe()}")
@@ -1392,7 +1401,9 @@ class SyncEngine:
                 return
             if status in ("ok", "unchanged"):
                 row.sent_hash = (
-                    content_hash if fragment is target.fragment else kept_edits.PLAIN + content_hash
+                    content_hash
+                    if fragment is target.fragment or fragment is block.linked
+                    else kept_edits.PLAIN + content_hash
                 )
                 row.snapshot = fragment.to_json()
                 # the channel shows the bot's version again: a manual edit nobody kept is gone
@@ -1582,7 +1593,14 @@ class SyncEngine:
             return "fallback"
         wanted = fragment.custom_emoji_count()
         if edited.custom_emoji is not None and edited.custom_emoji < wanted:
-            if edited.custom_emoji:  # some cannot be used by anyone (their pack deleted?)
+            if fragment.as_bot_sees() != fragment:  # Telegram took them out of the links after all
+                account.links_failed()
+                await self._alert_once(
+                    f"account_links:{chat_id}:{key}",
+                    "⚠️ Telegram убрал премиум-эмодзи из ссылки в посте, который правил аккаунт с Premium: "
+                    "светящиеся ники снова со ссылкой «[тык.]» рядом.",
+                )
+            elif edited.custom_emoji:  # some cannot be used by anyone (their pack deleted?)
                 account.give_up(*gave_up)
                 await self._alert_once(
                     f"account_lost:{chat_id}:{key}:{gave_up[2][:12]}",

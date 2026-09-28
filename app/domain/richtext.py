@@ -243,6 +243,21 @@ class Fragment:
     def without_auto(self) -> Fragment:
         return self.without(AUTO_DETECTED)
 
+    def as_bot_sees(self) -> Fragment:
+        """This text as the Bot API shows it to a bot: a premium emoji inside a link is dropped there (the
+        link stays). Only a person's account can put one inside a link (premium_account.py)."""
+        links = [e for e in self.entities if e.type == "text_link"]
+        if not links:
+            return self
+        return Fragment(
+            self.text,
+            tuple(
+                e
+                for e in self.entities
+                if e.type != "custom_emoji" or not any(k.offset <= e.offset and e.end <= k.end for k in links)
+            ),
+        )
+
     def map_links(self, resolve: Callable[[str], str | None]) -> Fragment:
         """Replace text_link URLs; when ``resolve`` returns None the link entity is dropped."""
         out = []

@@ -31,7 +31,7 @@ from sqlalchemy import select
 from app.bot.i18n import h
 from app.db.base import utcnow
 from app.db.models import Channel
-from app.domain.richtext import AUTO_DETECTED, Fragment
+from app.domain.richtext import AUTO_DETECTED, Fragment, RichText
 from app.services.channels import INACTIVE_STATUSES
 from app.services.notify import notify_staff
 from app.services.redact import add_secrets
@@ -65,6 +65,14 @@ NO_EDIT_RIGHT = "no_edit_right"
 CHAT_PROBLEMS = (NOT_MEMBER, NOT_ADMIN, NO_EDIT_RIGHT)
 POST = "post"  # this post cannot be written by the account (its text, an emoji of a deleted pack...)
 MISSING = "missing"  # the post is not in the channel any more
+
+# kinds of premium emoji, checked for whether Telegram keeps one inside a link (``probe``)
+VIDEO = "video"  # .webm: the glowing names
+ANIMATED = "animated"  # .tgs
+STATIC = "static"
+KIND_TEXT = {VIDEO: "видео (webm)", ANIMATED: "анимированные (tgs)", STATIC: "статичные"}
+PROBE_EVERY = timedelta(hours=24)
+PROBE_URL = "https://t.me/telegram"
 
 CHAT_TEXT = {
     NOT_MEMBER: "аккаунта нет в канале",
@@ -176,6 +184,8 @@ class Client(Protocol):
     async def edit(
         self, chat_id: int, message_id: int, fragment: Fragment, preview: bool | None
     ) -> Edited: ...
+
+    async def probe(self, emoji: list[tuple[str, str]]) -> list[bool]: ...
 
     async def log_out(self) -> None: ...
 
@@ -392,6 +402,50 @@ class TelethonClient:
             raise AccountError(FAILING, _rpc(exc)) from exc
         return edited_from(result, message_id)
 
+    async def probe(self, emoji: list[tuple[str, str]]) -> list[bool]:
+        """Sends to the account's Saved Messages each of ``emoji`` (id, stand-in) inside a link, reads back
+        what Telegram kept and deletes the message: for each, whether the link and the emoji both stayed."""
+        from telethon import errors
+        from telethon.tl import types as tl
+
+        rt = RichText().text("Service List:")
+        spans = []
+        for emoji_id, alt in emoji:
+            rt.text(" ")
+            start = rt.length
+            rt.emoji(emoji_id, alt)
+            spans.append((start, rt.length - start, int(emoji_id)))
+        entities: list[Any] = [tl.MessageEntityTextUrl(o, n, PROBE_URL) for o, n, _ in spans]
+        entities += [tl.MessageEntityCustomEmoji(o, n, d) for o, n, d in spans]
+        try:
+            sent = await self._client.send_message(
+                "me", rt.build().text, formatting_entities=entities, link_preview=False, silent=True
+            )
+            try:
+                got = await self._client.get_messages("me", ids=sent.id)
+            finally:
+                with contextlib.suppress(Exception):
+                    await self._client.delete_messages("me", [sent.id], revoke=True)
+        except (errors.UnauthorizedError, errors.AuthKeyDuplicatedError) as exc:
+            raise AccountError(LOGGED_OUT, _rpc(exc)) from exc
+        except errors.FloodWaitError as exc:
+            raise AccountError(FAILING, _rpc(exc), retry_after=exc.seconds) from exc
+        except errors.RPCError as exc:
+            raise AccountError(FAILING, _rpc(exc)) from exc
+        kept = list(getattr(got, "entities", None) or [])
+        result = []
+        for o, n, document_id in spans:
+            link = any(
+                isinstance(e, tl.MessageEntityTextUrl) and e.offset <= o and o + n <= e.offset + e.length
+                for e in kept
+            )
+            shown = any(
+                isinstance(e, tl.MessageEntityCustomEmoji) and e.offset == o and e.document_id == document_id
+                for e in kept
+            )
+            result.append(link and shown)
+        return result
+
     async def log_out(self) -> None:
         with contextlib.suppress(Exception):
             if not self._client.is_connected():
@@ -404,6 +458,13 @@ class TelethonClient:
 
 
 # ------------------------------------------------------------------------------------------ the account
+@dataclass(frozen=True)
+class ProbeEmoji:
+    emoji_id: str
+    alt: str
+    kind: str  # VIDEO, ANIMATED, STATIC
+
+
 @dataclass(frozen=True)
 class ChatInfo:
     chat_id: int
@@ -434,6 +495,10 @@ class PremiumAccount:
         self.distrust_until: datetime | None = None
         self.failures = 0  # checks in a row that failed
         self.gave_up: set[tuple[int, int, str]] = set()  # (post row, message, content) it could not write
+        # kind of premium emoji -> Telegram keeps one inside a link the account sends (checked on its server)
+        self.links: dict[str, bool] = {}
+        self.links_at: datetime | None = None
+        self.links_key: tuple[str, ...] = ()
         self._lock = asyncio.Lock()
 
     # --- what it can do now
@@ -463,6 +528,16 @@ class PremiumAccount:
     def covers_main(self) -> bool:
         return self.main_chat is not None and self.can_edit(self.main_chat)
 
+    def links_failed(self) -> None:
+        """Telegram took premium emoji out of a link the account sent after all: no links for a day."""
+        self.links = {**self.links, VIDEO: False}
+        self.links_at = utcnow()
+
+    @property
+    def links_ok(self) -> bool:
+        """A glowing name (video emoji) may itself be its service's link: Telegram kept such a link."""
+        return self.links.get(VIDEO) is True
+
     # --- connecting and checking
     async def _drop_client(self, *, log_out: bool = False) -> None:
         client, self.client = self.client, None
@@ -482,6 +557,7 @@ class PremiumAccount:
                 await self._drop_client()
                 self.state, self.data, self.me, self.stamp, self.error = OFF, None, None, None, None
                 self.chats, self.failures = {}, 0
+                self.links, self.links_at, self.links_key = {}, None, ()
                 return
             if stamp != self.stamp:  # connected (again) on the server
                 await self._drop_client()
@@ -489,6 +565,7 @@ class PremiumAccount:
                 self.me, self.chats, self.failures, self.checked_at = None, {}, 0, None
                 self.paused_until = self.distrust_until = None
                 self.gave_up.clear()
+                self.links, self.links_at, self.links_key = {}, None, ()
                 if self.data is None:
                     self.state, self.error = FAILING, "файл аккаунта не читается — подключите его заново"
                     self.failures = FAILING_AFTER
@@ -539,6 +616,38 @@ class PremiumAccount:
             distrusted = self.distrust_until is not None and now < self.distrust_until
             self.state = READY if me.premium and not distrusted else NO_PREMIUM
 
+    def wants_probe(self, now: datetime, *, force: bool = False) -> bool:
+        """Time to check again whether Telegram keeps premium emoji inside links: once a day, every ten
+        minutes while no glowing name could be checked yet (``force``: now)."""
+        if self.state != READY:
+            return False
+        if force or self.links_at is None:
+            return True
+        return now - self.links_at >= (PROBE_EVERY if VIDEO in self.links else CHECK_EVERY)
+
+    async def probe_links(self, probe: list[ProbeEmoji]) -> None:
+        """Whether Telegram keeps a premium emoji of each kind in ``probe`` inside a link the account sends
+        (a message to its Saved Messages, deleted at once)."""
+        async with self._lock:
+            now = utcnow()
+            client = self.client
+            if client is None or self.state != READY:
+                return
+            self.links_at = now  # tried: not again before its time, whatever the answer
+            if not probe:
+                return
+            try:
+                kept = await asyncio.wait_for(
+                    client.probe([(item.emoji_id, item.alt) for item in probe]), TIMEOUT
+                )
+            except Exception as exc:  # checked again later; the glowing names keep «[тык.]» meanwhile
+                log.warning("checking premium emoji inside links failed: %s", type(exc).__name__)
+                return
+            links: dict[str, bool] = {}
+            for item, ok in zip(probe, kept, strict=False):
+                links[item.kind] = links.get(item.kind, True) and ok
+            self.links, self.links_key = links, tuple(item.emoji_id for item in probe)
+
     def _failed(self, exc: AccountError, now: datetime) -> None:
         self.error = exc.detail or None
         if exc.kind == LOGGED_OUT:
@@ -559,6 +668,7 @@ class PremiumAccount:
                 self.path.unlink()
             self.state, self.data, self.me, self.stamp, self.error = OFF, None, None, None, None
             self.chats, self.failures = {}, 0
+            self.links, self.links_at, self.links_key = {}, None, ()
 
     async def close(self) -> None:
         await self._drop_client()
@@ -612,7 +722,7 @@ class PremiumAccount:
             bad = ",".join(
                 f"{chat_id}:{problem}" for chat_id, problem in sorted(self.chats.items()) if problem
             )
-            return f"{READY}:{who}:{bad}"
+            return f"{READY}:{who}:{bad}" + (":links" if self.links_ok else "")
         return f"{self.state}:{who}"
 
     def short(self) -> str:
@@ -657,6 +767,17 @@ class PremiumAccount:
                 lines.append(f"✅ «{title}»: ставит премиум-эмодзи в посты")
             else:
                 lines.append(f"⛔️ «{title}»: {CHAT_TEXT.get(problem, problem)}")
+        if self.links:
+            kinds = ", ".join(
+                f"{KIND_TEXT.get(kind, kind)} — {'✅' if ok else '⛔️'}"
+                for kind, ok in sorted(self.links.items())
+            )
+            lines.append(f"🔗 Ссылка на премиум-эмодзи (проверено в Telegram): {kinds}")
+            lines.append(
+                "✅ Светящийся ник сам ведёт на сервис"
+                if self.links_ok
+                else "Светящийся ник не кликабелен: ссылка — «[тык.]» рядом с ним"
+            )
         return lines
 
 
@@ -692,20 +813,74 @@ async def _chats(ctx: AppContext) -> list[ChatInfo]:
         ]
 
 
+async def _probe_emoji(ctx: AppContext) -> list[ProbeEmoji]:
+    """What the check of links over premium emoji is made with: an emoji of a glowing name (video) and one of
+    the catalog that is not a video, when there are such."""
+    from app.db.models import CustomEmoji, Feature
+    from app.domain.fonts import glyphs_from_json
+
+    async with ctx.db.session() as session:
+        fonts = (
+            await session.execute(
+                select(Feature)
+                .where(Feature.kind == "font", Feature.status == "active")
+                .order_by(Feature.id)
+                .limit(20)
+            )
+        ).scalars()
+        glow = next(
+            (
+                g
+                for font in fonts
+                if (font.params or {}).get("glow")
+                for g in glyphs_from_json(font.params.get("glyphs"))
+                if g.emoji_id
+            ),
+            None,
+        )
+        catalog = list(
+            (
+                await session.execute(
+                    select(CustomEmoji)
+                    .where(CustomEmoji.in_catalog)
+                    .order_by(CustomEmoji.catalog_order)
+                    .limit(10)
+                )
+            ).scalars()
+        )
+    result = [ProbeEmoji(str(glow.emoji_id), glow.alt, VIDEO)] if glow is not None else []
+    if catalog and ctx.bot is not None:
+        try:
+            stickers = await ctx.bot.get_custom_emoji_stickers(custom_emoji_ids=[e.id for e in catalog])
+        except Exception as exc:  # the check goes without it
+            log.warning("custom emoji of the catalog not read: %s", type(exc).__name__)
+            stickers = []
+        alts = {e.id: e.alt for e in catalog}
+        for sticker in stickers:
+            if not sticker.is_video and sticker.custom_emoji_id in alts:
+                kind = ANIMATED if sticker.is_animated else STATIC
+                result.append(ProbeEmoji(sticker.custom_emoji_id, alts[sticker.custom_emoji_id], kind))
+                break
+    return result
+
+
 async def check(ctx: AppContext, *, force: bool = False) -> PremiumAccount | None:
-    """Connects and checks the account (``force``: now); wakes the engine for the channels it can edit now
-    and tells the staff what changed."""
+    """Connects and checks the account (``force``: now); wakes the engine for the channels it can edit now,
+    or whose glowing names become links (or stop being ones), and tells the staff what changed."""
     account = get(ctx)
     if account is None:
         return None
     chats = await _chats(ctx)
     before = {chat.chat_id for chat in chats if account.can_edit(chat.chat_id)}
+    linked = account.links_ok
     await account.refresh(chats, force=force)
+    if account.wants_probe(utcnow(), force=force):
+        await account.probe_links(await _probe_emoji(ctx))
     engine = ctx.get("sync")
     if engine is not None:
         for chat in chats:
-            if chat.chat_id not in before and account.can_edit(chat.chat_id):
-                engine.wake(chat.channel_id)  # its posts get their premium emoji now
+            if account.can_edit(chat.chat_id) and (chat.chat_id not in before or account.links_ok != linked):
+                engine.wake(chat.channel_id)  # its posts get their premium emoji (and links) now
     await announce(ctx, account)
     return account
 

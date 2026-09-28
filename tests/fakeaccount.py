@@ -22,6 +22,9 @@ class FakeAccountClient:
     logged_out: bool = False
     fail: pa.AccountError | None = None  # every call raises this
     problems: dict[int, str] = field(default_factory=dict)  # chat id -> what it is not there
+    keeps_links: bool = True  # Telegram keeps a premium emoji inside a link the account sends
+    no_links_for: set[str] = field(default_factory=set)  # but not these emoji
+    probes: list[list[tuple[str, str]]] = field(default_factory=list)
     edits: list[tuple[int, int]] = field(default_factory=list)
     logouts: int = 0
     closed: int = 0
@@ -68,6 +71,11 @@ class FakeAccountClient:
         self.edits.append((chat_id, message_id))
         emoji = sum(1 for e in entities if e["type"] == "custom_emoji")
         return pa.Edited(emoji, "reply_markup" in message)
+
+    async def probe(self, emoji: list[tuple[str, str]]) -> list[bool]:
+        self._check()
+        self.probes.append(list(emoji))
+        return [self.keeps_links and emoji_id not in self.no_links_for for emoji_id, _ in emoji]
 
     async def log_out(self) -> None:
         self.logouts += 1

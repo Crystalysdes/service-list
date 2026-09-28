@@ -142,7 +142,8 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
     if row is None or row.snapshot is None:
         return
     edited = Fragment.from_message(message)
-    if compare(Fragment.from_json(row.snapshot), edited).equal:
+    # the bot is shown the post without the premium emoji the Premium account put inside links
+    if compare(Fragment.from_json(row.snapshot).as_bot_sees(), edited).equal:
         return
     # the admins putting in the premium emoji the bot could not (a task in the admin chat): no alert
     task = await emoji_tasks.on_edit(data["ctx"], session, row, edited)
