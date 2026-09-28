@@ -4,6 +4,8 @@ could not be carried out."""
 
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import timedelta
 
 import pytest
@@ -372,6 +374,29 @@ async def test_old_buttons_and_second_taps(h, tg, db, ctx):
     assert "из прошлой заявки" in _alert(tg)
     async with db.session() as s:
         assert len((await s.execute(select(ModerationRequest))).scalars().all()) == 1
+
+
+async def test_two_colours_tapped_at_once_show_what_the_application_keeps(h, tg, db, ctx, monkeypatch):
+    """An owner's taps are handled one after another (each update holds the owner's row till it is done): a
+    colour tapped while another is drawn waits for it, so the showcase never shows one colour while the
+    application keeps another."""
+
+    def drawn(name: str, palette: str = "neon") -> bytes:
+        time.sleep(0.3 if palette == "gold" else 0)  # gold, tapped first, takes longer to draw
+        return b"GIF89a" + palette.encode()
+
+    monkeypatch.setattr(glow, "preview_gif", drawn)
+    await _setup(tg, db, ctx)
+    await h.press(USER, await _fill(h), "Добавить светящийся ник")
+    picker = _sc(h)
+    await asyncio.gather(h.click(USER, picker, "add:g:gold"), h.click(USER, picker, "add:g:neon"))
+    shown = _sc(h)
+    palette = tg.files[shown["animation"]["file_id"]].removeprefix(b"GIF89a").decode()
+    assert f"({ {'gold': 'золото', 'neon': 'неон'}[palette] })" in shown["caption"]
+    await h.press(USER, shown, "Отправить на проверку")
+    async with db.session() as s:
+        request = (await s.execute(select(ModerationRequest))).scalar_one()
+    assert request.payload["options"] == {"glow": palette}
 
 
 async def test_the_package_discount_is_set_in_the_prices(h, tg, db, ctx):
