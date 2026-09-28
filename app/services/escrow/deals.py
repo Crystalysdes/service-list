@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Any
 
 from sqlalchemy import func, or_, select, text
@@ -29,6 +30,7 @@ from app.db.models import BlacklistEntry, Deal, DealInvoice, DealPayout, DealRec
 from app.db.session import Database
 from app.services.audit import audit
 from app.services.escrow import money, wallets
+from app.services.escrow.money import USDT, Coin
 from app.services.settings import Escrow, get_settings
 
 UNPAID = ("pending", "awaiting_payment")
@@ -71,6 +73,31 @@ class Draft:
     delivery_days: int
     counterparty: str | None = None  # @username of the other side, when known
     address: str | None = None  # a seller's payout address (not part of the terms)
+    currency: str = USDT.code  # the coin of the deal: ``amount_cents`` is in its units
+
+
+@dataclass(frozen=True)
+class Limits:
+    """The garant's limits (dollars) in units of a coin, at the rate of the moment: the least deal rounded
+    up, the greatest and the admins-only amount down (more deals for admins, never fewer)."""
+
+    low: int
+    high: int
+    admin_only: int | None
+
+
+def limits_for(settings: Escrow, coin: Coin, rate: Decimal) -> Limits:
+    low = coin.usd_to_units(settings.min_cents, rate, ROUND_CEILING)
+    if not coin.stable:  # a deal is at least two payouts' worth: a refund or a part of it must be sendable
+        low = max(low, 2 * coin.min_payout)
+    high = coin.usd_to_units(settings.max_cents, rate, ROUND_FLOOR)
+    admin_only = settings.admin_only_from_cents
+    return Limits(low, high, max(coin.usd_to_units(admin_only, rate, ROUND_FLOOR), 1) if admin_only else None)
+
+
+def usd_to_units(coin: Coin, usd_cents: int, rate: Decimal) -> int:
+    """An amount typed in dollars: the nearest unit of the coin."""
+    return coin.usd_to_units(usd_cents, rate, ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)
@@ -136,8 +163,9 @@ def amounts_of(deal: Deal) -> money.Amounts:
 
 
 def terms_fields(deal: Deal) -> dict[str, Any]:
-    """Everything the sides agree on; "✅ Принять" carries the hash of it."""
+    """Everything the sides agree on; "✅ Принять" carries the hash of it (made once, at creation)."""
     return {
+        "currency": deal.currency,
         "role": deal.creator_role,
         "creator": deal.creator_id,
         "counterparty": deal.counterparty_username,
@@ -267,7 +295,7 @@ def _payout(
     if deal.gateway != GATEWAY:  # the money is in the Crypto Pay app: staff pay it by hand
         payout.status = "failed"
         payout.last_error = LEGACY_NOTE
-    elif amount < money.MIN_PAYOUT_CENTS:  # the network fee would eat it: the owner decides
+    elif amount < money.coin_of(deal).min_payout:  # the network fee would eat it: the owner decides
         payout.status = "failed"
         payout.last_error = "below_min"
     return payout
@@ -329,20 +357,29 @@ async def payouts_of(session: AsyncSession, deal_id: int) -> list[DealPayout]:
     )
 
 
-async def _checked_address(session: AsyncSession, text: str) -> str:
+async def _checked_address(session: AsyncSession, text: str, coin: Coin) -> str:
     from app.services.evm import AddressError
 
     try:
-        return await wallets.check(session, text)
+        return await wallets.check(session, text, coin=coin)
     except AddressError as exc:
         raise DealError(f"address_{exc.code}") from exc
 
 
 # ------------------------------------------------------------------------------------------ before payment
 async def create_deal(
-    db: Database, creator_id: int, creator_username: str | None, draft: Draft, *, now: datetime | None = None
+    db: Database,
+    creator_id: int,
+    creator_username: str | None,
+    draft: Draft,
+    *,
+    rate: Decimal | None = None,
+    now: datetime | None = None,
 ) -> Deal:
+    """A new deal. One in BTC or LTC needs ``rate`` (dollars for one coin, read by the caller): the limits
+    are dollars, and the deal keeps its price in dollars for the reputation."""
     now = now or utcnow()
+    coin = money.coin(draft.currency)
     title, terms = draft.title.strip(), draft.terms.strip()
     _need(draft.role in ROLES, "bad_role")
     _need(draft.fee_payer in money.FEE_PAYERS, "bad_fee_payer")
@@ -356,8 +393,11 @@ async def create_deal(
     async with db.session() as session:
         settings = await get_settings(session, Escrow)
         _need(settings.enabled, "off")
-        _need(draft.amount_cents >= settings.min_cents, "amount_low", min=settings.min_cents)
-        _need(draft.amount_cents <= settings.max_cents, "amount_high", max=settings.max_cents)
+        _need(coin.code in settings.coins, "coin_off")
+        _need(coin.stable or rate is not None, "no_rate")
+        limits = limits_for(settings, coin, rate or Decimal(1))
+        _need(draft.amount_cents >= limits.low, "amount_low", min=limits.low, currency=coin.code)
+        _need(draft.amount_cents <= limits.high, "amount_high", max=limits.high, currency=coin.code)
         _need(draft.delivery_days in settings.delivery_days, "bad_days")
         await _lock_user(session, creator_id)
         await _refuse_banned(session, creator_id)
@@ -375,16 +415,18 @@ async def create_deal(
         try:
             total = money.amounts(draft.amount_cents, settings.fee_bps, draft.fee_payer)
         except money.AmountError as exc:
-            raise DealError("amount_low", min=settings.min_cents) from exc
+            raise DealError("amount_low", min=limits.low, currency=coin.code) from exc
         address = None
         if draft.role == "seller" and draft.address:
-            address = await _checked_address(session, draft.address)
-            await wallets.remember(session, creator_id, address)
+            address = await _checked_address(session, draft.address, coin)
+            await wallets.remember(session, creator_id, address, coin=coin)
         deal = Deal(
             code=new_code(),
             status="pending",
             version=0,
             gateway=GATEWAY,
+            currency=coin.code,
+            usd_cents=None if coin.stable else coin.units_to_usd_cents(total.amount, rate or Decimal(1)),
             seller_address=address,
             creator_id=creator_id,
             creator_role=draft.role,
@@ -403,7 +445,7 @@ async def create_deal(
             pay_hours=settings.pay_hours,
             release_hours=settings.release_hours,
             grace_hours=settings.grace_hours,
-            admin_only_from_cents=settings.admin_only_from_cents or None,
+            admin_only_from_cents=limits.admin_only,
             accept_due_at=now + timedelta(hours=settings.accept_hours),
             data={},
         )
@@ -416,7 +458,13 @@ async def create_deal(
             "deal.create",
             "deal",
             deal.id,
-            {"amount": deal.amount_cents, "role": deal.creator_role, "fee_payer": deal.fee_payer},
+            {
+                "amount": deal.amount_cents,
+                "currency": deal.currency,
+                "rate": str(rate) if rate is not None and not coin.stable else None,
+                "role": deal.creator_role,
+                "fee_payer": deal.fee_payer,
+            },
         )
         await session.commit()
         return deal
@@ -581,7 +629,8 @@ async def set_address(
         role = role_of(deal, user_id)
         _need(role is not None, "not_party")
         _need(deal.gateway == GATEWAY, "state")
-        address = await _checked_address(session, text)
+        coin = money.coin_of(deal)
+        address = await _checked_address(session, text, coin)
         mine = [p for p in await payouts_of(session, deal.id) if p.recipient_id == user_id]
         _need(not any(p.status in ("sending", "unknown") for p in mine), "payout_busy")
         waiting = [p for p in mine if p.status in ("no_address", "pending", "retry", "failed")]
@@ -595,7 +644,7 @@ async def set_address(
                 payout.next_attempt_at = now
                 payout.last_error = None
                 woken.append(payout)
-        await wallets.remember(session, user_id, address)
+        await wallets.remember(session, user_id, address, coin=coin)
         await audit(
             session, user_id, "deal.address", "deal", deal.id, {"role": role, "old": old, "new": address}
         )
@@ -647,6 +696,7 @@ async def take_payments(
         ).scalar_one()
         if deal.gateway != GATEWAY or invoice.address is None:
             return Funding("none", deal)
+        coin = money.coin_of(deal)
         rows = await session.execute(
             select(DealReceipt)
             .where(DealReceipt.invoice_id == invoice.id)
@@ -665,7 +715,7 @@ async def take_payments(
                     invoice_id=invoice.id,
                     txid=key,
                     amount=str(item.amount),
-                    cents=money.from_minor(item.amount),
+                    cents=coin.from_minor(item.amount),
                     confirmed=item.confirmed,
                     source=item.source,
                     raw=item.raw or {},
@@ -682,7 +732,7 @@ async def take_payments(
             invoice.remote_status = remote_status
         await session.flush()
         total = sum(int(row.amount) for row in receipts.values())
-        need = money.to_minor(invoice.amount_cents)
+        need = coin.to_minor(invoice.amount_cents)
         if deal.status == "awaiting_payment" and invoice.status == "active":
             if invoice.remote_status == "completed" and total >= need:
                 return await _fund(session, deal, invoice, list(receipts.values()), total, overpaid, now)
@@ -705,7 +755,7 @@ async def take_payments(
             row.purpose = "review"
         batch = [row for row in batch if row not in doubtful]
         payouts: list[DealPayout] = []
-        cents = money.from_minor(sum(int(row.amount) for row in batch))
+        cents = coin.from_minor(sum(int(row.amount) for row in batch))
         if cents > 0:
             payout = _payout(
                 deal, "extra", deal.buyer_id, cents, now, source_invoice_id=invoice.id, receipt_id=batch[0].id
@@ -714,7 +764,7 @@ async def take_payments(
             await session.flush()
             payouts.append(payout)
         for row in batch:
-            row.purpose = "refund" if cents > 0 else "review"  # less than a cent: not worth a transfer
+            row.purpose = "refund" if cents > 0 else "review"  # less than a unit: not worth a transfer
             row.payout_id = payouts[0].id if payouts else None
         deal.needs_attention = True
         await session.flush()
@@ -740,19 +790,20 @@ async def _fund(
     now: datetime,
 ) -> Funding:
     """The invoice is paid and confirmed: the money is held for the deal; a surplus goes back."""
+    coin = money.coin_of(deal)
     for row in receipts:
         row.confirmed = True
         row.purpose = "deal"
     invoice.status = "paid"
     invoice.disposition = "funded"
     invoice.paid_at = now
-    invoice.received_cents = money.from_minor(total)
+    invoice.received_cents = coin.from_minor(total)
     deal.status = "funded"
     deal.funded_at = now
     deal.deliver_due_at = now + timedelta(days=deal.delivery_days)
-    deal.received_cents = money.from_minor(total)
+    deal.received_cents = coin.from_minor(total)
     payouts: list[DealPayout] = []
-    surplus = money.from_minor(total - money.to_minor(invoice.amount_cents))
+    surplus = coin.from_minor(total - coin.to_minor(invoice.amount_cents))
     if surplus > 0 and overpaid and deal.buyer_id is not None:
         payout = _payout(deal, "extra", deal.buyer_id, surplus, now, source_invoice_id=invoice.id)
         session.add(payout)
@@ -971,7 +1022,7 @@ async def verdict(
         _check_version(deal, version)
         _need(bool(note), "no_reason")
         try:
-            to_seller, to_buyer = money.split(amounts_of(deal), seller_share)
+            to_seller, to_buyer = money.coin_of(deal).split(amounts_of(deal), seller_share)
         except money.AmountError as exc:
             raise DealError("bad_split") from exc
         deal.verdict_by = staff_id

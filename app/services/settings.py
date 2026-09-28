@@ -222,6 +222,16 @@ class Escrow(SettingsGroup):
     max_unpaid_per_user: int = 2
     create_cooldown_sec: int = 60
     admin_only_from_cents: int = 50_000  # verdicts from this amount on are for admins only
+    # the coins a deal may be in; the others are switched on in the garant's settings (their check passed).
+    # The limits above are dollars (cents): a deal in BTC or LTC gets them at the rate of its creation
+    coins: list[str] = Field(default_factory=lambda: ["usdt@bnb"])
+
+    @field_validator("coins")
+    @classmethod
+    def _known_coins(cls, value: list[str]) -> list[str]:
+        from app.services.escrow.money import COINS
+
+        return list(dict.fromkeys(code for code in value if code in COINS))
 
     @property
     def fee_percent(self) -> float:
@@ -247,7 +257,9 @@ class EscrowRuntime(SettingsGroup):
     pause_reason: str | None = None
     paused_at: datetime | None = None
     last_reconcile_at: datetime | None = None
-    last_balance: dict[str, Any] = Field(default_factory=dict)  # cents: available, total and what is owed
+    # USDT in cents: available, total and what is owed; the other coins under "coins" (code → the same, in
+    # their units, with their state: ok / wait / short / unknown)
+    last_balance: dict[str, Any] = Field(default_factory=dict)
     problems: list[str] = Field(default_factory=list)  # what the last check found
     told: list[str] = Field(default_factory=list)  # of those, the passing ones already told to the owner
     # accounts the owner vouched for as creators of deal groups (a service account): a group's creator stays
@@ -256,10 +268,13 @@ class EscrowRuntime(SettingsGroup):
     switched_at: datetime | None = None  # the garant moved from Crypto Pay to Apirone (done once)
     scanned_at: datetime | None = None  # the account's history (of USDT) was read in full up to here
     scanned: dict[str, datetime] = Field(default_factory=dict)  # the same for the other coins: code → moment
+    # money out of the other coins (their deals' payouts, the owner's withdrawals in the cabinet): the same
+    scanned_out: dict[str, datetime] = Field(default_factory=dict)
     restored_backup_at: datetime | None = None  # a restore brought back the state of this moment
     # money that left the account with no payout or withdrawal of the bot behind it (a transfer made by hand,
-    # one made before a restore): [{txid, item, date, amount, addresses, status: open / owner}]; payouts to
-    # the addresses of an open one wait until the owner says what it was
+    # one made before a restore): [{txid, item, date, amount, addresses, status: open / owner, currency}];
+    # payouts of that coin to the addresses of an open one wait until the owner says what it was (no currency:
+    # USDT)
     unknown_payments: list[dict[str, Any]] = Field(default_factory=list)
     withdraw_address: str | None = None  # where the owner's last withdrawal went
 

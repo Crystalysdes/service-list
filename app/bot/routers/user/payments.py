@@ -3,7 +3,6 @@ address)."""
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from aiogram import F, Router
@@ -13,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.i18n import Translator, h
 from app.db.models import Order, Service
-from app.services import apirone_pay, billing
+from app.services import apirone_pay, billing, rates
 from app.services.escrow import money
 from app.services.escrow.money import Coin
 from app.services.purchases import after_paid, option_title
@@ -30,15 +29,6 @@ def _minutes(invoice: Any) -> int:
     if invoice.expires_at is None:
         return 60
     return max(1, int((invoice.expires_at - billing.utcnow()).total_seconds() // 60))
-
-
-def _rate(value: str | None) -> str:
-    """Dollars for one coin: "$63 000", "$83.45"."""
-    try:
-        rate = Decimal(value or "")
-    except InvalidOperation:
-        return "—"
-    return f"${rate:,.0f}".replace(",", " ") if rate >= 1000 else f"${rate:.2f}"
 
 
 async def send_invoice(message: Message, data: dict[str, Any], order: Order) -> None:
@@ -91,7 +81,7 @@ async def send_apirone(message: Message, data: dict[str, Any], order: Order, coi
     if shown is money.USDT:
         text = t("pay.ap_invoice", **common)
     else:
-        rate = _rate(invoice.paid_usd_rate)
+        rate = rates.show_rate(invoice.paid_usd_rate)
         text = t("pay.ap_invoice_coin", network=shown.network, ticker=shown.ticker, rate=rate, **common)
     if apirone_pay.received(invoice):
         text += "\n\n" + t(

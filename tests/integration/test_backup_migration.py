@@ -360,3 +360,38 @@ async def test_an_archive_from_before_apirone_brings_its_deals_back_as_crypto_pa
         assert runtime.restored_backup_at == datetime(
             2026, 9, 1, 10, tzinfo=UTC
         )  # the history is read from here
+
+
+async def test_an_archive_from_before_the_coins_brings_its_deals_back_in_usdt(db):
+    """0018: a deal of an archive made before the coins has no coin of its own: it comes back as USDT's."""
+    from app.db.models import Deal
+    from app.services.backup import _decode_row
+
+    row = {
+        "code": "old",
+        "status": "funded",
+        "gateway": "apirone",
+        "creator_id": 1,
+        "creator_role": "buyer",
+        "buyer_id": 1,
+        "seller_id": 2,
+        "title": "t",
+        "terms": "t",
+        "terms_hash": "h",
+        "amount_cents": 1000,
+        "fee_cents": 50,
+        "buyer_pays_cents": 1050,
+        "seller_gets_cents": 1000,
+        "fee_bps": 500,
+        "fee_payer": "buyer",
+        "delivery_days": 3,
+        "pay_hours": 24,
+        "release_hours": 72,
+        "grace_hours": 24,
+        "created_at": "2026-09-01T10:00:00+00:00",
+        "updated_at": "2026-09-01T10:00:00+00:00",
+    }
+    async with db.engine.begin() as conn:
+        await conn.execute(Deal.__table__.insert(), [_decode_row(Deal.__table__, row)])
+    async with db.session() as s:
+        assert (await s.execute(text("SELECT currency, usd_cents FROM deals"))).one() == ("usdt@bnb", None)

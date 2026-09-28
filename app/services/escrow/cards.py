@@ -14,8 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.i18n import Translator, h
 from app.db.models import Deal, DealPayout, User
+from app.services import rates
 from app.services.escrow import money, wallets
 from app.services.escrow.deals import GATEWAY, HELD, OPEN, role_of
+from app.services.escrow.money import USDT
 from app.services.timefmt import fmt_date, fmt_dt
 
 ROLE_ICONS = {"buyer": "🛒", "seller": "💼"}
@@ -43,8 +45,13 @@ class Reputation:
     disputes: int
 
 
+# a deal's price in dollars (cents): USDT's own, BTC's and LTC's at the rate of their creation
+DOLLARS = case((Deal.currency == USDT.code, Deal.amount_cents), else_=func.coalesce(Deal.usd_cents, 0))
+
+
 async def reputation(session: AsyncSession, user_id: int) -> Reputation:
-    """A user's record as a party: finished deals, different counterparties, turnover and disputes."""
+    """A user's record as a party: finished deals, different counterparties, turnover (in dollars, whatever
+    the coins) and disputes."""
     party = or_(Deal.buyer_id == user_id, Deal.seller_id == user_id)
     other = case((Deal.buyer_id == user_id, Deal.seller_id), else_=Deal.buyer_id)
     row = (
@@ -52,7 +59,7 @@ async def reputation(session: AsyncSession, user_id: int) -> Reputation:
             select(
                 func.count(Deal.id).filter(Deal.status == "completed"),
                 func.count(func.distinct(other)).filter(Deal.status == "completed"),
-                func.coalesce(func.sum(Deal.amount_cents).filter(Deal.status == "completed"), 0),
+                func.coalesce(func.sum(DOLLARS).filter(Deal.status == "completed"), 0),
                 func.count(Deal.id).filter(Deal.disputed_at.is_not(None)),
             ).where(party)
         )
@@ -75,14 +82,22 @@ def who(user: User | None, user_id: int) -> str:
 
 
 def amount_params(deal: Deal) -> dict[str, str]:
+    coin = money.coin_of(deal)
     return {
-        "amount": money.show(deal.amount_cents),
-        "fee": money.show(deal.fee_cents),
+        "amount": coin.show(deal.amount_cents),
+        "fee": coin.show(deal.fee_cents),
         "fee_pct": f"{deal.fee_bps / 100:g}",
-        "buyer_pays": money.show(deal.buyer_pays_cents),
-        "seller_gets": money.show(deal.seller_gets_cents),
-        "refund": money.show(deal.buyer_pays_cents - deal.fee_cents),
+        "buyer_pays": coin.show(deal.buyer_pays_cents),
+        "seller_gets": coin.show(deal.seller_gets_cents),
+        "refund": coin.show(deal.buyer_pays_cents - deal.fee_cents),
     }
+
+
+def usd_line(t: Translator, deal: Deal) -> str | None:
+    """A deal in BTC or LTC: what it was worth in dollars when it was made (it stays in its coin)."""
+    if money.coin_of(deal).stable or deal.usd_cents is None:
+        return None
+    return t("g.card.usd", usd=rates.show_usd(deal.usd_cents))
 
 
 def rules(t: Translator, deal: Deal) -> str:
@@ -90,7 +105,7 @@ def rules(t: Translator, deal: Deal) -> str:
         "g.rules",
         release_hours=deal.release_hours,
         grace_hours=deal.grace_hours,
-        fee=money.show(deal.fee_cents),
+        fee=money.coin_of(deal).show(deal.fee_cents),
     )
 
 
@@ -123,11 +138,15 @@ def _address_line(t: Translator, deal: Deal, viewer: int | None) -> str | None:
     return t("g.card.no_address") if role == "seller" and deal.status in OPEN else None
 
 
-def _payout_line(t: Translator, payout: DealPayout) -> str:
+def _payout_line(t: Translator, payout: DealPayout, coin: money.Coin) -> str:
     role = t(f"g.to.{payout.purpose}")
-    value = money.show(payout.amount_cents)
+    value = coin.show(payout.amount_cents)
     if payout.status in ("done", "manual"):
-        tx = t("g.card.tx", url=wallets.tx_url(payout.txid)) if payout.txid else h(payout.manual_ref or "")
+        tx = (
+            t("g.card.tx", url=wallets.tx_url(payout.txid, coin=coin))
+            if payout.txid
+            else h(payout.manual_ref or "")
+        )
         return t("g.card.payout_sent", role=role, value=value, tx=tx)
     if payout.status == "no_address":
         return t("g.card.payout_address", role=role, value=value)
@@ -154,8 +173,8 @@ def _status_line(t: Translator, deal: Deal, viewer: int | None, users: dict[int,
         "pay_due": fmt_dt(deal.pay_due_at, tz),
         "deliver_due": fmt_dt(deal.deliver_due_at, tz),
         "release_due": fmt_dt(deal.release_due_at, tz),
-        "seller_share": money.show(deal.seller_share_cents or 0),
-        "buyer_share": money.show(deal.buyer_share_cents or 0),
+        "seller_share": money.coin_of(deal).show(deal.seller_share_cents or 0),
+        "buyer_share": money.coin_of(deal).show(deal.buyer_share_cents or 0),
     }
     if s == "pending":
         other = deal.seller_id if deal.creator_role == "buyer" else deal.buyer_id
@@ -206,6 +225,8 @@ def card_text(
         "",
         t("g.card.money", payer=t(f"g.payer.{deal.fee_payer}"), **amount_params(deal)),
     ]
+    if usd := usd_line(t, deal):
+        lines.append(usd)
     if deal.deliver_due_at is not None and deal.status in HELD:
         lines.append(t("g.card.deliver_due", deliver_due=fmt_dt(deal.deliver_due_at, tz)))
     else:
@@ -227,7 +248,7 @@ def card_text(
     if address:
         lines.append(address)
     for payout in payouts:
-        lines.append(_payout_line(t, payout))
+        lines.append(_payout_line(t, payout, money.coin_of(deal)))
     return "\n".join(lines)
 
 
@@ -264,7 +285,7 @@ def card_keyboard(
     elif s == "awaiting_payment":
         if role == "buyer":
             builder.button(
-                text=t("g.btn.pay", value=money.show(deal.buyer_pays_cents)),
+                text=t("g.btn.pay", value=money.coin_of(deal).show(deal.buyer_pays_cents)),
                 callback_data=f"g:pay:{n}",
                 style="success",
             )
@@ -302,13 +323,14 @@ def invitation_text(t: Translator, deal: Deal, users: dict[int, User], rep: Repu
             since=fmt_date(rep.since, tz),
             completed=rep.completed,
             partners=rep.partners,
-            turnover=money.show(rep.turnover),
+            turnover=USDT.show(rep.turnover),  # dollars
             disputes=rep.disputes,
         ),
         "",
         f"<b>{h(deal.title)}</b>",
         f"<blockquote expandable>{h(deal.terms)}</blockquote>",
         t("g.card.money", payer=t(f"g.payer.{deal.fee_payer}"), **amount_params(deal)),
+        *filter(None, [usd_line(t, deal)]),
         t("g.card.days", days=deal.delivery_days),
         t("g.inv.until", accept_due=fmt_dt(deal.accept_due_at, tz)),
         "",
@@ -328,6 +350,7 @@ def preview_text(t: Translator, deal: Deal, users: dict[int, User]) -> str:
         _party_line(t, deal, "seller", users),
         "",
         t("g.card.money", payer=t(f"g.payer.{deal.fee_payer}"), **amount_params(deal)),
+        *filter(None, [usd_line(t, deal)]),
         t("g.card.days", days=deal.delivery_days),
     ]
     if deal.seller_address:  # the creator's own: the other side does not see it
@@ -351,7 +374,7 @@ def list_line(t: Translator, deal: Deal) -> str:
         icon=STATUS_ICONS.get(deal.status, "🛡"),
         n=deal.id,
         title=deal.title[:28],
-        amount=money.show(deal.amount_cents),
+        amount=money.coin_of(deal).show(deal.amount_cents),
     )
 
 

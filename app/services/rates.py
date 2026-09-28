@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from app.context import AppContext
 from app.services.apirone import PROVIDER_ERRORS
@@ -49,3 +49,26 @@ async def usd_rate(ctx: AppContext, coin: Coin) -> Decimal:
         raise RateError(f"{coin.ticker} = ${price}?")
     cache[coin.code] = (price, now)
     return price
+
+
+def show_rate(rate: Decimal | str | None) -> str:
+    """Dollars for one coin: "$63 000", "$83.45" ("—" when it is no number)."""
+    try:
+        value = Decimal(rate if rate is not None else "")
+    except InvalidOperation:
+        return "—"
+    return f"${value:,.0f}".replace(",", " ") if value >= 1000 else f"${value:.2f}"
+
+
+def show_usd(cents: int) -> str:
+    """Cents of the dollar: "$65", "$1 250", "$99.50"."""
+    whole, part = divmod(cents, 100)
+    text = f"{whole:,}".replace(",", " ")
+    return f"${text}.{part:02d}" if part else f"${text}"
+
+
+def parse_usd(text: str) -> int:
+    """Dollars as people type them ("50", "12.5", "$50") → cents; ``AmountError`` when it is none."""
+    from app.services.escrow.money import USDT
+
+    return USDT.parse((text or "").strip().lstrip("$"))

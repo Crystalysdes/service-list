@@ -335,3 +335,66 @@ def test_an_invoice_in_another_coin_keeps_the_schema_from_going_down():
         )
     finally:
         _psql(f"DROP DATABASE IF EXISTS {NAME}")
+
+
+def test_deals_in_other_coins_grow_to_64_bits_and_keep_the_schema_from_going_down():
+    """0018: a deal knows its coin (the old ones are USDT's) and its sums outgrow 32 bits (30 LTC in satoshi).
+    Going down is refused while a deal in BTC or LTC is kept, and goes once there is none."""
+    if not _psql(f"DROP DATABASE IF EXISTS {NAME}") or not _psql(f"CREATE DATABASE {NAME}"):
+        pytest.skip("cannot create a scratch database")
+    url = _admin_url().rsplit("/", 1)[0] + f"/{NAME}"
+
+    def sql(statement: str, *, ok: bool = True) -> str:
+        result = subprocess.run(
+            ["psql", url, "-v", "ON_ERROR_STOP=1", "-At", "-c", statement],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert (result.returncode == 0) == ok, result.stderr[-2000:]
+        return result.stdout.strip()
+
+    deal = (
+        "INSERT INTO deals (code, status, creator_id, creator_role, buyer_id, seller_id, title, terms, "
+        "terms_hash, amount_cents, fee_cents, buyer_pays_cents, seller_gets_cents, fee_bps, fee_payer, "
+        "delivery_days, pay_hours, release_hours, grace_hours, {extra_columns}updated_at, created_at) "
+        "VALUES ('{code}', 'funded', 1, 'buyer', 1, 2, 't', 't', 'h', {amount}, 0, {amount}, {amount}, 0, "
+        "'buyer', 3, 24, 72, 24, {extra_values}now(), now()) RETURNING id"
+    )
+    try:
+        assert _alembic("upgrade", "0017").returncode == 0
+        old = sql(deal.format(code="old", amount=1000, extra_columns="", extra_values="")).splitlines()[0]
+        assert _alembic("upgrade", "head").returncode == 0
+        assert sql(f"SELECT currency, usd_cents IS NULL FROM deals WHERE id = {old}") == "usdt@bnb|t"
+        big = sql(
+            deal.format(
+                code="big",
+                amount=3_000_000_000,
+                extra_columns="currency, usd_cents, ",
+                extra_values="'ltc', 240000, ",
+            )
+        ).splitlines()[0]
+        assert sql(f"SELECT amount_cents FROM deals WHERE id = {big}") == "3000000000"
+        sql(  # a deal of Crypto Pay was never in another coin
+            deal.format(
+                code="bad",
+                amount=1000,
+                extra_columns="gateway, currency, ",
+                extra_values="'cryptopay', 'btc', ",
+            ),
+            ok=False,
+        )
+        refused = _alembic("downgrade", "0017")
+        assert refused.returncode != 0 and "BTC or LTC" in refused.stderr
+        sql(f"DELETE FROM deals WHERE id = {big}")
+        assert _alembic("downgrade", "0017").returncode == 0
+        assert (
+            sql(
+                "SELECT data_type FROM information_schema.columns WHERE table_name = 'deals' "
+                "AND column_name = 'amount_cents'"
+            )
+            == "integer"
+        )
+        assert sql(f"SELECT amount_cents FROM deals WHERE id = {old}") == "1000"
+    finally:
+        _psql(f"DROP DATABASE IF EXISTS {NAME}")

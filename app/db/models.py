@@ -602,7 +602,8 @@ DEAL_STATUSES = (
 
 
 class Deal(TimestampMixin, Base):
-    """An escrow deal. Money in cents of USDT; the settings in force at creation are frozen into it."""
+    """An escrow deal. Money in whole units of its coin (``currency``: cents of USDT, satoshi of BTC and LTC;
+    the columns keep their old names); the settings in force at creation are frozen into it."""
 
     __tablename__ = "deals"
     __table_args__ = (
@@ -637,6 +638,8 @@ class Deal(TimestampMixin, Base):
             name="judge_not_party",
         ),
         CheckConstraint("gateway IN ('cryptopay', 'apirone')", name="gateway_valid"),
+        CheckConstraint("currency IN ('usdt@bnb', 'btc', 'ltc')", name="currency_valid"),
+        CheckConstraint("gateway = 'apirone' OR currency = 'usdt@bnb'", name="currency_gateway"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -652,17 +655,17 @@ class Deal(TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(128))
     terms: Mapped[str] = mapped_column(Text)
     terms_hash: Mapped[str] = mapped_column(String(64))
-    amount_cents: Mapped[int] = mapped_column(Integer)
-    fee_cents: Mapped[int] = mapped_column(Integer)
-    buyer_pays_cents: Mapped[int] = mapped_column(Integer)
-    seller_gets_cents: Mapped[int] = mapped_column(Integer)
+    amount_cents: Mapped[int] = mapped_column(BigInteger)
+    fee_cents: Mapped[int] = mapped_column(BigInteger)
+    buyer_pays_cents: Mapped[int] = mapped_column(BigInteger)
+    seller_gets_cents: Mapped[int] = mapped_column(BigInteger)
     fee_bps: Mapped[int] = mapped_column(Integer)
     fee_payer: Mapped[str] = mapped_column(String(8))
     delivery_days: Mapped[int] = mapped_column(Integer)
     pay_hours: Mapped[int] = mapped_column(Integer)
     release_hours: Mapped[int] = mapped_column(Integer)
     grace_hours: Mapped[int] = mapped_column(Integer)
-    admin_only_from_cents: Mapped[int | None] = mapped_column(Integer)
+    admin_only_from_cents: Mapped[int | None] = mapped_column(BigInteger)
     accept_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pay_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deliver_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -674,8 +677,8 @@ class Deal(TimestampMixin, Base):
     disputed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    received_cents: Mapped[int | None] = mapped_column(Integer)
-    provider_fee_cents: Mapped[int | None] = mapped_column(Integer)
+    received_cents: Mapped[int | None] = mapped_column(BigInteger)
+    provider_fee_cents: Mapped[int | None] = mapped_column(BigInteger)
     release_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     cancel_proposed_by: Mapped[int | None] = mapped_column(BigInteger)
     dispute_by: Mapped[int | None] = mapped_column(BigInteger)
@@ -683,8 +686,8 @@ class Deal(TimestampMixin, Base):
     resolution: Mapped[str | None] = mapped_column(String(16))  # release / auto / mutual / verdict
     verdict_by: Mapped[int | None] = mapped_column(BigInteger)
     verdict_note: Mapped[str | None] = mapped_column(Text)
-    seller_share_cents: Mapped[int | None] = mapped_column(Integer)
-    buyer_share_cents: Mapped[int | None] = mapped_column(Integer)
+    seller_share_cents: Mapped[int | None] = mapped_column(BigInteger)
+    buyer_share_cents: Mapped[int | None] = mapped_column(BigInteger)
     chat_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     chat_status: Mapped[str] = mapped_column(String(12), default="none", server_default=text("'none'"))
     card_message_id: Mapped[int | None] = mapped_column(Integer)
@@ -695,7 +698,11 @@ class Deal(TimestampMixin, Base):
     # where the money of the deal is: "apirone" (every deal since the switch) or "cryptopay" (the ones before;
     # the bot no longer moves their money: staff pay them out of the Crypto Pay app by hand)
     gateway: Mapped[str] = mapped_column(String(12), default="apirone", server_default=text("'apirone'"))
-    # where each side's payout goes (USDT BEP20, EIP-55 form); not part of the terms, changed by its side only
+    # the coin of the deal (Apirone's name): every amount of it is in its units
+    currency: Mapped[str] = mapped_column(String(16), default="usdt@bnb", server_default=text("'usdt@bnb'"))
+    usd_cents: Mapped[int | None] = mapped_column(BigInteger)  # BTC/LTC: the price in dollars at creation
+    # where each side's payout goes (in the deal's coin; USDT in EIP-55 form); not part of the terms, changed
+    # by its side only
     seller_address: Mapped[str | None] = mapped_column(String(64))
     buyer_address: Mapped[str | None] = mapped_column(String(64))
 
@@ -728,14 +735,14 @@ class DealInvoice(TimestampMixin, Base):
     provider_invoice_id: Mapped[str] = mapped_column(String(64), unique=True)
     payload: Mapped[str] = mapped_column(String(64))
     pay_url: Mapped[str | None] = mapped_column(String(512))
-    amount_cents: Mapped[int] = mapped_column(Integer)
+    amount_cents: Mapped[int] = mapped_column(BigInteger)  # units of the deal's coin
     # active (can be paid) / paid (it funded the deal) / closed (the deal ended unpaid) / expired;
     # Crypto Pay's also deleted
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     disposition: Mapped[str | None] = mapped_column(String(12))  # funded / extra / mismatch
     address: Mapped[str | None] = mapped_column(
         String(64), index=True, unique=True
-    )  # Apirone's deposit address, lower-case: one invoice's only
+    )  # Apirone's deposit address (a key: coinaddr.key): one invoice's only
     remote_status: Mapped[str | None] = mapped_column(
         String(16)
     )  # created/partpaid/paid/overpaid/completed/expired
@@ -743,7 +750,7 @@ class DealInvoice(TimestampMixin, Base):
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paid_amount: Mapped[str | None] = mapped_column(String(32))
     fee_amount: Mapped[str | None] = mapped_column(String(32))
-    received_cents: Mapped[int | None] = mapped_column(Integer)
+    received_cents: Mapped[int | None] = mapped_column(BigInteger)
     raw: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
 
 
@@ -762,8 +769,8 @@ class DealReceipt(TimestampMixin, Base):
     deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id", ondelete="RESTRICT"), index=True)
     invoice_id: Mapped[int] = mapped_column(ForeignKey("deal_invoices.id", ondelete="RESTRICT"), index=True)
     txid: Mapped[str] = mapped_column(String(128))
-    amount: Mapped[str] = mapped_column(String(40))  # minor units (10**-18 USDT) as digits: beyond 64 bits
-    cents: Mapped[int] = mapped_column(Integer)  # the amount rounded down to a cent
+    amount: Mapped[str] = mapped_column(String(40))  # minor units of the coin as digits: beyond 64 bits
+    cents: Mapped[int] = mapped_column(BigInteger)  # the amount rounded down to a unit of the coin
     confirmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     # deal (it paid for the deal) / refund (goes back to the buyer by payout_id) / review (the owner decides)
     purpose: Mapped[str | None] = mapped_column(String(8))
@@ -799,7 +806,7 @@ class DealPayout(TimestampMixin, Base):
     purpose: Mapped[str] = mapped_column(String(8))  # seller / buyer / extra
     source_invoice_id: Mapped[int | None] = mapped_column(ForeignKey("deal_invoices.id", ondelete="RESTRICT"))
     recipient_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    amount_cents: Mapped[int] = mapped_column(Integer)
+    amount_cents: Mapped[int] = mapped_column(BigInteger)  # units of the deal's coin
     # pending / sending / done / retry / failed / unknown / manual / no_address
     status: Mapped[str] = mapped_column(String(16), default="pending")
     spend_id: Mapped[str] = mapped_column(String(64), unique=True)  # the payout's own name (esc-{code}-...)
@@ -808,7 +815,7 @@ class DealPayout(TimestampMixin, Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     transfer_id: Mapped[str | None] = mapped_column(String(128))
-    address: Mapped[str | None] = mapped_column(String(64), index=True)  # fixed when claimed, lower-case
+    address: Mapped[str | None] = mapped_column(String(64), index=True)  # fixed when claimed (a key)
     txid: Mapped[str | None] = mapped_column(String(128))
     fee_minor: Mapped[str | None] = mapped_column(String(40))  # the fees taken out of it, minor units
     doubt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # its outcome became unknown
@@ -840,7 +847,7 @@ class EscrowWithdrawal(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[int] = mapped_column(BigInteger)
     address: Mapped[str] = mapped_column(String(64))  # lower-case
-    amount_cents: Mapped[int] = mapped_column(Integer)
+    amount_cents: Mapped[int] = mapped_column(Integer)  # cents of USDT: the bot withdraws USDT only
     status: Mapped[str] = mapped_column(String(12), default="sending")  # sending / unknown / done / failed
     transfer_id: Mapped[str | None] = mapped_column(String(128))
     txid: Mapped[str | None] = mapped_column(String(128))

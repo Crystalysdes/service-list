@@ -1,4 +1,5 @@
-"""The owner takes the garant's income (its fees) off the Apirone account.
+"""The owner takes the garant's income (its fees) off the Apirone account: USDT only (the income in BTC and
+LTC the owner takes in Apirone's cabinet; the bot shows how much of it is free).
 
 What may go is the account's balance less everything the garant owes and everything whose outcome is not
 known yet, read again under the money lock right before the transfer. One withdrawal at a time; its
@@ -17,11 +18,13 @@ from sqlalchemy import select, update
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import EscrowWithdrawal
+from app.services import coinaddr
 from app.services.apirone import PROVIDER_ERRORS, ApironeError, outcome_unknown
 from app.services.audit import audit
-from app.services.escrow import ledger, money, wallets
+from app.services.escrow import ledger, wallets
 from app.services.escrow.deals import DealError, txid_key
-from app.services.evm import AddressError, checksummed
+from app.services.escrow.money import USDT
+from app.services.evm import AddressError
 from app.services.redact import describe
 from app.services.settings import EscrowRuntime, get_settings, update_settings
 
@@ -71,11 +74,11 @@ async def withdraw(
             if await in_flight(session) is not None:
                 raise DealError("busy")
             try:
-                shown = await wallets.check(session, address)
+                shown = await wallets.check(session, address, coin=USDT)
             except AddressError as exc:
                 raise DealError(f"address_{exc.code}") from exc
-            low = shown.lower()
-            if low in await ledger.busy_addresses(session):
+            low = coinaddr.key(shown)
+            if low in await ledger.busy_addresses(session, coin=USDT):
                 raise DealError("busy")
         ok, numbers = await ledger.check_balance(ctx, now=now)
         free = await ledger.withdrawable(ctx, numbers) if ok is not None else None
@@ -93,7 +96,7 @@ async def withdraw(
             await session.commit()
             row_id = row.id
         try:
-            transfer = await pay.transfer(low, money.to_minor(cents))
+            transfer = await pay.transfer(low, USDT.to_minor(cents))
         except Exception as exc:
             if outcome_unknown(exc):
                 log.warning("escrow withdrawal %s: outcome unknown (%s)", row_id, describe(exc))
@@ -153,7 +156,7 @@ async def settle(ctx: AppContext, pay: Any, *, now: datetime | None = None) -> l
             m
             for m in moved
             if row.address in m.addresses
-            and ledger.fits(m.amount, row.amount_cents)
+            and ledger.fits(m.amount, row.amount_cents, coin=USDT)
             and m.after(row.claimed_at)
         ]
         if len(fitting) == 1:
@@ -185,4 +188,4 @@ async def settle(ctx: AppContext, pay: Any, *, now: datetime | None = None) -> l
 
 
 def shown_address(row: EscrowWithdrawal) -> str:
-    return checksummed(row.address)
+    return coinaddr.shown(USDT.code, row.address)

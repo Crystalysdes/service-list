@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot.i18n import h
 from app.context import AppContext
 from app.db.models import Deal, DealChat, User
+from app.services import coinaddr
 from app.services.escrow import cards, chats
 from app.services.escrow.notify import to_staff, translator_for
 
@@ -29,9 +30,16 @@ router = Router(name="escrow_chat")
 
 PAYMENT_LINK = re.compile(
     r"(?i)(t\.me/(cryptobot|cryptotestnetbot|send|wallet)\b|telegram\.me/(cryptobot|send|wallet)\b|"
-    r"crypt\.bot|app\.send\.tg|\?start=(cq|iv)\w+|apirone\.com/(invoice|pay|checkout)|pay\.apirone\.)"
+    r"crypt\.bot|app\.send\.tg|\?start=(cq|iv)\w+|apirone\.com/(invoice|pay|checkout)|pay\.apirone\.|"
+    r"\b(bitcoin|litecoin):)"
 )
-WALLET_ADDRESS = re.compile(r"(?i)\b0x[0-9a-f]{40}\b")
+
+
+def names_a_wallet(text: str) -> bool:
+    """A wallet's address of a coin of the garant (USDT BEP20, BTC, LTC), checked with its checksum."""
+    return bool(coinaddr.find_any(text))
+
+
 SERVICE_KEYS = (
     "new_chat_members",
     "left_chat_member",
@@ -201,7 +209,7 @@ async def on_message(message: Message, pool: DealChat, session: AsyncSession, **
             data=_media(message),
             tg_date=message.date,
         )
-        if WALLET_ADDRESS.search(message.text or message.caption or "") and role in ("buyer", "seller"):
+        if names_a_wallet(message.text or message.caption or "") and role in ("buyer", "seller"):
             t = await translator_for(ctx, deal.creator_id)
             with contextlib.suppress(TelegramAPIError):
                 await message.reply(t("g.chat.address_warning"))

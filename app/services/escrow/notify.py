@@ -34,17 +34,24 @@ def address_buttons(t: Translator, deal_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+# events whose words name USDT BEP20 or its speed: a deal in another coin gets ``<key>_coin`` (its network)
+COIN_TEXTS = frozenset({"verdict", "funded_seller", "need_address", "confirming"})
+
+
 def params(ctx: AppContext, deal: Deal) -> dict[str, Any]:
     """What deal texts may use: number, title, sums and deadlines."""
     tz = ctx.config.timezone
+    coin = money.coin_of(deal)
     return {
         "n": deal.id,
         "title": h(deal.title),
-        "amount": money.show(deal.amount_cents),
-        "buyer_pays": money.show(deal.buyer_pays_cents),
-        "seller_gets": money.show(deal.seller_gets_cents),
-        "refund": money.show(deal.buyer_pays_cents - deal.fee_cents),
-        "fee": money.show(deal.fee_cents),
+        "amount": coin.show(deal.amount_cents),
+        "buyer_pays": coin.show(deal.buyer_pays_cents),
+        "seller_gets": coin.show(deal.seller_gets_cents),
+        "refund": coin.show(deal.buyer_pays_cents - deal.fee_cents),
+        "fee": coin.show(deal.fee_cents),
+        "ticker": coin.ticker,
+        "network": coin.network,
         "deliver_due": fmt_dt(deal.deliver_due_at, tz),
         "release_due": fmt_dt(deal.release_due_at, tz),
         "pay_due": fmt_dt(deal.pay_due_at, tz),
@@ -65,6 +72,8 @@ async def tell(
     if not user_id:
         return False
     t = await translator_for(ctx, user_id)
+    if key in COIN_TEXTS and money.coin_of(deal) is not money.USDT:  # names the network of the money
+        key = f"{key}_coin"
     text = t(f"g.ev.{key}", **{**params(ctx, deal), **extra})  # what the event says wins over the deal's
     markup = address_buttons(t, deal.id) if ask_address else deal_button(t, deal.id)
     return await notify_user(ctx, user_id, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
@@ -85,7 +94,9 @@ async def tell_once(
     return first and await tell(ctx, user_id, deal, key, **extra)
 
 
-async def alert_owner(ctx: AppContext, text: str, *, once: str | None = None) -> None:
+async def alert_owner(
+    ctx: AppContext, text: str, *, once: str | None = None, reply_markup: Any = None
+) -> None:
     """Money problems go straight to the owners' private chats (``once``: a key that is told only once)."""
     if once is not None:
         async with ctx.db.session() as session:
@@ -94,7 +105,13 @@ async def alert_owner(ctx: AppContext, text: str, *, once: str | None = None) ->
         if not first:
             return
     for owner_id in ctx.config.owner_ids:
-        await notify_user(ctx, owner_id, "🛡 <b>Гарант</b>\n" + text, link_preview_options=NO_PREVIEW)
+        await notify_user(
+            ctx,
+            owner_id,
+            "🛡 <b>Гарант</b>\n" + text,
+            reply_markup=reply_markup,
+            link_preview_options=NO_PREVIEW,
+        )
 
 
 async def to_staff(ctx: AppContext, text: str, reply_markup: Any = None) -> list[Message]:
@@ -121,7 +138,7 @@ async def dispute_alert(ctx: AppContext, deal: Deal, *, reason_only: bool = Fals
         text = f"Причина спора по сделке #{deal.id} от {by}:\n<blockquote>{reason}</blockquote>"
     else:
         text = (
-            f"⚠️ <b>Спор по сделке #{deal.id}</b> · {money.show(deal.amount_cents)}\n"
+            f"⚠️ <b>Спор по сделке #{deal.id}</b> · {money.coin_of(deal).show(deal.amount_cents)}\n"
             f"«{h(deal.title)}»\nОткрыл: {by}"
         )
     builder = InlineKeyboardBuilder()

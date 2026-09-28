@@ -14,11 +14,11 @@ from sqlalchemy import select
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Deal, DealPayout
+from app.services import coinaddr
 from app.services.escrow import deals, invoices, money, payouts, wallets
 from app.services.escrow.deals import DealError, Funding
 from app.services.escrow.notify import alert_owner, dispute_alert, tell, tell_both, tell_once, to_staff
 from app.services.escrow.payouts import Sent
-from app.services.evm import checksummed
 
 log = logging.getLogger(__name__)
 
@@ -30,17 +30,18 @@ ADDRESS_REMINDERS = 7  # days a side waiting for its money is reminded to give a
 async def on_funding(ctx: AppContext, result: Funding, *, seen_by: int | None = None) -> None:
     """Tell the sides what money at an invoice did (``seen_by`` sees it on screen already)."""
     deal = result.deal
+    coin = money.coin_of(deal)
     if result.outcome == "funded":
         if deal.buyer_id != seen_by:
             await tell(ctx, deal.buyer_id, deal, "funded_buyer")
         if deal.seller_id != seen_by:
             await tell(ctx, deal.seller_id, deal, "funded_seller", ask_address=not deal.seller_address)
         for payout in result.payouts:
-            await tell(ctx, deal.buyer_id, deal, "surplus", back=money.show(payout.amount_cents))
+            await tell(ctx, deal.buyer_id, deal, "surplus", back=coin.show(payout.amount_cents))
         if deal.needs_attention and not result.payouts:
             await alert_owner(
                 ctx,
-                f"Сделка #{deal.id} оплачена с излишком ({money.show_minor(result.received)}), но Apirone не "
+                f"Сделка #{deal.id} оплачена с излишком ({coin.show_minor(result.received)}), но Apirone не "
                 "отметил переплату — излишек не возвращён, проверьте поступления в карточке сделки.",
                 once=f"esc:over:{deal.id}",
             )
@@ -55,13 +56,13 @@ async def on_funding(ctx: AppContext, result: Funding, *, seen_by: int | None = 
                 deal.buyer_id,
                 deal,
                 "extra_payment",
-                back=money.show(payout.amount_cents),
+                back=coin.show(payout.amount_cents),
                 ask_address=not deal.buyer_address,
             )
             await alert_owner(
                 ctx,
                 f"Платёж по сделке #{deal.id}, который к ней уже не подходит: "
-                f"{money.show(payout.amount_cents)} вернутся покупателю.",
+                f"{coin.show(payout.amount_cents)} вернутся покупателю.",
             )
         return
     if result.outcome == "partial" and result.fresh:
@@ -71,8 +72,8 @@ async def on_funding(ctx: AppContext, result: Funding, *, seen_by: int | None = 
             deal.buyer_id,
             deal,
             "partial",
-            got=money.show_minor(result.received),
-            missing=money.show_minor(result.missing),
+            got=coin.show_minor(result.received),
+            missing=coin.show_minor(result.missing),
         )
     elif result.outcome == "confirming" and result.fresh:
         await tell_once(ctx, f"esc:conf:{deal.id}", deal.buyer_id, deal, "confirming")
@@ -80,21 +81,27 @@ async def on_funding(ctx: AppContext, result: Funding, *, seen_by: int | None = 
         await alert_owner(
             ctx,
             f"⚠️ По сделке #{deal.id} поступления не сходятся со счётом Apirone "
-            f"(видно {money.show_minor(result.received)}) — проверьте карточку сделки.",
+            f"(видно {coin.show_minor(result.received)}) — проверьте карточку сделки.",
             once=f"esc:mismatch:{deal.id}:{result.received}",
         )
 
 
-def _payout_params(payout: DealPayout) -> dict[str, str]:
-    minor = money.to_minor(payout.amount_cents)
+def _payout_params(payout: DealPayout, deal: Deal) -> dict[str, str]:
+    coin = money.coin_of(deal)
+    minor = coin.to_minor(payout.amount_cents)
     fee = int(payout.fee_minor) if payout.fee_minor and payout.fee_minor.isdigit() else None
-    link = f'<a href="{wallets.tx_url(payout.txid)}">{payout.txid[:10]}…</a>' if payout.txid else "—"
+    shown_tx = payout.txid.removeprefix("0x") if payout.txid and coin is not money.USDT else payout.txid
+    link = (
+        f'<a href="{wallets.tx_url(payout.txid, coin=coin)}">{(shown_tx or "")[:10]}…</a>'
+        if payout.txid
+        else "—"
+    )
     return {
-        "value": money.show(payout.amount_cents),
-        "fee": money.show_minor(fee) if fee is not None else "—",
-        "net": money.show_minor(minor - fee) if fee is not None else money.show(payout.amount_cents),
+        "value": coin.show(payout.amount_cents),
+        "fee": coin.show_minor(fee) if fee is not None else "—",
+        "net": coin.show_minor(minor - fee) if fee is not None else coin.show(payout.amount_cents),
         "tx": link,
-        "address": checksummed(payout.address) if payout.address else "—",
+        "address": coinaddr.shown(coin.code, payout.address) if payout.address else "—",
     }
 
 
@@ -105,8 +112,9 @@ async def on_payouts(ctx: AppContext, results: list[Sent]) -> None:
             deal = await deals.get_deal(session, payout.deal_id)
         if deal is None:
             continue
+        coin = money.coin_of(deal)
         if sent.outcome in ("done", "found"):
-            await tell(ctx, payout.recipient_id, deal, "paid_out", **_payout_params(payout))
+            await tell(ctx, payout.recipient_id, deal, "paid_out", **_payout_params(payout, deal))
         elif sent.outcome == "address":
             await tell_once(
                 ctx,
@@ -114,7 +122,7 @@ async def on_payouts(ctx: AppContext, results: list[Sent]) -> None:
                 payout.recipient_id,
                 deal,
                 "need_address",
-                value=money.show(payout.amount_cents),
+                value=coin.show(payout.amount_cents),
                 ask_address=True,
             )
         elif sent.outcome == "address_rejected":
@@ -123,7 +131,7 @@ async def on_payouts(ctx: AppContext, results: list[Sent]) -> None:
                 payout.recipient_id,
                 deal,
                 "address_rejected",
-                value=money.show(payout.amount_cents),
+                value=coin.show(payout.amount_cents),
                 ask_address=True,
             )
         if sent.closed is not None:
@@ -168,7 +176,7 @@ async def _address_reminders(ctx: AppContext, now: datetime) -> None:
                 payout.recipient_id,
                 deal,
                 "need_address",
-                value=money.show(payout.amount_cents),
+                value=money.coin_of(deal).show(payout.amount_cents),
                 ask_address=True,
             )
     for deal in unset:

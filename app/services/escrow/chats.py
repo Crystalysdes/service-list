@@ -31,7 +31,7 @@ from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Deal, DealChat, DealEvent, User
 from app.services.audit import audit
-from app.services.escrow import cards, deals
+from app.services.escrow import cards, deals, money
 from app.services.escrow.deals import HELD, SETTLED, role_of
 from app.services.escrow.notify import alert_owner, to_staff, translator_for
 from app.services.notify import notify_user
@@ -499,7 +499,7 @@ async def transcript(session: AsyncSession, deal: Deal, tz: str) -> bytes:
     lines = [
         f"Сделка #{deal.id} «{deal.title}» — переписка в чате сделки",
         f"Покупатель: ID {deal.buyer_id}   Продавец: ID {deal.seller_id}",
-        f"Сумма: {deal.amount_cents / 100:.2f} USDT   Статус: {deal.status}",
+        f"Сумма: {money.coin_of(deal).show(deal.amount_cents)}   Статус: {deal.status}",
         "",
     ]
     for event in events:

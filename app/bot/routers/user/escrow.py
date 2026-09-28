@@ -5,6 +5,8 @@ of a deal up to its end. The buttons only offer what a side may do; the deal che
 from __future__ import annotations
 
 import logging
+import re
+from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
 
@@ -21,9 +23,10 @@ from app.bot.states import DealAddress, DealDispute, DealWizard
 from app.context import AppContext
 from app.db.models import Deal, DealInvoice, DealReceipt
 from app.domain.links import LinkError, clean_text
-from app.services import evm
+from app.services import coinaddr, evm, rates
 from app.services.escrow import cards, deals, invoices, money, wallets
 from app.services.escrow.deals import OPEN, DealError, Draft
+from app.services.escrow.money import USDT, Coin
 from app.services.escrow.notify import dispute_alert, tell, translator_for
 from app.services.escrow.sweep import on_funding
 from app.services.notify import notify_user
@@ -38,13 +41,29 @@ router.callback_query.filter(F.message.chat.type == "private")
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 TITLE_MIN, TERMS_MIN = 3, 10
 FEE_PAYERS = ("buyer", "seller", "split")
+COIN_ICONS = {"usdt": "🪙", "btc": "₿", "ltc": "Ł"}
+EXAMPLES = {"btc": "0.0015", "ltc": "0.75"}  # an amount in the coin, for the wizard's hint
+_DOLLARS_RE = re.compile(
+    r"^\s*(\$\s*(?P<a>[\d.,\s]+)|(?P<b>[\d.,\s]+?)\s*(\$|usd|долл\w*))\s*$", re.IGNORECASE
+)
 
 
 def error_text(t: Translator, exc: DealError) -> str:
     params = dict(exc.params)
     if exc.key in ("amount_low", "amount_high"):
-        params = {k: money.show(v) for k, v in params.items()}
+        coin = money.coin(params.pop("currency", None))
+        params = {k: coin.show(v) for k, v in params.items()}
     return t(f"g.err.{exc.key}", **params)
+
+
+def deal_coins(settings: Escrow) -> list[Coin]:
+    """The coins a new deal may be in (USDT when the settings name none)."""
+    return [money.coin(code) for code in settings.coins] or [USDT]
+
+
+def coin_texts(t: Translator, coin: Coin) -> dict[str, str]:
+    """What the texts of a coin other than USDT say about it: its ticker, network and addresses."""
+    return {"ticker": coin.ticker, "network": coin.network, "starts": t(f"g.addr.starts_{coin.key}")}
 
 
 def _id(call: CallbackQuery, index: int = 2) -> int:
@@ -71,7 +90,11 @@ async def home_parts(session: AsyncSession, t: Translator, user_id: int) -> tupl
         )
         or 0
     )
-    text = t("g.home", fee=f"{settings.fee_percent:g}")
+    coins = deal_coins(settings)
+    if coins == [USDT]:
+        text = t("g.home", fee=f"{settings.fee_percent:g}")
+    else:
+        text = t("g.home_coins", fee=f"{settings.fee_percent:g}", coins=", ".join(c.label for c in coins))
     if not settings.enabled:
         text += "\n\n" + t("g.home_off")
     builder = InlineKeyboardBuilder()
@@ -145,11 +168,13 @@ async def on_how(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
     settings = await get_settings(session, Escrow)
     await call.answer()
     assert call.message is not None
+    coins = deal_coins(settings)
     text = t(
-        "g.how",
+        "g.how" if coins == [USDT] else "g.how_coins",
         fee=f"{settings.fee_percent:g}",
         release_hours=settings.release_hours,
         grace_hours=settings.grace_hours,
+        coins=", ".join(c.label for c in coins),
     )
     await show_screen(call.message, text, reply_markup=_back(t))
 
@@ -265,36 +290,151 @@ async def on_terms(message: Message, state: FSMContext, session: AsyncSession, *
         return
     settings = await get_settings(session, Escrow)
     await state.update_data(g_terms=terms)
+    coins = deal_coins(settings)
+    if len(coins) == 1:
+        await state.update_data(g_coin=coins[0].code)
+        await _ask_amount(message, {**data, "session": session, "state": state}, coins[0], edit=False)
+        return
+    await state.set_state(None)
+    await message.answer(t("g.w.coin"), reply_markup=_coin_kb(t, coins))
+
+
+def _coin_kb(t: Translator, coins: list[Coin]) -> Any:
+    builder = InlineKeyboardBuilder()
+    for coin in coins:
+        builder.button(text=f"{COIN_ICONS[coin.key]} {coin.label}", callback_data=f"g:w:coin:{coin.key}")
+    builder.button(text=t("common.cancel"), callback_data="g:w:x")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data.regexp(r"^g:w:coin:[a-z]+$"))
+async def on_coin(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
+    t: Translator = data["t"]
+    coin = money.BY_KEY.get((call.data or "").rsplit(":", 1)[1])
+    settings = await get_settings(session, Escrow)
+    if "g_terms" not in await state.get_data():
+        await call.answer(t("g.err.wizard_gone"), show_alert=True)
+        return
+    if coin is None or coin not in deal_coins(settings):
+        await call.answer(t("g.err.coin_off"), show_alert=True)
+        return
+    await state.update_data(g_coin=coin.code)
+    await call.answer()
+    assert call.message is not None
+    await _ask_amount(call.message, {**data, "session": session, "state": state}, coin, edit=True)
+
+
+async def _limits(ctx: AppContext, settings: Escrow, coin: Coin) -> tuple[deals.Limits, Decimal] | None:
+    """The limits of a deal in the coin at the rate of the moment (None: no rate now)."""
+    try:
+        rate = await rates.usd_rate(ctx, coin)
+    except rates.RateError:
+        return None
+    return deals.limits_for(settings, coin, rate), rate
+
+
+async def _ask_amount(target: Message, data: dict[str, Any], coin: Coin, *, edit: bool) -> None:
+    t: Translator = data["t"]
+    state: FSMContext = data["state"]
+    settings = await get_settings(data["session"], Escrow)
+    if coin is USDT:
+        text = t("g.w.amount", min=USDT.show(settings.min_cents), max=USDT.show(settings.max_cents))
+    else:
+        found = await _limits(data["ctx"], settings, coin)
+        if found is None:  # the coin again in a while, or another one
+            await state.set_state(None)
+            text = t("g.w.no_rate", ticker=coin.ticker)
+            markup = _coin_kb(t, deal_coins(settings))
+            if edit:
+                await show_screen(target, text, reply_markup=markup)
+            else:
+                await target.answer(text, reply_markup=markup)
+            return
+        limits, rate = found
+        text = t(
+            "g.w.amount_coin",
+            min=coin.show(limits.low),
+            max=coin.show(limits.high),
+            min_usd=rates.show_usd(coin.units_to_usd_cents(limits.low, rate)),
+            max_usd=rates.show_usd(coin.units_to_usd_cents(limits.high, rate)),
+            rate=rates.show_rate(rate),
+            example=EXAMPLES.get(coin.key, "1"),
+            **coin_texts(t, coin),
+        )
     await state.set_state(DealWizard.amount)
-    await message.answer(
-        t("g.w.amount", min=money.show(settings.min_cents), max=money.show(settings.max_cents)),
-        reply_markup=_cancel_kb(t),
-    )
+    if edit:
+        await show_screen(target, text, reply_markup=_cancel_kb(t))
+    else:
+        await target.answer(text, reply_markup=_cancel_kb(t))
+
+
+def parse_deal_amount(text: str, coin: Coin, rate: Decimal) -> int:
+    """An amount typed for a deal in the coin → its units: in the coin ("0.0015"), or in dollars ("$50",
+    "50$", "50 usd") at ``rate``, to the nearest unit. ``money.AmountError`` when it is none."""
+    match = _DOLLARS_RE.match(text or "")
+    if match is None:
+        return coin.parse(text)
+    cents = rates.parse_usd(match.group("a") or match.group("b") or "")
+    return deals.usd_to_units(coin, cents, rate)
 
 
 @router.message(DealWizard.amount)
 async def on_amount(message: Message, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     t: Translator = data["t"]
     settings = await get_settings(session, Escrow)
+    coin = money.coin((await state.get_data()).get("g_coin"))
+    if coin is USDT:
+        low, high, rate = settings.min_cents, settings.max_cents, Decimal(1)
+        bad = t("g.w.bad_amount", min=USDT.show(settings.min_cents), max=USDT.show(settings.max_cents))
+    else:
+        found = await _limits(data["ctx"], settings, coin)
+        if found is None:
+            await state.set_state(None)
+            await message.answer(
+                t("g.w.no_rate", ticker=coin.ticker), reply_markup=_coin_kb(t, deal_coins(settings))
+            )
+            return
+        limits, rate = found
+        low, high = limits.low, limits.high
+        bad = t(
+            "g.w.bad_amount_coin",
+            min=coin.show(low),
+            max=coin.show(high),
+            example=EXAMPLES.get(coin.key, "1"),
+            **coin_texts(t, coin),
+        )
     try:
-        cents = money.parse_amount(message.text or "")
+        cents = (
+            USDT.parse(message.text or "")
+            if coin is USDT
+            else parse_deal_amount(message.text or "", coin, rate)
+        )
     except money.AmountError:
         cents = 0
-    if not settings.min_cents <= cents <= settings.max_cents:
-        await message.answer(
-            t("g.w.bad_amount", min=money.show(settings.min_cents), max=money.show(settings.max_cents)),
-            reply_markup=_cancel_kb(t),
-        )
+    if not low <= cents <= high:
+        await message.answer(bad, reply_markup=_cancel_kb(t))
         return
-    await state.update_data(g_amount=cents)
+    await state.update_data(g_amount=cents, g_rate=None if coin.stable else str(rate))
     await state.set_state(None)
     lines = [
         t(
             "g.w.fee",
             fee=f"{settings.fee_percent:g}",
-            fee_sum=money.show(money.fee_for(cents, settings.fee_bps)),
+            fee_sum=coin.show(money.fee_for(cents, settings.fee_bps)),
         )
     ]
+    if not coin.stable:
+        lines.insert(
+            0,
+            t(
+                "g.w.amount_is",
+                amount=coin.show(cents),
+                usd=rates.show_usd(coin.units_to_usd_cents(cents, rate)),
+                rate=rates.show_rate(rate),
+                ticker=coin.ticker,
+            ),
+        )
     builder = InlineKeyboardBuilder()
     for payer in FEE_PAYERS:
         total = money.amounts(cents, settings.fee_bps, payer)
@@ -302,8 +442,8 @@ async def on_amount(message: Message, state: FSMContext, session: AsyncSession, 
             t(
                 "g.w.fee_line",
                 label=t(f"g.w.fee_{payer}"),
-                buyer_pays=money.show(total.buyer_pays),
-                seller_gets=money.show(total.seller_gets),
+                buyer_pays=coin.show(total.buyer_pays),
+                seller_gets=coin.show(total.seller_gets),
             )
         )
         builder.button(text=t(f"g.w.fee_{payer}"), callback_data=f"g:w:fee:{payer}")
@@ -347,12 +487,17 @@ async def on_days(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
     await show_screen(call.message, t("g.w.counterparty"), reply_markup=builder.as_markup())
 
 
-def _transient(draft: Draft, creator_id: int, settings: Escrow) -> Deal:
+def _transient(draft: Draft, creator_id: int, settings: Escrow, rate: Decimal | None = None) -> Deal:
     """The deal as it would be created, for the preview (never saved)."""
     total = money.amounts(draft.amount_cents, settings.fee_bps, draft.fee_payer)
+    coin = money.coin(draft.currency)
     return Deal(
         status="pending",
         gateway=deals.GATEWAY,
+        currency=coin.code,
+        usd_cents=coin.units_to_usd_cents(total.amount, rate)
+        if rate is not None and not coin.stable
+        else None,
         seller_address=draft.address if draft.role == "seller" else None,
         creator_id=creator_id,
         creator_role=draft.role,
@@ -385,15 +530,25 @@ def _draft(fsm: dict[str, Any]) -> Draft | None:
             delivery_days=int(fsm["g_days"]),
             counterparty=fsm.get("g_counterparty"),
             address=fsm.get("g_address"),
+            currency=money.coin(fsm.get("g_coin")).code,
         )
     except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _draft_rate(fsm: dict[str, Any]) -> Decimal | None:
+    """The rate the wizard showed the amount at (for the preview's dollars only)."""
+    try:
+        return Decimal(fsm["g_rate"]) if fsm.get("g_rate") else None
+    except (ArithmeticError, TypeError, ValueError):
         return None
 
 
 async def _preview(target: Message, data: dict[str, Any], *, edit: bool) -> None:
     t: Translator = data["t"]
     state: FSMContext = data["state"]
-    draft = _draft(await state.get_data())
+    fsm = await state.get_data()
+    draft = _draft(fsm)
     if draft is None:
         await target.answer(t("g.err.wizard_gone"))
         return
@@ -401,7 +556,7 @@ async def _preview(target: Message, data: dict[str, Any], *, edit: bool) -> None
     session: AsyncSession = data["session"]
     settings = await get_settings(session, Escrow)
     creator = data["user"]
-    deal = _transient(draft, creator.id, settings)
+    deal = _transient(draft, creator.id, settings, _draft_rate(fsm))
     text = cards.preview_text(t, deal, {creator.id: creator})
     builder = InlineKeyboardBuilder()
     builder.button(text=t("g.w.create"), callback_data="g:w:ok", style="success")
@@ -441,32 +596,53 @@ async def on_skip(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
     await _address_step(call.message, {**data, "state": state}, edit=True)
 
 
-def address_error(t: Translator, exc: evm.AddressError | DealError) -> str:
-    if isinstance(exc, evm.AddressError):
-        return t(f"g.addr.bad_{exc.code}")
-    code = exc.key.removeprefix("address_")
-    if exc.key.startswith("address_") and code in ("format", "checksum", "forbidden"):
+ADDRESS_CODES = ("format", "checksum", "forbidden", "testnet", "other_coin", "ltc_p2sh", "unsupported")
+
+
+def address_error(t: Translator, exc: evm.AddressError | DealError, coin: Coin = USDT) -> str:
+    """Why an address was not taken, in the words of its coin."""
+    if isinstance(exc, DealError) and not exc.key.startswith("address_"):
+        return error_text(t, exc)
+    code = exc.code if isinstance(exc, evm.AddressError) else exc.key.removeprefix("address_")
+    if code not in ADDRESS_CODES:
+        return error_text(t, exc) if isinstance(exc, DealError) else t("g.addr.bad_format")
+    if code == "forbidden" or (coin is USDT and code in ("format", "checksum")):
         return t(f"g.addr.bad_{code}")
-    return error_text(t, exc)
+    if coin is USDT:
+        return t("g.addr.bad_format")
+    return t(f"g.addr.coin_{code}", **coin_texts(t, coin))
+
+
+def address_ask(t: Translator, key: str, coin: Coin, **extra: Any) -> str:
+    """The request for a payout address: USDT's words as always, the other coins' with their network."""
+    if coin is USDT:
+        return t(f"g.addr.{key}", **extra)
+    return t(f"g.addr.{key}_coin", **extra, **coin_texts(t, coin))
+
+
+def _wizard_coin(fsm: dict[str, Any]) -> Coin:
+    return money.coin(fsm.get("g_coin"))
 
 
 async def _address_step(target: Message, data: dict[str, Any], *, edit: bool) -> None:
     """A seller says where the money goes before the deal exists (the buyer is asked only for a refund)."""
     t: Translator = data["t"]
     state: FSMContext = data["state"]
-    if (await state.get_data()).get("g_role") != "seller":
+    fsm = await state.get_data()
+    if fsm.get("g_role") != "seller":
         await _preview(target, data, edit=edit)
         return
+    coin = _wizard_coin(fsm)
     await state.set_state(DealWizard.address)
-    saved = await wallets.remembered(data["session"], data["user"].id)
+    saved = await wallets.remembered(data["session"], data["user"].id, coin=coin)
     builder = InlineKeyboardBuilder()
     if saved:
         builder.button(
-            text=t("g.addr.use", address=evm.short(saved)), callback_data="g:w:addr", style="success"
+            text=t("g.addr.use", address=coinaddr.short(saved)), callback_data="g:w:addr", style="success"
         )
     builder.button(text=t("common.cancel"), callback_data="g:w:x")
     builder.adjust(1)
-    text = t("g.addr.ask") + ("\n\n" + t("g.addr.saved", address=saved) if saved else "")
+    text = address_ask(t, "ask", coin) + ("\n\n" + t("g.addr.saved", address=saved) if saved else "")
     if edit:
         await show_screen(target, text, reply_markup=builder.as_markup())
     else:
@@ -476,10 +652,11 @@ async def _address_step(target: Message, data: dict[str, Any], *, edit: bool) ->
 @router.message(DealWizard.address)
 async def on_wizard_address(message: Message, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     t: Translator = data["t"]
+    coin = _wizard_coin(await state.get_data())
     try:
-        address = await wallets.check(session, message.text or "")
+        address = await wallets.check(session, message.text or "", coin=coin)
     except evm.AddressError as exc:
-        await message.answer(address_error(t, exc), reply_markup=_cancel_kb(t))
+        await message.answer(address_error(t, exc, coin), reply_markup=_cancel_kb(t))
         return
     await state.update_data(g_address=address)
     await _preview(message, {**data, "session": session, "state": state}, edit=False)
@@ -490,8 +667,9 @@ async def on_wizard_saved_address(
     call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any
 ) -> None:
     t: Translator = data["t"]
-    saved = await wallets.remembered(session, data["user"].id)
-    if saved is None or "g_days" not in await state.get_data():
+    fsm = await state.get_data()
+    saved = await wallets.remembered(session, data["user"].id, coin=_wizard_coin(fsm))
+    if saved is None or "g_days" not in fsm:
         await call.answer(t("g.err.wizard_gone"), show_alert=True)
         return
     await state.update_data(g_address=saved)
@@ -529,10 +707,19 @@ async def on_create(call: CallbackQuery, state: FSMContext, **data: Any) -> None
         return
     user = data["user"]
     username = call.from_user.username if call.from_user else user.username
+    coin = money.coin(draft.currency)
+    rate = None
+    if not coin.stable:  # the limits and the dollars of the deal: at the rate of this moment
+        try:
+            rate = await rates.usd_rate(ctx, coin)
+        except rates.RateError:
+            await call.answer(t("g.err.no_rate"), show_alert=True)
+            return
     try:
-        deal = await deals.create_deal(ctx.db, user.id, username, draft)
+        deal = await deals.create_deal(ctx.db, user.id, username, draft, rate=rate)
     except DealError as exc:
-        await call.answer(error_text(t, exc), show_alert=True)
+        coined = coin is not USDT and exc.key.startswith("address_")
+        await call.answer(address_error(t, exc, coin) if coined else error_text(t, exc), show_alert=True)
         return
     await state.clear()
     await call.answer()
@@ -654,18 +841,19 @@ async def on_confirm_party(call: CallbackQuery, **data: Any) -> None:
 async def _address_prompt(chat_id: int, data: dict[str, Any], deal: Deal, *, fresh: bool = False) -> None:
     """A message that asks a side for its payout address (the remembered one is a tap away)."""
     t: Translator = data["t"]
-    saved = await wallets.remembered(data["session"], data["user"].id)
+    coin = money.coin_of(deal)
+    saved = await wallets.remembered(data["session"], data["user"].id, coin=coin)
     builder = InlineKeyboardBuilder()
     if saved:
         builder.button(
-            text=t("g.addr.use", address=evm.short(saved)),
+            text=t("g.addr.use", address=coinaddr.short(saved)),
             callback_data=f"g:addr:{deal.id}:s",
             style="success",
         )
     builder.button(text=t("g.addr.enter"), callback_data=f"g:addr:{deal.id}")
     builder.button(text=t("g.open_deal", n=deal.id), callback_data=f"g:d:{deal.id}")
     builder.adjust(1)
-    text = t("g.addr.after_accept" if fresh else "g.addr.ask_deal", n=deal.id)
+    text = address_ask(t, "after_accept" if fresh else "ask_deal", coin, n=deal.id)
     if saved:
         text += "\n\n" + t("g.addr.saved", address=saved)
     await data["bot"].send_message(chat_id, text, reply_markup=builder.as_markup())
@@ -681,11 +869,12 @@ async def on_address(call: CallbackQuery, state: FSMContext, session: AsyncSessi
         return
     await state.set_state(DealAddress.waiting)
     await state.update_data(g_addr_deal=deal.id)
-    saved = await wallets.remembered(session, data["user"].id)
+    coin = money.coin_of(deal)
+    saved = await wallets.remembered(session, data["user"].id, coin=coin)
     builder = InlineKeyboardBuilder()
     if saved:
         builder.button(
-            text=t("g.addr.use", address=evm.short(saved)),
+            text=t("g.addr.use", address=coinaddr.short(saved)),
             callback_data=f"g:addr:{deal.id}:s",
             style="success",
         )
@@ -693,7 +882,7 @@ async def on_address(call: CallbackQuery, state: FSMContext, session: AsyncSessi
     builder.adjust(1)
     role = deals.role_of(deal, data["user"].id) or "seller"
     current = deal.seller_address if role == "seller" else deal.buyer_address
-    text = t("g.addr.ask_deal", n=deal.id)
+    text = address_ask(t, "ask_deal", coin, n=deal.id)
     if current:
         text += "\n\n" + t("g.addr.current", address=current)
     elif saved:
@@ -703,14 +892,14 @@ async def on_address(call: CallbackQuery, state: FSMContext, session: AsyncSessi
     await show_screen(call.message, text, reply_markup=builder.as_markup())
 
 
-async def _save_address(data: dict[str, Any], deal_id: int, text: str) -> tuple[Deal | None, str]:
+async def _save_address(data: dict[str, Any], deal_id: int, text: str, coin: Coin) -> tuple[Deal | None, str]:
     """(the deal, the note to show): the deal is None when the address was not taken."""
     t: Translator = data["t"]
     ctx: AppContext = data["ctx"]
     try:
         deal, woken = await deals.set_address(ctx.db, deal_id, data["user"].id, text)
     except DealError as exc:
-        return None, address_error(t, exc) if exc.key.startswith("address_") else error_text(t, exc)
+        return None, address_error(t, exc, coin) if exc.key.startswith("address_") else error_text(t, exc)
     role = deals.role_of(deal, data["user"].id) or "seller"
     address = deal.seller_address if role == "seller" else deal.buyer_address
     return deal, t("g.addr.saved_ok" if not woken else "g.addr.saved_payout", address=address or "")
@@ -721,11 +910,13 @@ async def on_saved_address(
     call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any
 ) -> None:
     t: Translator = data["t"]
-    saved = await wallets.remembered(session, data["user"].id)
+    current = await _visible_deal(session, _id(call), data["user"].id)
+    coin = money.coin_of(current) if current is not None else USDT
+    saved = await wallets.remembered(session, data["user"].id, coin=coin) if current is not None else None
     if saved is None:
         await call.answer(t("g.err.state"), show_alert=True)
         return
-    deal, note = await _save_address(data, _id(call), saved)
+    deal, note = await _save_address(data, _id(call), saved, coin)
     if deal is None:
         await call.answer(note, show_alert=True)
         return
@@ -743,7 +934,9 @@ async def on_address_text(message: Message, state: FSMContext, **data: Any) -> N
     if not deal_id:
         await state.clear()
         return
-    deal, note = await _save_address(data, int(deal_id), message.text or "")
+    current = await deals.get_deal(data["session"], int(deal_id))
+    coin = money.coin_of(current) if current is not None else USDT
+    deal, note = await _save_address(data, int(deal_id), message.text or "", coin)
     if deal is None:
         builder = InlineKeyboardBuilder()
         builder.button(text=t("common.cancel"), callback_data=f"g:d:{deal_id}")
@@ -763,18 +956,20 @@ async def _pay_message(ctx: AppContext, t: Translator, deal: Deal, invoice: Deal
                 await session.execute(select(DealReceipt.amount).where(DealReceipt.invoice_id == invoice.id))
             ).scalars()
         )
+    coin = money.coin_of(deal)
     lines = [
         t(
-            "g.pay.invoice",
+            "g.pay.invoice" if coin is USDT else "g.pay.invoice_coin",
             n=deal.id,
-            buyer_pays=money.show(deal.buyer_pays_cents),
-            address=evm.checksummed(invoice.address) if invoice.address else "—",
+            buyer_pays=coin.show(deal.buyer_pays_cents),
+            address=coinaddr.shown(coin.code, invoice.address) if invoice.address else "—",
             pay_due=fmt_dt(deal.pay_due_at, ctx.config.timezone),
+            **({} if coin is USDT else coin_texts(t, coin)),
         )
     ]
     if received:
-        missing = max(money.to_minor(invoice.amount_cents) - received, 0)
-        lines.append(t("g.pay.received", got=money.show_minor(received), missing=money.show_minor(missing)))
+        missing = max(coin.to_minor(invoice.amount_cents) - received, 0)
+        lines.append(t("g.pay.received", got=coin.show_minor(received), missing=coin.show_minor(missing)))
     builder = InlineKeyboardBuilder()
     if invoice.pay_url:
         builder.button(text=t("g.pay.open"), url=invoice.pay_url, style="success")
@@ -820,12 +1015,13 @@ async def on_check(call: CallbackQuery, **data: Any) -> None:
     if fresh is not None and fresh.status != "awaiting_payment":
         await show_card(call, data, deal.id, t("g.pay.got"))
         return
+    coin = money.coin_of(deal)
     if result is not None and result.outcome == "partial":
         note = t(
-            "g.pay.partial", got=money.show_minor(result.received), missing=money.show_minor(result.missing)
+            "g.pay.partial", got=coin.show_minor(result.received), missing=coin.show_minor(result.missing)
         )
     elif result is not None and result.outcome == "confirming":
-        note = t("g.pay.confirming")
+        note = t("g.pay.confirming" if coin is USDT else "g.pay.confirming_coin", network=coin.network)
     else:
         note = t("g.pay.not_yet")
     await call.answer(note, show_alert=True)

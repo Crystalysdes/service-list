@@ -26,8 +26,8 @@ async def staff_name(ctx: AppContext, staff_id: int) -> str:
 
 def shares_text(deal: Deal) -> str:
     return (
-        f"продавцу {money.show(deal.seller_share_cents or 0)}, "
-        f"покупателю {money.show(deal.buyer_share_cents or 0)}"
+        f"продавцу {money.coin_of(deal).show(deal.seller_share_cents or 0)}, "
+        f"покупателю {money.coin_of(deal).show(deal.buyer_share_cents or 0)}"
     )
 
 
@@ -37,8 +37,8 @@ async def after_verdict(ctx: AppContext, deal: Deal, judge_id: int, role: str | 
         ctx,
         deal,
         "verdict",
-        seller_share=money.show(deal.seller_share_cents or 0),
-        buyer_share=money.show(deal.buyer_share_cents or 0),
+        seller_share=money.coin_of(deal).show(deal.seller_share_cents or 0),
+        buyer_share=money.coin_of(deal).show(deal.buyer_share_cents or 0),
         note=h(deal.verdict_note or ""),
     )
     judge = await staff_name(ctx, judge_id)
@@ -47,9 +47,10 @@ async def after_verdict(ctx: AppContext, deal: Deal, judge_id: int, role: str | 
     )
     await close_alert(ctx, "deal", deal.id, line)
     if judge_id not in ctx.config.owner_ids:
+        amount = money.coin_of(deal).show(deal.amount_cents)
         await alert_owner(
             ctx,
-            f"⚖️ Вердикт по сделке #{deal.id} ({money.show(deal.amount_cents)}): {shares_text(deal)}.\n"
+            f"⚖️ Вердикт по сделке #{deal.id} ({amount}): {shares_text(deal)}.\n"
             f"Решил: {ROLE_TITLES.get(role or '', role or '')} {judge}\n"
             f"Причина: {h(deal.verdict_note or '')}",
         )

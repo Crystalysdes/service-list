@@ -1,4 +1,4 @@
-"""Deal invoices at Apirone (USDT BEP20).
+"""Deal invoices at Apirone (in the deal's coin: USDT BEP20, BTC or LTC).
 
 A deal gets one invoice, made at the first "Оплатить" for the rest of the payment time: an address of its
 own and an amount. Money sent to that address belongs to the deal whenever it comes (see
@@ -10,7 +10,6 @@ off the invoice's status is read first, and one paid meanwhile keeps the deal in
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -19,6 +18,7 @@ from sqlalchemy import select, text
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Deal, DealInvoice, DealReceipt
+from app.services import coinaddr
 from app.services.apirone import PROVIDER_ERRORS, ApironeInvoice
 from app.services.escrow import deals, money
 from app.services.escrow.deals import UNPAID_REMOTE, DealError, Funding, Seen
@@ -32,7 +32,6 @@ __all__ = ["provider"]
 
 MIN_TTL = 300  # seconds an invoice lives at least
 INVOICE_LOCK_NS = deals.LOCK_NS + 1  # one invoice is made for a deal at a time
-_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 
 
 def seen_of(remote: ApironeInvoice) -> list[Seen]:
@@ -103,16 +102,18 @@ async def invoice_for(
                 raise DealError("state")
             return current
         ttl = max(MIN_TTL, int((deal.pay_due_at - now).total_seconds()))
-        amount = money.to_minor(deal.buyer_pays_cents)
+        coin = money.coin_of(deal)
+        amount = coin.to_minor(deal.buyer_pays_cents)
         try:
-            created = await pay.create_invoice(amount, ttl, f"Service List · сделка #{deal.id}")
+            created = await pay.create_invoice(amount, ttl, f"Service List · сделка #{deal.id}", **coin.kw)
         except PROVIDER_ERRORS as exc:
             log.warning("escrow invoice for deal %s failed: %s", deal.id, describe(exc))
             raise DealError("provider") from exc
+        currencies = (coin.code, "") if coin is money.USDT else (coin.code,)
         if (
             created.amount != amount
-            or not _ADDRESS_RE.match(created.address)
-            or created.currency not in ("", money.CURRENCY)
+            or not coinaddr.valid_invoice_address(coin.code, created.address)
+            or created.currency.lower() not in currencies
         ):  # never shown to the buyer: an invoice for another sum, coin or address is not ours to use
             log.error(
                 "escrow invoice %s does not match deal %s: %r", created.invoice_id, deal.id, created.raw
@@ -226,10 +227,11 @@ async def _refund_after(ctx: AppContext, row: DealInvoice | None) -> None:
             .where(DealReceipt.invoice_id == row.id, DealReceipt.purpose.is_(None))
             .limit(1)
         )
+        deal = await session.get(Deal, row.deal_id)
     fundings = []
-    if waiting is not None:
+    if waiting is not None and deal is not None:
         try:
-            fundings, _strangers = await scan_receipts(ctx, row.created_at - SLACK)
+            fundings, _strangers = await scan_receipts(ctx, row.created_at - SLACK, money.coin_of(deal))
         except PROVIDER_ERRORS as exc:
             log.warning("escrow history for a refund: %s", describe(exc))
     fundings.append(await deals.take_payments(ctx.db, row.id))
@@ -299,20 +301,27 @@ async def scan_receipts(
 ) -> tuple[list[Funding], list[str]]:
     """Money of the coin the account's history shows arriving since ``since``: each payment to an invoice's
     address is taken to its deal (a late one goes back to the buyer) or to its order; a payment to an address
-    that is no invoice's is a problem for the owner. Raises what Apirone raises."""
+    that is no invoice's is a problem for the owner. Raises what Apirone raises.
+
+    BTC and LTC: one transaction may pay several addresses (an exchange's batch), so what is written down is
+    a transaction *at an invoice*; and a transaction the account itself sent (its change coming back) is
+    never taken for a payment."""
+    from app.services.escrow import ledger
+
     pay = provider(ctx)
     items = await movements(pay, "receipt", since, coin)
     if not items:
         return [], []
+    utxo = coin.utxo
     txids = {deals.txid_key(t) for item in items for t in item.txids}
     async with ctx.db.session() as session:
-        known = {
-            (row.txid, row.confirmed)
-            for row in (
-                await session.execute(select(DealReceipt).where(DealReceipt.txid.in_(txids)))
-            ).scalars()
-        }
+        written = list(
+            (await session.execute(select(DealReceipt).where(DealReceipt.txid.in_(txids)))).scalars()
+        )
+        own = await ledger.taken_txids(session) if utxo else set()
+    known = {(row.txid, row.confirmed) for row in written}
     known_txids = {txid for txid, _ in known}
+    at_invoice = {(row.txid, row.invoice_id): row.confirmed for row in written}
     results: list[Funding] = []
     problems: list[str] = []
     cache: dict[str, set[str]] = {}
@@ -321,14 +330,18 @@ async def scan_receipts(
         if not keys or item.amount is None:
             continue
         confirmed = bool(item.confirmed)
-        if keys[0] in known_txids and ((keys[0], True) in known or not confirmed):
-            continue  # written down already, with nothing new to add
+        if keys[0] in own:
+            continue  # sent by the account itself: its change, not a payment
+        if not utxo and keys[0] in known_txids and ((keys[0], True) in known or not confirmed):
+            continue  # written down already, with nothing new to add (one transaction pays one address)
         addresses = await addresses_of(pay, item, cache, coin)
         async with ctx.db.session() as session:
             rows = list(
                 (
                     await session.execute(
-                        select(DealInvoice).where(DealInvoice.address.in_(addresses or {"-"}))
+                        select(DealInvoice)
+                        .join(Deal, Deal.id == DealInvoice.deal_id)
+                        .where(DealInvoice.address.in_(addresses or {"-"}), Deal.currency == coin.code)
                     )
                 ).scalars()
             )
@@ -340,7 +353,7 @@ async def scan_receipts(
             if listing is not None:
                 await apirone_pay.history_receipt(ctx, listing, keys[0], item.amount, confirmed, coin)
                 continue
-            if coin is not money.USDT:  # BTC/LTC: the change of the account's own transfers may come back
+            if utxo:  # BTC/LTC: money to an address that is no invoice's is logged, not raised
                 log.info("receipt %s of %s at no invoice's address: %s", keys[0], coin.code, addresses)
                 continue
         if len(rows) != 1:  # nobody's, or the item names the addresses of several invoices
@@ -348,6 +361,9 @@ async def scan_receipts(
             whose = "это не адрес счёта сделки" if not rows else "неясно, какой из сделок оно"
             problems.append(f"поступление {coin.show_minor(item.amount)} на {where} — {whose}")
             continue
+        before = at_invoice.get((keys[0], rows[0].id))  # this invoice's share, written down already?
+        if utxo and before is not None and (before or not confirmed):
+            continue  # with nothing new to add
         seen = Seen(keys[0], item.amount, confirmed, "history", item.raw)
         results.append(await deals.take_payments(ctx.db, rows[0].id, seen=[seen]))
     return results, problems

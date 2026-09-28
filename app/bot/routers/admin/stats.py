@@ -102,20 +102,28 @@ async def sources(session: AsyncSession, limit: int = 15) -> list[dict[str, Any]
 
 
 async def garant_line(session: AsyncSession, now: datetime) -> str:
-    """Auto-garant: finished deals, turnover, the garant's fees, disputes and what is open now."""
-    from app.services.escrow import money as usdt
+    """Auto-garant: finished deals, turnover (in dollars, whatever the coins), the garant's fees in each coin,
+    disputes and what is open now."""
+    from app.services import rates
+    from app.services.escrow import money as coins
+    from app.services.escrow.cards import DOLLARS
     from app.services.escrow.deals import OPEN
 
     finished = ("completed", "refunded", "split")
-    done, turnover, fees = (
+    done, turnover = (
         await session.execute(
-            select(
-                func.count(Deal.id),
-                func.coalesce(func.sum(Deal.amount_cents), 0),
-                func.coalesce(func.sum(Deal.fee_cents), 0),
-            ).where(Deal.status.in_(finished))
+            select(func.count(Deal.id), func.coalesce(func.sum(DOLLARS), 0)).where(Deal.status.in_(finished))
         )
     ).one()
+    by_coin = (
+        await session.execute(
+            select(Deal.currency, func.coalesce(func.sum(Deal.fee_cents), 0))
+            .where(Deal.status.in_(finished))
+            .group_by(Deal.currency)
+        )
+    ).all()
+    fees = [coins.coin(code).show(int(total)) for code, total in by_coin if code in coins.COINS]
+    only_usdt = all(code == coins.USDT.code for code, _total in by_coin)
     month = await session.scalar(
         select(func.count())
         .select_from(Deal)
@@ -127,7 +135,8 @@ async def garant_line(session: AsyncSession, now: datetime) -> str:
     open_now = await session.scalar(select(func.count()).select_from(Deal).where(Deal.status.in_(OPEN)))
     return (
         f"<b>Гарант:</b> сделок завершено {done} (за 30 дней {month or 0}), "
-        f"оборот {usdt.show(int(turnover))}, комиссии {usdt.show(int(fees))}, споров {disputes or 0}, "
+        f"оборот {coins.USDT.show(int(turnover)) if only_usdt else '≈ ' + rates.show_usd(int(turnover))}, "
+        f"комиссии {' + '.join(fees) or coins.USDT.show(0)}, споров {disputes or 0}, "
         f"открыто сейчас {open_now or 0}"
     )
 

@@ -20,7 +20,9 @@ per call), ``transfer_timeouts`` (no answer, nothing sent), ``transfer_lost_repl
 ``transfer_5xx`` (sent, then a server error), ``history_fail`` / ``balance_fail`` / ``invoice_fail`` /
 ``rate_fail`` (those calls get no answer), ``history_lag`` (the newest items are not in the history yet),
 ``coin_history_fail`` (the history of those currencies gets no answer), ``filter_ignored`` (the history
-lists every currency whatever was asked).
+lists every currency whatever was asked), ``pending_payments`` (BTC/LTC sent from the account show in the
+history without a transaction id until ``confirm_payments``), ``nameless`` (transactions whose details name
+no address).
 """
 
 from __future__ import annotations
@@ -80,6 +82,8 @@ class FakeApirone:
         self.rate_fail = False
         self.coin_history_fail: set[str] = set()
         self.filter_ignored = False
+        self.pending_payments = False
+        self.nameless: set[str] = set()
         self._ids = itertools.count(1)
         self._addr = itertools.count(1)
         self._tx = itertools.count(1)
@@ -138,8 +142,20 @@ class FakeApirone:
             "is_confirmed": confirmed,
             "address": address,
         }
+        if kind == "payment" and currency != USDT and self.pending_payments:  # no transaction id yet
+            item.update({"txs": [], "is_confirmed": False, "_txid": txid})
         self.items.append(item)
         return item
+
+    def confirm_payments(self) -> None:
+        """BTC/LTC sent from the account get into a block: their transaction ids show."""
+        for item in self.items:
+            if "_txid" in item:
+                item.update({"txs": [item.pop("_txid")], "is_confirmed": True})
+
+    @staticmethod
+    def _public(item: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in item.items() if k != "address" and not k.startswith("_")}
 
     def _invoice_view(self, data: dict[str, Any]) -> ApironeInvoice:
         public = {k: v for k, v in data.items() if not k.startswith("_")}
@@ -309,7 +325,7 @@ class FakeApirone:
                 continue
             if since is not None and HistoryItem.from_api(item).date < since.replace(microsecond=0):
                 continue
-            found.append({k: v for k, v in item.items() if k != "address"})  # the list names no address
+            found.append(self._public(item))  # the list names no address
         return [HistoryItem.from_api(item, currency) for item in found[offset : offset + limit]]
 
     async def history_item(self, item_id: str, currency: str = USDT) -> HistoryItem:
@@ -318,7 +334,9 @@ class FakeApirone:
             raise ApironeError("no answer in time", unknown=True)
         for item in self.items:
             if item["id"] == item_id:
-                detail = {k: v for k, v in item.items() if k != "address"}
+                detail = self._public(item)
+                if set(item["txs"]) & self.nameless:
+                    return HistoryItem.from_api(detail, currency)
                 if item["type"] == "payment":
                     detail["destinations"] = [{"address": item["address"], "amount": item["amount"]}]
                 else:
