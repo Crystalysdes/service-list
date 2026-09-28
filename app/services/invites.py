@@ -1,4 +1,4 @@
-"""Personal invitation links behind «📋 Service List» and «💬 Chat» in the bot's menu.
+"""Personal invitation links behind «📋 Service List», «📰 Service List Info» and «💬 Chat» in the bot's menu.
 
 Every time the menu is shown, the person who opened it (past the captcha) gets links of their own: valid
 for a minute and for one join. A link copied by a bot is useless a minute later and lets in one account at
@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext
 from app.db.base import utcnow
-from app.services.channels import main_channel
+from app.db.models import Channel
+from app.services.channels import info_channel, main_channel
 from app.services.render_db import community_url
 from app.services.settings import Chats, Limits, get_settings
 
@@ -41,10 +42,15 @@ class MenuLinks:
     main: Link | None  # None: no channel connected yet
     chat: Link | None  # None: no community chat known
     ttl: int = 60
+    info: Link | None = None  # the Service List Info channel (None: not connected)
+
+    @property
+    def links(self) -> tuple[Link | None, ...]:
+        return (self.main, self.info, self.chat)
 
     @property
     def personal(self) -> bool:
-        return any(link is not None and (link.personal or link.retry) for link in (self.main, self.chat))
+        return any(link is not None and (link.personal or link.retry) for link in self.links)
 
 
 def _cache(ctx: AppContext) -> dict[tuple[int, int], tuple[str, float]]:
@@ -112,22 +118,26 @@ async def _personal(ctx: AppContext, chat_id: int, user_id: int, ttl: int) -> Li
     return Link(url=url, personal=url is not None, retry=url is None)
 
 
+async def _channel_link(ctx: AppContext, channel: Channel | None, user_id: int, ttl: int) -> Link | None:
+    """A public channel's link, or a link of this person's own into a private one."""
+    if channel is None:
+        return None
+    if channel.username:
+        return Link(url=f"https://t.me/{channel.username}")
+    return await _personal(ctx, channel.chat_id, user_id, ttl)
+
+
 async def menu_links(ctx: AppContext, session: AsyncSession, user_id: int) -> MenuLinks:
     ttl = (await get_settings(session, Limits)).invite_link_ttl_sec
-    channel = await main_channel(session)
-    main = None
-    if channel is not None:
-        if channel.username:
-            main = Link(url=f"https://t.me/{channel.username}")
-        else:
-            main = await _personal(ctx, channel.chat_id, user_id, ttl)
+    main = await _channel_link(ctx, await main_channel(session), user_id, ttl)
+    info = await _channel_link(ctx, await info_channel(session), user_id, ttl)
     chats = await get_settings(session, Chats)
     if chats.community_chat_id:
         chat: Link | None = await _personal(ctx, chats.community_chat_id, user_id, ttl)
     else:
         static = await community_url(session)
         chat = Link(url=static) if static else None
-    return MenuLinks(main=main, chat=chat, ttl=ttl)
+    return MenuLinks(main=main, chat=chat, ttl=ttl, info=info)
 
 
 def ttl_text(ttl: int, lang: str | None) -> str:

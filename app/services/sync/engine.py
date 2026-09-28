@@ -53,10 +53,17 @@ SETTLED = ("ok", KEPT)  # a post in one of these states showing its data is left
 OWNER_RANK = {"category": 0, "static": 0, "nav": 1}  # who keeps a message two rows claim; leftovers last
 ORPHAN_WINDOW = 10  # newest messages looked at for a post sent right before a crash
 ALWAYS_SHOWN = ("nav", "spare")  # published without premium emoji rather than held back by the emoji gate
+SYNCED_ROLES = ("main", "mirror", "scam", "info")  # channels the engine keeps (a worker each)
 
 
 class ChannelBroken(Exception):
     pass
+
+
+def _always_shown(kind: str, channel: Channel) -> bool:
+    """Published without premium emoji rather than held back by the emoji gate: the navigation (it must never
+    be missing), and every post of the Info channel (its pinned main post is its first post)."""
+    return kind in ALWAYS_SHOWN or channel.role == "info"
 
 
 def buttons_markup(buttons: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup | None:
@@ -95,6 +102,7 @@ class PassResult:
     unchanged: int = 0
     skipped: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    pending: int = 0  # posts a move still has to publish there (the Info channel is filled in portions)
 
 
 @dataclass
@@ -104,6 +112,7 @@ class Outgoing:
     chat_id: int
     block: render_db.RenderedBlock
     fragment: Fragment
+    silent: bool = True  # without a notification sound
 
     def saved(self, row: ChannelPost, message: Message) -> None:
         """The row now shows this block in ``message``."""
@@ -209,9 +218,11 @@ class SyncEngine:
         self.idle_interval = idle_interval
         self.per_minute = per_minute
         self.workers: dict[int, ChannelWorker] = {}
+        self.roles: dict[int, str] = {}  # channel id -> role, of the channels with a worker
+        from app.services.infofeed import reconcile_info
         from app.services.scamlist import reconcile_scam
 
-        self.planners: dict[str, Any] = {"scam": reconcile_scam}
+        self.planners: dict[str, Any] = {"scam": reconcile_scam, "info": reconcile_info}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ lifecycle
@@ -226,11 +237,12 @@ class SyncEngine:
     async def ensure_workers(self) -> None:
         async with self.ctx.db.session() as session:
             rows = await session.execute(
-                select(Channel.id).where(
-                    Channel.role.in_(("main", "mirror", "scam")), Channel.status != "retired"
+                select(Channel.id, Channel.role).where(
+                    Channel.role.in_(SYNCED_ROLES), Channel.status != "retired"
                 )
             )
-            wanted = set(rows.scalars())
+            self.roles = {channel_id: role for channel_id, role in rows.all()}
+            wanted = set(self.roles)
         for channel_id in wanted - set(self.workers):
             worker = ChannelWorker(self, channel_id)
             self.workers[channel_id] = worker
@@ -242,6 +254,12 @@ class SyncEngine:
         for worker_id, worker in self.workers.items():
             if channel_id is None or worker_id == channel_id:
                 worker.event.set()
+
+    def wake_role(self, role: str) -> None:
+        """A pass soon over the channels of this role (the Info channel: news waiting for the list)."""
+        for channel_id, channel_role in self.roles.items():
+            if channel_role == role:
+                self.wake(channel_id)
 
     async def wake_all(self) -> None:
         await self.ensure_workers()
@@ -283,13 +301,10 @@ class SyncEngine:
     ) -> None:
         async with self.ctx.db.session() as session:
             channel = await session.get(Channel, channel_id)
+            is_main = channel is not None and channel.role == "main"
             # plain links to our posts in texts the admins wrote follow the posts from now on (the old
             # navigation included), before any post of the channel changes its place
-            if (
-                channel is not None
-                and channel.role == "main"
-                and await own_links.symbolize_stored(session, channel)
-            ):
+            if is_main and channel is not None and await own_links.symbolize_stored(session, channel):
                 await session.commit()
             desired = await render_db.desired_blocks(session)
             rows = list(
@@ -323,6 +338,8 @@ class SyncEngine:
             await tell_published(self.ctx, channel_id)
         except Exception:
             log.exception("telling owners about published services failed")
+        if is_main:  # the Info channel's news of what the list shows now
+            self.wake_role("info")
 
     # ------------------------------------------------------------------ structure
     async def _assign_new_blocks(
@@ -628,10 +645,10 @@ class SyncEngine:
                 result.errors.append(f"move: {exc.message}")
                 await self._save_move(move)
                 return
-            own_posts.update(item["copies"])
+            own_posts.update((chat_id, copy_id) for copy_id in item["copies"])
             if len(own_posts) > 2000:
-                for old_id in sorted(own_posts)[:1000]:
-                    own_posts.discard(old_id)
+                for old in sorted(own_posts, key=lambda key: key[1])[:1000]:
+                    own_posts.discard(old)
             await self._save_move(move)
         took = False
         if place is not None:  # 2. the block right under the last block
@@ -1115,13 +1132,16 @@ class SyncEngine:
             block.fragment,
             result,
             f"{kind}:{block_id}",
-            plain_ok=kind in ALWAYS_SHOWN,
+            plain_ok=_always_shown(kind, channel),
             plain=block.plain,
             channel_id=channel_id,
         )
         if fragment is None:
             return None
-        return Outgoing(channel.chat_id, block, fragment)
+        # a channel a move is filling gets everything silently
+        return Outgoing(
+            channel.chat_id, block, fragment, silent=block.silent or channel.status == "migrating"
+        )
 
     async def _deliver(self, channel_id: int, out: Outgoing, limiter: RateLimiter) -> Message:
         bot = self.ctx.bot
@@ -1138,6 +1158,7 @@ class SyncEngine:
                             block.media_kind,
                             fragment,
                             buttons_markup(block.buttons),
+                            silent=out.silent,
                         ),
                         channel_id,
                     )
@@ -1148,7 +1169,7 @@ class SyncEngine:
                         entities=fragment.to_entities(),
                         parse_mode=None,
                         link_preview_options=WITH_PREVIEW if block.link_preview else NO_PREVIEW,
-                        disable_notification=True,
+                        disable_notification=out.silent,
                         reply_markup=buttons_markup(block.buttons),
                     ),
                     channel_id,
@@ -1158,14 +1179,15 @@ class SyncEngine:
 
     async def _send_new(
         self, channel_id: int, kind: str, block_id: int, limiter: RateLimiter, result: PassResult
-    ) -> None:
+    ) -> Message | None:
+        """Publish the block of a row without a message; the message sent (None: nothing was sent)."""
         async with self.ctx.db.session() as session:
             row = await self._row(session, channel_id, kind, block_id)
             if row is None or row.message_id:
-                return
+                return None
             out = await self._prepare(session, channel_id, kind, block_id, result)
             if out is None:
-                return
+                return None
             row.state = "sending"
             row.snapshot = out.fragment.to_json()  # a crash before the id is saved: matched against this
             await session.commit()
@@ -1191,11 +1213,11 @@ class SyncEngine:
                 f"{h(exc.message)}.{size} Остальные посты канала обновляются как обычно, этот бот попробует "
                 "снова при следующей синхронизации.",
             )
-            return
+            return None
         async with self.ctx.db.session() as session:
             row = await self._row(session, channel_id, kind, block_id)
             if row is None:
-                return
+                return message
             out.saved(row, message)
             await session.commit()
         result.sent += 1
@@ -1206,6 +1228,7 @@ class SyncEngine:
             channel = await session.get(Channel, channel_id)
             base = channel_post_base(out.chat_id, channel.username if channel else None)
         await self._restored(channel_id, kind, block_id, base + str(message.message_id))
+        return message
 
     async def _restored(self, channel_id: int, kind: str, block_id: int, url: str) -> None:
         """A post that was deleted from the channel shows again: the owner hears where."""
@@ -1220,7 +1243,14 @@ class SyncEngine:
         )
 
     async def _send_media(
-        self, chat_id: int, media: MediaFile, kind: str | None, fragment: Fragment, reply_markup: Any = None
+        self,
+        chat_id: int,
+        media: MediaFile,
+        kind: str | None,
+        fragment: Fragment,
+        reply_markup: Any = None,
+        *,
+        silent: bool = True,
     ) -> Message:
         return await send_stored(
             self.ctx,
@@ -1230,7 +1260,7 @@ class SyncEngine:
             caption=fragment.text or None,
             caption_entities=fragment.to_entities() or None,
             parse_mode=None,
-            disable_notification=True,
+            disable_notification=silent,
             reply_markup=reply_markup,
         )
 
@@ -1266,9 +1296,14 @@ class SyncEngine:
             channel = await session.get(Channel, channel_id)
             assert channel is not None
             bases = kept_edits.post_bases(channel.chat_id, channel.username)
-            target = kept_edits.target_for(row.manual, block.fragment, block.content_hash(), bases)
+            source = await render_db.link_source(session, channel)  # whose posts its links lead to
+            link_bases = (
+                bases if source is channel else kept_edits.post_bases(source.chat_id, source.username)
+            )
+            target = kept_edits.target_for(row.manual, block.fragment, block.content_hash(), link_bases)
             content_hash = target.sent_hash
             key = f"{kind}:{block_id}"
+            plain_ok = _always_shown(kind, channel)
             # premium emoji the bot cannot put are put by the Premium account (premium_account.py)
             account = None
             bot_emoji = True
@@ -1304,7 +1339,7 @@ class SyncEngine:
                     target.fragment,
                     result,
                     key,
-                    plain_ok=kind in ALWAYS_SHOWN,
+                    plain_ok=plain_ok,
                     plain=plain,
                     channel_id=channel_id,
                 )
@@ -1347,7 +1382,7 @@ class SyncEngine:
                         target.fragment,
                         result,
                         key,
-                        plain_ok=kind in ALWAYS_SHOWN,
+                        plain_ok=plain_ok,
                         plain=plain,
                         channel_id=channel_id,
                     )

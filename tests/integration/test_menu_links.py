@@ -1,4 +1,4 @@
-"""Personal invitation links behind «📋 Service List» and «💬 Chat» in the bot's menu.
+"""Personal invitation links behind «📋 Service List», «📰 Service List Info» and «💬 Chat» in the bot's menu.
 
 Each person gets links of their own, for one join and a minute; 🔄 makes new ones; a link Telegram refuses
 turns into "try again", never into the permanent link. «🛡 Auto-garant» is in the menu even while deals are
@@ -75,7 +75,7 @@ async def test_a_private_channel_gives_each_person_a_link_of_their_own(h, tg, db
     assert h.button(ann, "🔄")["callback_data"] == "m:links"
     assert _url(h, ann, "Service List").startswith("https://t.me/+inv")
     assert _url(h, ann, "Service List") != _url(h, bob, "Service List")
-    assert ann["text"].endswith("🔐 Ссылки на канал и чат личные и живут 1 мин. Истекли — 🔄 или /start.")
+    assert ann["text"].endswith("🔐 Ссылки на каналы и чат личные и живут 1 мин. Истекли — 🔄 или /start.")
     made = tg.called("createChatInviteLink")
     assert [p["name"] for p in made] == [f"u{ANN}", f"u{BOB}"]
     assert all(p["chat_id"] == PRIVATE and p["member_limit"] == 1 for p in made)
@@ -174,3 +174,51 @@ async def test_the_garant_button_is_there_while_deals_are_off(h, tg, db):
     assert "скоро включим" in home["text"]
     texts = [b["text"] for b in h.buttons(home)]
     assert "➕ Создать сделку" not in texts and "📂 Мои сделки" in texts and "📖 Как это работает" in texts
+
+
+INFO_CHANNEL = -1008200003
+
+
+async def _info_channel(tg, db, *, username: str | None = None) -> None:
+    tg.add_chat(INFO_CHANNEL, "channel", "Service List Info", username=username)
+    async with db.session() as s:
+        s.add(
+            Channel(
+                chat_id=INFO_CHANNEL, role="info", status="live", title="Service List Info", username=username
+            )
+        )
+        await s.commit()
+
+
+async def test_the_info_channel_stands_next_to_the_list_in_the_menu(h, tg, db):
+    await _people(tg, db, ANN)
+    await _main_channel(tg, db, username="servicelist")
+    await h.say(ANN, "/menu")
+    assert _rows(h.last(ANN))[0] == ["📋 Service List"]  # not connected: the list across the width
+    await h.press(ANN, h.last(ANN), "Помощь")
+    assert "Service List Info" not in h.last(ANN)["text"]
+
+    await _info_channel(tg, db, username="slinfo")
+    await h.say(ANN, "/menu")
+    menu = h.last(ANN)
+    assert _rows(menu)[0] == ["📋 Service List", "📰 Service List Info"]
+    assert _url(h, menu, "Service List") == "https://t.me/servicelist"  # the list is still the first
+    assert _url(h, menu, "Service List Info") == "https://t.me/slinfo"
+    assert h.button(menu, "Service List Info")["style"] == "primary"
+    await h.press(ANN, menu, "Помощь")
+    assert "📰 Service List Info — новости списка" in h.last(ANN)["text"]
+
+
+async def test_a_private_info_channel_gives_each_person_a_link_of_their_own(h, tg, db, ctx):
+    await _people(tg, db, ANN)
+    await _main_channel(tg, db, username="servicelist")
+    await _info_channel(tg, db)
+    await h.say(ANN, "/menu")
+    menu = h.last(ANN)
+    first = _url(h, menu, "Service List Info")
+    assert first.startswith(f"https://t.me/+inv{abs(INFO_CHANNEL)}x")
+    assert "🔄" in [text for row in _rows(menu) for text in row] and "личные" in menu["text"]
+    _later(ctx)
+    await h.press(ANN, menu, "🔄")
+    fresh = _url(h, tg.messages[ANN][menu["message_id"]], "Service List Info")
+    assert fresh.startswith("https://t.me/+inv") and fresh != first

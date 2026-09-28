@@ -285,6 +285,7 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
                 await session.commit()
 
     # 2. new cards (text post + screenshots replying to it) and edits of existing ones
+    new_cards = 0
     for entry in entries:
         fragment = render_card(entry, tpl, tz)
         content_hash = fragment.content_hash()
@@ -322,8 +323,11 @@ async def _reconcile(engine: Any, channel_id: int, limiter: Any, result: Any) ->
                 target.dirty = False
                 await session.commit()
             result.sent += 1
+            new_cards += 1
         else:
             await _update_post(engine, channel_id, chat_id, row, fragment, bases, limiter, result)
+    if new_cards and hasattr(engine, "wake_role"):  # the Info channel's news of them link to the cards
+        engine.wake_role("info")
 
     # 3. paged index (newest first), every page pinned, page 1 pinned last so it shows on top
     async with ctx.db.session() as session:

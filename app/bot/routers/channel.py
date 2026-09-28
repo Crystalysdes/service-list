@@ -19,10 +19,10 @@ from app.db.models import Channel, ChannelPost
 from app.domain.render import compare
 from app.domain.richtext import Fragment
 from app.domain.symbols import channel_post_base
-from app.services import emoji_tasks
+from app.services import emoji_tasks, infofeed
 from app.services.audit import audit
 from app.services.catalog import request_sync
-from app.services.channels import remember_chat
+from app.services.channels import INACTIVE_STATUSES, remember_chat
 from app.services.notify import claim_notification, close_alert, notify_staff, remember_alert
 from app.services.settings import Runtime, get_settings
 from app.services.sync import manual as kept_edits
@@ -86,18 +86,33 @@ async def _owned(session: AsyncSession, channel_id: int, message_id: int) -> boo
     return any(own == message_id or message_id in (extra or []) for own, extra in rows.all())
 
 
+def _wake(ctx: AppContext, channel_id: int) -> None:
+    engine = ctx.get("sync")
+    if engine is not None:
+        engine.wake(channel_id)
+
+
 @router.channel_post()
 async def on_channel_post(message: Message, session: AsyncSession, **data: Any) -> None:
     if message.content_type in SERVICE_TYPES:  # a pin and the like is not a post after the navigation
         if message.pinned_message is not None:  # an admin's pinned post keeps its pin when it is moved
             await remember_pin(session, message.chat.id, message.pinned_message.message_id)
+            await infofeed.on_pin(session, message.chat.id, message.pinned_message.message_id)
         return
     if message.media_group_id:  # an album is moved as one (a forward of one photo does not tell)
         await remember_album(session, message.chat.id, message.message_id, message.media_group_id)
     await asyncio.sleep(OWN_POST_GRACE)
-    if message.message_id in data["ctx"].services.get(OWN_POSTS, set()):  # a copy the bot just made
+    if (message.chat.id, message.message_id) in data["ctx"].services.get(OWN_POSTS, set()):  # its copy
         return
     channel = await _channel(session, message.chat.id)
+    if channel is not None and channel.role == "info":
+        # an admin's post (news, an ad) in the Info channel is kept; not in one a move is filling (the bot's
+        # copies land there)
+        moving = channel.status in INACTIVE_STATUSES
+        if not moving and not await _owned(session, channel.id, message.message_id):
+            await infofeed.on_post(session, channel, message)
+            _wake(data["ctx"], channel.id)
+        return
     if channel is None or channel.role not in ("main", "mirror") or channel.status == "retired":
         return
     runtime = await get_settings(session, Runtime)
@@ -141,6 +156,12 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
     ).scalars()
     # the row that shows the post (a block before the navigation before a leftover)
     row = min(owners, key=lambda r: (OWNER_RANK.get(r.kind, len(OWNER_RANK)), r.id), default=None)
+    if channel.role == "info" and (row is None or row.kind == "info"):
+        # a post of the Info feed: the record and its copy follow the edit (no alert, the admins' words)
+        if channel.status not in INACTIVE_STATUSES:
+            await infofeed.on_edit(session, channel, message)
+            _wake(data["ctx"], channel.id)
+        return
     if row is None or row.snapshot is None:
         return
     edited = Fragment.from_message(message)

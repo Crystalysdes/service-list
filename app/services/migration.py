@@ -35,15 +35,29 @@ from app.services.settings import Runtime, get_settings
 
 log = logging.getLogger(__name__)
 
-LIST_ROLES = ("main", "mirror", "scam")
+LIST_ROLES = ("main", "mirror", "scam", "info")
 
 
 async def publish(ctx: AppContext, channel_id: int) -> Any:
-    """Fill a channel now (also before "live"), respecting Telegram's posting pace."""
+    """Fill a channel now (also before "live"), respecting Telegram's posting pace. The Info channel is filled
+    in portions: between them the other channels get their turn."""
     from app.services.sync.engine import RateLimiter, SyncEngine
 
     engine = ctx.get("sync") or SyncEngine(ctx)
-    return await engine.reconcile(channel_id, RateLimiter(18), force=True)
+    worker = engine.workers.get(channel_id)
+    limiter = worker.limiter if worker is not None else RateLimiter(18)  # one pace for the channel
+    result = await engine.reconcile(channel_id, limiter, force=True)
+    while result.pending and not result.errors:
+        more = await engine.reconcile(channel_id, limiter, force=True)
+        result.sent += more.sent
+        result.edited += more.edited
+        result.skipped += more.skipped
+        result.errors += more.errors
+        progress = more.sent or more.pending < result.pending
+        result.pending = more.pending
+        if not progress:  # nothing moves (the channel is gone?): the report says what is left
+            break
+    return result
 
 
 async def posts_count(session: AsyncSession, channel_id: int) -> int:
@@ -76,6 +90,10 @@ async def make_current(
         old.status = "retired"
     channel.role = role
     channel.status = "live" if runtime.live else "setup"
+    if role == "main":  # the news of the Info channel lead into the new main channel
+        from app.services.infofeed import after_main_moved
+
+        await after_main_moved(session)
     await audit(
         session,
         actor,

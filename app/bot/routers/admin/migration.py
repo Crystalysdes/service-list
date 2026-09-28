@@ -1,4 +1,4 @@
-"""Admin: moving to a new channel (main or Scam list), mirrors."""
+"""Admin: moving to a new channel (main, Scam list or Service List Info), mirrors."""
 
 from __future__ import annotations
 
@@ -19,16 +19,17 @@ from app.bot.filters import RoleFilter
 from app.bot.i18n import h
 from app.context import AppContext
 from app.db.models import Channel
-from app.services import migration
+from app.services import infofeed, migration
 from app.services.channels import (
     RIGHT_NAMES,
-    ROLE_TITLES,
+    channel_what,
     chat_ref_from_message,
     ensure_invite_link,
     inspect_chat,
     known_chats,
     missing_rights,
     request_chat_keyboard,
+    role_title,
     save_channel,
 )
 
@@ -43,7 +44,8 @@ HELP = (
     "сообщений, приглашение пользователей) и выберите канал в списке выше, перешлите оттуда пост "
     "или пришлите @username / ID."
 )
-MOVE_REQUEST_IDS = {"main": 201, "scam": 202}
+MOVE_REQUEST_IDS = {"main": 201, "scam": 202, "info": 203}
+ICONS = {"main": "📋", "scam": "🚫", "info": "📰"}
 
 
 class MoveConnect(StatesGroup):
@@ -69,15 +71,17 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         "🚚 <b>Переезд и зеркала</b>",
         "",
         "Если канал заблокировали или его нужно собрать заново, бот опубликует всё в новом канале в том же "
-        "оформлении — посты, навигацию последней и закреп, для Scam list — карточки и индекс. Кнопки меню "
-        "и ссылки переключатся сами, когда вы нажмёте «Сделать основным».",
+        "оформлении — посты, навигацию последней и закреп, для Scam list — карточки и индекс, для Service "
+        "List Info — закреп и все посты по порядку, с альбомами, пересланными постами и кнопками. Кнопки "
+        "меню и ссылки переключатся сами, когда вы нажмёте «Сделать основным».",
         "",
     ]
     builder = InlineKeyboardBuilder()
     for channel in rows:
-        role = ROLE_TITLES.get(channel.role, channel.role)
         if channel.status == "migrating":
-            lines.append(f"⏳ Новый {role}: {_name(channel)} — наполняется, ещё не основной")
+            left = await infofeed.backlog_left(session, channel.id) if channel.role == "info" else 0
+            state = f"публикуется, осталось постов: {left}" if left else "наполняется, ещё не основной"
+            lines.append(f"⏳ Новый {channel_what(channel.role)}: {_name(channel)} — {state}")
             builder.button(
                 text=f"✅ Сделать основным: {channel.title or channel.chat_id}"[:60],
                 callback_data=f"a:mig:switch:{channel.id}",
@@ -92,11 +96,11 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
             )
         else:
             state = "⚠️ недоступен" if channel.status == "broken" else channel.status
-            lines.append(
-                f"{'📋' if channel.role == 'main' else '🚫'} {role.capitalize()}: {_name(channel)} — {state}"
-            )
+            icon = ICONS.get(channel.role, "📢")
+            lines.append(f"{icon} {role_title(channel.role, capital=True)}: {_name(channel)} — {state}")
     builder.button(text="📋 Новый основной канал", callback_data="a:mig:new:main")
     builder.button(text="🚫 Новый канал Scam list", callback_data="a:mig:new:scam")
+    builder.button(text="📰 Новый канал Service List Info", callback_data="a:mig:new:info")
     builder.adjust(1)
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="a:ch"))
     return "\n".join(lines), builder.as_markup()
@@ -114,7 +118,7 @@ async def on_screen(call: CallbackQuery, state: FSMContext, session: AsyncSessio
     await call.message.answer(text, reply_markup=markup)
 
 
-@router.callback_query(F.data.regexp(r"^a:mig:new:(main|scam)$"))
+@router.callback_query(F.data.regexp(r"^a:mig:new:(main|scam|info)$"))
 async def on_new(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     role = (call.data or "").rsplit(":", 1)[1]
     await state.set_state(MoveConnect.waiting)
@@ -132,8 +136,14 @@ async def on_new(call: CallbackQuery, state: FSMContext, session: AsyncSession, 
     builder.button(text="✖️ Отмена", callback_data="a:mig")
     builder.adjust(1)
     listed = "Каналы, где бот уже администратор, — нажмите нужный.\n\n" if chats else ""
+    note = (
+        "\n\nДо «Сделать основным» ничего не публикуйте в новом канале сами: бот переносит туда посты "
+        "по порядку, а новые пишите пока в прежнем."
+        if role == "info"
+        else ""
+    )
     await call.message.edit_text(
-        f"🚚 Новый {ROLE_TITLES[role]} канал.\n\n{listed}{HELP}", reply_markup=builder.as_markup()
+        f"🚚 Новый {channel_what(role)}.\n\n{listed}{HELP}{note}", reply_markup=builder.as_markup()
     )
     await call.message.answer(
         "👇 Кнопка выбора — внизу экрана.", reply_markup=request_chat_keyboard(role, MOVE_REQUEST_IDS[role])
@@ -229,7 +239,7 @@ async def on_channel(
     await start_move(message, role, ref, session=session, bot=bot, state=state, data=data)
 
 
-@router.callback_query(F.data.regexp(r"^a:mig:pick:(main|scam):-?\d+$"))
+@router.callback_query(F.data.regexp(r"^a:mig:pick:(main|scam|info):-?\d+$"))
 async def on_pick(
     call: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot, **data: Any
 ) -> None:
@@ -255,6 +265,13 @@ async def on_switch(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
     channel = await session.get(Channel, int((call.data or "").rsplit(":", 1)[1]))
     if channel is None or channel.status == "retired" or channel.role not in migration.LIST_ROLES:
         await call.answer("Канал не найден", show_alert=True)
+        return
+    left = await infofeed.backlog_left(session, channel.id) if channel.role == "info" else 0
+    if left and channel.status == "migrating":  # the new Info channel is not complete yet
+        await call.answer(
+            f"⏳ В новый канал ещё публикуются посты: осталось {left}. Дождитесь итога и нажмите снова.",
+            show_alert=True,
+        )
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Да, переключить", callback_data=f"a:mig:yes:{channel.id}", style="danger")

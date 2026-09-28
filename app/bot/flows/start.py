@@ -158,11 +158,14 @@ def menu_keyboard(t: Translator, links: MenuLinks, scam_url: str | None) -> Inli
         return button(key, callback_data="m:links", **kwargs)
 
     builder = InlineKeyboardBuilder()
-    builder.row(
+    first = [
         link_button("menu.service_list", links.main, style="primary")
         if links.main is not None
         else button("menu.service_list", callback_data="m:nochan", style="primary")
-    )
+    ]
+    if links.info is not None:  # the Service List Info channel, next to the list
+        first.append(link_button("menu.service_list_info", links.info, style="primary"))
+    builder.row(*first)
     second = [button("menu.garant", callback_data="g:home", style="primary")]
     if links.chat is not None:
         second.append(link_button("menu.chat", links.chat, style="primary"))

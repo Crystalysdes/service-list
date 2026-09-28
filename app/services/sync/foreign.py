@@ -28,7 +28,8 @@ from app.services.settings import ChannelLayout, get_settings, update_settings
 
 log = logging.getLogger(__name__)
 
-OWN_POSTS = "channel_own_posts"  # ctx.services: ids of the copies the bot made (no admin's posts after all)
+# ctx.services: (chat id, message id) of the copies the bot made (no admin's posts after all)
+OWN_POSTS = "channel_own_posts"
 MISSES = 10  # empty ids in a row after the known ones: the end of the channel
 MAX_ITEMS = 30  # more posts than this under the last block are not moved by themselves: the admin is told
 PINS_KEPT = 50

@@ -36,12 +36,28 @@ REQUIRED_RIGHTS: dict[str, tuple[str, ...]] = {
     "main": ("can_post_messages", "can_edit_messages", "can_delete_messages", "can_invite_users"),
     "mirror": ("can_post_messages", "can_edit_messages", "can_delete_messages", "can_invite_users"),
     "scam": ("can_post_messages", "can_edit_messages", "can_delete_messages", "can_invite_users"),
+    # the main post pinned there: in a channel pinning comes with editing
+    "info": ("can_post_messages", "can_edit_messages", "can_delete_messages", "can_invite_users"),
     "storage": ("can_post_messages", "can_edit_messages", "can_delete_messages"),
     "community": ("can_invite_users",),  # personal links into the chat for the bot's menu
 }
-ROLE_TITLES = {"main": "основной", "mirror": "зеркало", "scam": "Scam list", "storage": "служебный"}
+ROLE_TITLES = {
+    "main": "основной",
+    "mirror": "зеркало",
+    "scam": "Scam list",
+    "info": "Service List Info",
+    "storage": "служебный",
+}
 # request_id of the "choose a chat" keyboard button per purpose (any int32; tells the answers apart)
-REQUEST_IDS = {"main": 101, "scam": 102, "mirror": 103, "storage": 104, "moderation": 105, "community": 106}
+REQUEST_IDS = {
+    "main": 101,
+    "scam": 102,
+    "mirror": 103,
+    "storage": 104,
+    "moderation": 105,
+    "community": 106,
+    "info": 107,
+}
 GROUP_ROLES = ("moderation", "community")
 RIGHT_FLAGS = (
     "can_manage_chat",
@@ -56,6 +72,19 @@ RIGHT_FLAGS = (
 )
 # channels that are not "the" main / scam channel: retired ones and new ones still being filled (a move)
 INACTIVE_STATUSES = ("retired", "migrating")
+
+
+def role_title(role: str, *, capital: bool = False) -> str:
+    """The role's name in a text: «основной», «Scam list» (``capital``: «Основной», the rest as is)."""
+    title = ROLE_TITLES.get(role, role)
+    return title[:1].upper() + title[1:] if capital else title
+
+
+def channel_what(role: str) -> str:
+    """«основной канал», «канал Scam list», «канал Service List Info»: a name stays after the word."""
+    title = role_title(role)
+    return f"{title} канал" if title[:1].islower() else f"канал {title}"
+
 
 _REF_RE = re.compile(r"^(?:https?://)?(?:t\.me/|telegram\.me/)?@?([A-Za-z][A-Za-z0-9_]{3,31})/?$")
 
@@ -168,6 +197,12 @@ async def main_channel(session: AsyncSession) -> Channel | None:
 
 async def scam_channel(session: AsyncSession) -> Channel | None:
     rows = await active_channels(session, ("scam",))
+    return rows[0] if rows else None
+
+
+async def info_channel(session: AsyncSession) -> Channel | None:
+    """THE Service List Info channel (not one a move is filling)."""
+    rows = await active_channels(session, ("info",))
     return rows[0] if rows else None
 
 

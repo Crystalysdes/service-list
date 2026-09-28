@@ -147,6 +147,23 @@ class Announce(SettingsGroup):
     new_services: bool = True
 
 
+class InfoFeed(SettingsGroup):
+    """The bot's news in the Service List Info channel (app/services/infofeed.py): the kinds it publishes."""
+
+    KEY: ClassVar[str] = "info_feed"
+
+    # the feed's start (the first pass over an Info channel on air): nothing that happened before is news
+    started_at: datetime | None = None
+    services: bool = True  # a new service in the list
+    categories: bool = True  # a new category
+    claims: bool = True  # an owner confirmed their service
+    deals: bool = True  # a garant deal that went well
+    scams: bool = True  # a new Scam list entry
+    sound: bool = False  # the bot's news with a notification sound
+    # a kind switched on again: what happened while it was off is not caught up with
+    since: dict[str, datetime] = Field(default_factory=dict)
+
+
 class ChannelLayout(SettingsGroup):
     """The admins' own posts (ads) below the main channel's last category when a new one comes: moved below
     it (app/services/sync/foreign.py)."""

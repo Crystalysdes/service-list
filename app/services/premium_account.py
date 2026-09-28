@@ -807,7 +807,11 @@ async def _chats(ctx: AppContext) -> list[ChatInfo]:
         channels = (
             await session.execute(
                 select(Channel)
-                .where(Channel.role.in_(("main", "mirror")), Channel.status.not_in(INACTIVE_STATUSES))
+                .where(
+                    # the Info channel too: the main post pinned there has the premium emoji of the original
+                    Channel.role.in_(("main", "mirror", "info")),
+                    Channel.status.not_in(INACTIVE_STATUSES),
+                )
                 .order_by(Channel.id)
             )
         ).scalars()

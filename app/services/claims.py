@@ -112,9 +112,11 @@ async def assign_owner(
         request.reason = "владелец уже подтверждён"
         request.decided_at = utcnow()
     await audit(session, user.id, "service.claim", "service", service.id, {"method": method})
+    from app.services import infofeed
     from app.services.announce import enqueue_claimed
 
     await enqueue_claimed(session, service)  # everyone in the bot hears that its owner confirmed it
+    await infofeed.note_claim(session, service)  # and the Info channel
     await session.commit()
     for request in others:
         await close_cards(ctx, "request", request.id, "✖️ Закрыта: владелец сервиса уже подтверждён")

@@ -24,6 +24,7 @@ from app.bot.i18n import LANGS, Translator, h
 from app.db.base import utcnow
 from app.domain.captcha import check, is_blocked, new_challenge
 from app.services import announce
+from app.services.channels import info_channel
 from app.services.invites import ttl_text
 from app.services.render_db import support_link
 from app.services.settings import Captcha, get_settings
@@ -212,7 +213,7 @@ async def on_refresh_links(call: CallbackQuery, **data: Any) -> None:
     if isinstance(call.message, Message):
         with contextlib.suppress(TelegramBadRequest):  # "not modified": the links were fresh already
             await call.message.edit_reply_markup(reply_markup=markup)
-    retry = any(link is not None and link.retry for link in (links.main, links.chat))
+    retry = any(link is not None and link.retry for link in links.links)
     if retry:
         await call.answer(t("menu.links_failed"), show_alert=True)
     else:
@@ -224,6 +225,8 @@ async def _help(data: dict[str, Any]) -> tuple[str, Any]:
     t: Translator = data["t"]
     support = await support_link(data["session"])
     text = t("help.text")
+    if await info_channel(data["session"]) is not None:
+        text += "\n\n" + t("help.info")
     if support is not None:
         text += "\n\n" + t("help.support", contact=h(support[0]))
     return text, _help_keyboard(t, data["user"], support)

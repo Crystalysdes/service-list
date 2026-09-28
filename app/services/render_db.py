@@ -175,8 +175,33 @@ async def channel_urls(session: AsyncSession) -> dict[str, str]:
     return urls
 
 
+async def _current(session: AsyncSession, role: str) -> Channel | None:
+    return (
+        (
+            await session.execute(
+                select(Channel)
+                .where(Channel.role == role, Channel.status.not_in(INACTIVE_STATUSES))
+                .order_by(Channel.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def link_source(session: AsyncSession, channel: Channel) -> Channel:
+    """The channel whose posts the links of ``channel``'s posts lead to: its own; for the Service List Info
+    channel the main one (its pinned main post and its news point into the list)."""
+    if channel.role == "info":
+        main = await _current(session, "main")
+        if main is not None:
+            return main
+    return channel
+
+
 async def link_context(session: AsyncSession, channel: Channel, bot_username: str | None) -> LinkContext:
-    rows = await session.execute(select(ChannelPost).where(ChannelPost.channel_id == channel.id))
+    source = await link_source(session, channel)
+    rows = await session.execute(select(ChannelPost).where(ChannelPost.channel_id == source.id))
     posts: dict[str, int] = {}
     for row in rows.scalars():
         if not row.message_id:
@@ -187,12 +212,25 @@ async def link_context(session: AsyncSession, channel: Channel, bot_username: st
             posts[f"cat:{row.block_id}"] = row.message_id
         elif row.kind == "static":
             posts[f"static:{row.block_id}"] = row.message_id
-    return LinkContext(
+    ctx = LinkContext(
         bot_username=bot_username,
-        post_base=channel_post_base(channel.chat_id, channel.username),
+        post_base=channel_post_base(source.chat_id, source.username),
         posts=posts,
         channels=await channel_urls(session),
     )
+    if channel.role == "info":  # its news of the Scam list lead to the cards
+        scam = await _current(session, "scam")
+        if scam is not None:
+            ctx.scam_post_base = channel_post_base(scam.chat_id, scam.username)
+            cards = await session.execute(
+                select(ChannelPost.block_id, ChannelPost.message_id).where(
+                    ChannelPost.channel_id == scam.id,
+                    ChannelPost.kind == "scam_card",
+                    ChannelPost.message_id.is_not(None),
+                )
+            )
+            ctx.scam_cards = {entry_id: message_id for entry_id, message_id in cards.all()}
+    return ctx
 
 
 @dataclass
@@ -208,6 +246,7 @@ class RenderedBlock:
     plain: Fragment | None = None
     # the post with each glowing name inside its service's link, for the Premium account (None: no such names)
     linked: Fragment | None = None
+    silent: bool = True  # sent without a notification sound (the Info channel's news may have one)
 
     @property
     def is_caption(self) -> bool:
@@ -287,6 +326,10 @@ async def render_block(
         return RenderedBlock(kind, 0, render_nav(await nav_items(session), tpl, ctx))
     if kind == "spare":  # keeps its place for a future category; meanwhile leads to the navigation
         return RenderedBlock(kind, block_id, render_spare(tpl, ctx))
+    if kind == "info":  # the bot's news in the Service List Info channel
+        from app.services.infofeed import render_block as render_news
+
+        return await render_news(session, block_id, ctx)
     return None
 
 

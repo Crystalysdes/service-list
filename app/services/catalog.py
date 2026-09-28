@@ -81,6 +81,9 @@ async def create_category(session: AsyncSession, header: Fragment, nav_label: st
     )
     session.add(category)
     await session.flush()
+    from app.services import infofeed
+
+    await infofeed.note(session, infofeed.CATEGORY, category.id)  # news once its post is out
     return category
 
 

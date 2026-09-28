@@ -24,8 +24,10 @@ OWNER_ID = 1001
 def no_own_post_grace(monkeypatch):
     """Channel updates are checked at once: in tests nothing is sent concurrently with them."""
     from app.bot.routers import channel
+    from app.services import infofeed
 
     monkeypatch.setattr(channel, "OWN_POST_GRACE", 0)
+    monkeypatch.setattr(infofeed, "SETTLE", 0)  # an admin's post is copied on the next pass
 
 
 @pytest.fixture(scope="session")

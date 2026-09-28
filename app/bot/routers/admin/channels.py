@@ -1,4 +1,4 @@
-"""Admin: channels (main / scam / mirrors / storage) and the moderation group binding."""
+"""Admin: channels (main / scam / Service List Info / mirrors / storage) and the moderation group binding."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from app.bot.routers.admin.panel import back_home
 from app.bot.states import ChannelConnect
 from app.db.models import Channel, ChannelPost
 from app.domain.symbols import channel_post_base
+from app.services import premium_account
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.channels import (
@@ -28,6 +29,7 @@ from app.services.channels import (
     RIGHT_NAMES,
     ROLE_TITLES,
     active_channels,
+    channel_what,
     chat_ref_from_message,
     ensure_invite_link,
     inspect_chat,
@@ -35,11 +37,13 @@ from app.services.channels import (
     main_channel,
     missing_rights,
     request_chat_keyboard,
+    role_title,
     save_channel,
 )
 from app.services.settings import (
     ChannelLayout,
     Chats,
+    InfoFeed,
     Limits,
     Runtime,
     get_settings,
@@ -71,22 +75,21 @@ def _what(role: str) -> str:
         return "группа модерации"
     if role == "community":
         return "чат сообщества (кнопка «💬 Chat» в меню)"
-    return f"{ROLE_TITLES[role]} канал"
+    return channel_what(role)
 
 
 async def channels_text(session: AsyncSession) -> str:
     chats = await get_settings(session, Chats)
-    channels = await active_channels(session, ("main", "scam", "mirror"))
+    channels = await active_channels(session, ("main", "scam", "mirror", "info"))
     lines = ["📡 <b>Каналы</b>", ""]
-    for role in ("main", "scam", "mirror"):
+    for role in ("main", "scam", "mirror", "info"):
         items = [c for c in channels if c.role == role]
+        title = role_title(role, capital=True)
         if not items:
-            lines.append(f"<b>{ROLE_TITLES[role].capitalize()}:</b> не подключён")
+            lines.append(f"<b>{title}:</b> не подключён")
         for c in items:
             name = f"@{c.username}" if c.username else (c.invite_link or str(c.chat_id))
-            lines.append(
-                f"<b>{ROLE_TITLES[role].capitalize()}:</b> {h(c.title or '')} ({h(name)}) — {c.status}"
-            )
+            lines.append(f"<b>{title}:</b> {h(c.title or '')} ({h(name)}) — {c.status}")
             if role == "main":
                 lines += await nav_lines(session, c)
     lines.append(f"<b>Служебный:</b> {chats.storage_chat_id if chats.storage_chat_id else 'не подключён'}")
@@ -154,7 +157,9 @@ async def nav_lines(session: AsyncSession, channel: Channel) -> list[str]:
     return lines
 
 
-def channels_keyboard(has_main: bool, has_scam: bool, move_foreign: bool = True) -> Any:
+def channels_keyboard(
+    has_main: bool, has_scam: bool, move_foreign: bool = True, has_info: bool = False
+) -> Any:
     builder = InlineKeyboardBuilder()
     if not has_main:
         builder.button(text="➕ Основной канал", callback_data="a:ch:add:main")
@@ -167,6 +172,10 @@ def channels_keyboard(has_main: bool, has_scam: bool, move_foreign: bool = True)
         builder.button(text="📦 Поднять категории над рекламой", callback_data="a:ch:tidy")
     if not has_scam:
         builder.button(text="➕ Канал Scam list", callback_data="a:ch:add:scam")
+    if has_info:
+        builder.button(text="📰 Service List Info", callback_data="a:info")
+    else:
+        builder.button(text="➕ Канал Service List Info", callback_data="a:ch:add:info")
     builder.button(text="➕ Зеркало", callback_data="a:ch:add:mirror")
     builder.button(text="🗄 Служебный канал", callback_data="a:ch:add:storage")
     builder.button(text="👥 Группа модерации", callback_data="a:ch:add:moderation")
@@ -177,9 +186,10 @@ def channels_keyboard(has_main: bool, has_scam: bool, move_foreign: bool = True)
 
 
 async def _channels_screen(session: AsyncSession) -> tuple[str, Any]:
-    roles = {c.role for c in await active_channels(session, ("main", "scam"))}
+    roles = {c.role for c in await active_channels(session, ("main", "scam", "info"))}
     moving = (await get_settings(session, ChannelLayout)).move_foreign
-    return await channels_text(session), channels_keyboard("main" in roles, "scam" in roles, moving)
+    markup = channels_keyboard("main" in roles, "scam" in roles, moving, "info" in roles)
+    return await channels_text(session), markup
 
 
 @router.callback_query(F.data == "a:ch:tidy")
@@ -335,6 +345,14 @@ async def connect(
         return
     chat = check.chat
     user_id = data["user"].id
+    taken = await _taken_as(session, chat.id, role)
+    if taken is not None:  # a channel is one thing: picking the main one by mistake must not re-role it
+        await state.clear()
+        await target.answer(
+            f"⚠️ Этот канал уже подключён как {taken}. Выберите другой канал.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
     if role in ("storage", "moderation", "community"):
         chats = await get_settings(session, Chats)
         if role == "storage":
@@ -356,13 +374,17 @@ async def connect(
         await audit(session, user_id, f"{role}.connect", "chat", chat.id)
     else:
         existing = [c for c in await active_channels(session, (role,)) if c.chat_id != chat.id]
-        if role in ("main", "scam") and existing:
+        if role in ("main", "scam", "info") and existing:
             await state.clear()
             await target.answer(
                 "⚠️ Такой канал уже подключён. Для замены используйте «🚚 Переезд / пересборка».",
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
+        again = (
+            await session.execute(select(Channel).where(Channel.chat_id == chat.id))
+        ).scalar_one_or_none()
+        fresh = again is None or again.role != role or again.status == "retired"
         channel = await save_channel(session, chat, role, await ensure_invite_link(bot, chat))
         await audit(session, user_id, "channel.connect", "channel", channel.id, {"role": role})
         live = (await get_settings(session, Runtime)).live
@@ -373,6 +395,10 @@ async def connect(
             after = "Бот сейчас заполнит канал."
         else:
             after = "Посты будут опубликованы при запуске в эфир."
+        if role == "info":
+            if fresh:  # a new feed: its news start with its first pass on air
+                await update_settings(session, InfoFeed, started_at=None)
+            after = await _info_after(data["ctx"], session, live)
         note = f"✅ Канал подключён: {h(chat.title or chat.id)} — {ROLE_TITLES[role]}.\n{after}"
     await state.clear()
     await session.commit()
@@ -382,6 +408,42 @@ async def connect(
     await target.answer(note, reply_markup=ReplyKeyboardRemove())
     text, markup = await _channels_screen(session)
     await target.answer(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+
+async def _taken_as(session: AsyncSession, chat_id: int, role: str) -> str | None:
+    """What the chat is connected as already, when that is something else (None: it is free for ``role``)."""
+    known = (await session.execute(select(Channel).where(Channel.chat_id == chat_id))).scalar_one_or_none()
+    if known is not None and known.status != "retired" and known.role != role:
+        return channel_what(known.role)
+    chats = await get_settings(session, Chats)
+    if role != "storage" and chat_id == chats.storage_chat_id:
+        return "служебный канал"
+    if role == "storage" and known is not None and known.status != "retired":
+        return channel_what(known.role)
+    return None
+
+
+async def _info_after(ctx: Any, session: AsyncSession, live: bool) -> str:
+    """What happens next with a new Service List Info channel."""
+    lines = [
+        "Бот опубликует в нём главный пост Service List и закрепит его, дальше туда пойдут новости списка. "
+        "Свои новости и рекламу публикуйте прямо в канале — бот сохранит каждый пост."
+        if live
+        else "Главный пост и новости списка пойдут туда после запуска в эфир."
+    ]
+    if not (await get_settings(session, Chats)).storage_chat_id:
+        lines.append(
+            "⚠️ Подключите 🗄 Служебный канал: туда бот копирует все посты Info, чтобы их можно было "
+            "восстановить."
+        )
+    account = premium_account.get(ctx)
+    if account is not None and account.state != premium_account.OFF:
+        lines.append(
+            "👤 Чтобы в закрепе были премиум-эмодзи, сделайте аккаунт с Premium администратором этого канала "
+            "с правом редактировать сообщения."
+        )
+    lines.append("Настройки: 📡 Каналы → 📰 Service List Info.")
+    return "\n\n".join(lines)
 
 
 @router.message(ChannelConnect.waiting, F.chat.type == "private")

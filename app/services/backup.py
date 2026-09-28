@@ -538,11 +538,13 @@ async def _after_restore(session: AsyncSession, manifest: dict[str, Any] | None 
         await tidy_names(session)
     # the new server must prove premium emoji work again before posts with them are touched
     await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
+    from app.services import infofeed
     from app.services.announce import cancel_unfinished
     from app.services.emoji_tasks import drop_after_restore
 
     await cancel_unfinished(session)  # the archive may predate announcements sent since
     await drop_after_restore(session)  # its emoji tasks speak of posts as they were then
+    await infofeed.after_restore(session)  # and news of the Info channel published since
     # the archive may predate payouts made since: garant payouts wait until the account's history since the
     # archive was made is checked (a payout sent after it must not go out a second time)
     if await session.scalar(select(func.count()).select_from(Deal)):

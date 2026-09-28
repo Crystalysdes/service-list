@@ -156,6 +156,7 @@ class FakeTelegram:
         *,
         date: int | None = None,
         photo: bool = False,
+        video: bool = False,
         caption: str | None = None,
         caption_entities: list[dict] | None = None,
         service: bool = False,
@@ -186,11 +187,10 @@ class FakeTelegram:
             msg["media_group_id"] = media_group_id
         if service:
             msg["new_chat_title"] = chat.get("title", "")
-        elif photo:
-            file_id = f"photo_{chat_id}_{mid}"
-            msg["photo"] = [
-                {"file_id": file_id, "file_unique_id": f"u{file_id}", "width": 800, "height": 400}
-            ]
+        elif photo or video:
+            kind = "photo" if photo else "video"
+            file_id = f"{kind}_{chat_id}_{mid}"
+            msg.update(self._media_object(kind, file_id))
             self.files[file_id] = b"\x89PNG fake image " + str(mid).encode()
             if caption is not None:
                 msg["caption"] = caption
@@ -479,6 +479,7 @@ class FakeTelegram:
             msg["reply_markup"] = markup
         else:
             msg.pop("reply_markup", None)
+        msg["edit_date"] = self.clock
         return self._export(msg)
 
     def m_editMessageMedia(self, params: dict, files: dict) -> dict:
@@ -594,16 +595,26 @@ class FakeTelegram:
         return {"message_id": forwarded["message_id"]}
 
     def _album(self, method: Any, params: dict, files: dict) -> list[dict]:
+        """Like Telegram: the messages that are not there (any more) are skipped; none at all is an error."""
         ids = params["message_ids"]
         if isinstance(ids, str):
             ids = json.loads(ids)
         group = f"mg{self._new_id(-777)}"
         result = []
+        missing: FakeError | None = None
         for mid in ids:
-            one = method({**params, "message_id": mid}, files)
+            try:
+                one = method({**params, "message_id": mid}, files)
+            except FakeError as err:
+                if "not found" not in err.description or "chat not found" in err.description:
+                    raise
+                missing = err
+                continue
             stored = self.messages[self._chat(params["chat_id"])["id"]][one["message_id"]]
             stored["media_group_id"] = group
             result.append({"message_id": one["message_id"]})
+        if not result and missing is not None:
+            raise missing
         return result
 
     def m_copyMessages(self, params: dict, files: dict) -> list[dict]:
@@ -986,18 +997,23 @@ class FakeTelegram:
         if not 2 <= len(params["media"]) <= 10:
             raise FakeError(400, "Bad Request: wrong number of media in the album")
         result = []
+        group = f"mg{self._new_id(-778)}"
         for item in params["media"]:
-            file_id = self._upload(files, item["media"], item.get("type", "photo"))
+            kind = item.get("type", "photo")
+            file_id = self._upload(files, item["media"], kind)
             msg = self._base_message(chat)
-            msg["media_group_id"] = "mg1"
-            msg["photo"] = [
-                {"file_id": file_id, "file_unique_id": f"u{file_id}", "width": 800, "height": 400}
-            ]
-            if item.get("caption"):
-                msg["caption"] = item["caption"]
-            if item.get("type") == "document":
-                msg.pop("photo")
+            msg["media_group_id"] = group
+            if kind == "document":
                 msg["document"] = {"file_id": file_id, "file_unique_id": f"u{file_id}", "file_name": "f.png"}
+            else:
+                msg.update(self._media_object(kind, file_id))
+            if item.get("caption"):
+                text, entities = self._process_entities(
+                    chat, item["caption"], item.get("caption_entities"), item.get("parse_mode")
+                )
+                msg["caption"] = text
+                if entities:
+                    msg["caption_entities"] = entities
             self._common(msg, params)
             self._store(chat, msg)
             result.append(self._export(msg))
@@ -1244,6 +1260,44 @@ class Harness:
         msg["text"] = text
         msg["edit_date"] = self.tg.tick()
         await self.feed({"edited_message": self.tg._export(msg)})
+
+    async def channel_post(self, chat_id: int, text: str = "", **kwargs: Any) -> dict[str, Any]:
+        """An admin posts in a channel (``tg.post`` arguments): the bot gets the channel_post update."""
+        msg = self.tg.post(chat_id, text, **kwargs)
+        await self.feed({"channel_post": self.tg._export(msg)})
+        return msg
+
+    async def channel_edit(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        text: str | None = None,
+        caption: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """An admin edits a channel post by hand: the bot gets the edited_channel_post update."""
+        msg = self.tg.messages[chat_id][message_id]
+        if text is not None:
+            msg["text"] = text
+            msg.pop("entities", None)
+        if caption is not None:
+            msg["caption"] = caption
+            msg.pop("caption_entities", None)
+        if reply_markup is not None:
+            msg["reply_markup"] = reply_markup
+        msg["edit_date"] = self.tg.tick()
+        await self.feed({"edited_channel_post": self.tg._export(msg)})
+        return msg
+
+    async def channel_pin(self, chat_id: int, message_id: int) -> None:
+        """An admin pins a channel post: Telegram posts the service message that says which."""
+        self.tg.pins.setdefault(chat_id, []).append(message_id)
+        pin = self.tg.post(chat_id, service=True)
+        pin.pop("new_chat_title", None)
+        pin["pinned_message"] = self.tg._export(self.tg.messages[chat_id][message_id])
+        await self.feed({"channel_post": self.tg._export(pin)})
+        del self.tg.messages[chat_id][pin["message_id"]]
 
     async def group_say(self, chat_id: int, user_id: int, text: str, thread_id: int | None = None) -> None:
         msg = self.tg.group_message(chat_id, user_id, text, thread_id)

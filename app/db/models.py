@@ -61,7 +61,7 @@ class Channel(TimestampMixin, Base):
     username: Mapped[str | None] = mapped_column(String(64))
     title: Mapped[str | None] = mapped_column(String(256))
     invite_link: Mapped[str | None] = mapped_column(String(256))
-    role: Mapped[str] = mapped_column(String(16))  # main / mirror / scam
+    role: Mapped[str] = mapped_column(String(16))  # main / mirror / scam / info
     status: Mapped[str] = mapped_column(String(16), default="setup")  # setup/live/paused/broken/retired
     last_health_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -369,7 +369,7 @@ class ChannelPost(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id", ondelete="CASCADE"), index=True)
-    # intro / static / category / nav / spare / scam_card / scam_album / scam_index
+    # static / category / nav / spare / old_nav / scam_card / scam_index / info (an InfoPost)
     kind: Mapped[str] = mapped_column(String(16))
     block_id: Mapped[int] = mapped_column(Integer, default=0)
     message_id: Mapped[int | None] = mapped_column(Integer)
@@ -502,6 +502,49 @@ class Broadcast(CreatedMixin, Base):
     failed: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class InfoPost(TimestampMixin, Base):
+    """A post of the Service List Info channel (app/services/infofeed.py): news the bot publishes by itself
+    (an event: a new service or category, an owner who confirmed a service, a garant deal that went well, a
+    Scam list entry) or a post the admins published there (news, ads). Each is kept here and copied to the
+    storage channel, so that a new Info channel gets all of them again, in their order.
+
+    Where it is shown: ``ChannelPost(kind="info", block_id=id)`` of each Info channel."""
+
+    __tablename__ = "info_posts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # service:12 / category:3 / claim:12:777 / deal:5 / scam:4; an admin's post msg:<chat>:<id>, their album
+    # album:<chat>:<group>
+    key: Mapped[str] = mapped_column(String(96), unique=True)
+    kind: Mapped[str] = mapped_column(String(8))  # event / admin
+    event: Mapped[str | None] = mapped_column(String(16))  # service / category / claim / deal / scam
+    ref_id: Mapped[int | None] = mapped_column(Integer)
+    # waiting (the event is not seen yet) → ready (its text is set) → live (in the channel); dropped: never
+    # published; deleted: gone from the channel (by hand, or a Scam list entry taken back)
+    state: Mapped[str] = mapped_column(
+        String(12), default="waiting", server_default=text("'waiting'"), index=True
+    )
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # the feed's order
+    origin_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    origin_message_id: Mapped[int | None] = mapped_column(Integer)
+    # {"fragment": Fragment json, "buttons": [[text, url]]}; the links of the bot's news are symbolic
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    # the Telegram messages of an admin's post, as Telegram gave them (an album: one per item, in order)
+    messages: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    forward: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))  # +1 on every edit
+    # the copy in the storage channel and the version it shows
+    storage_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    storage_ids: Mapped[list[int]] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))
+    storage_version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # still in the channel?
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class AuditLog(Base):
