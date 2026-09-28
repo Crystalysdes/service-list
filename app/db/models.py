@@ -181,7 +181,8 @@ class Feature(TimestampMixin, Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     top_position: Mapped[int | None] = mapped_column(Integer)
-    # emoji: {"emoji_id", "alt"}; font: {"font_id", "glyphs": [[emoji_id, alt] | [null, " "]...], "plain"}
+    # emoji: {"emoji_id", "alt"}; font — the glowing name: {"glow": palette, "plain", "glyphs": [[emoji_id,
+    # alt]...] of the bot's pack once drawn, "glow_set", "glow_drawn"} (app/services/glownick.py)
     params: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     source: Mapped[str] = mapped_column(String(16), default="order")  # order / admin / import
 
@@ -338,33 +339,6 @@ class CustomEmoji(CreatedMixin, Base):
     set_name: Mapped[str | None] = mapped_column(String(128))
     in_catalog: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     catalog_order: Mapped[int] = mapped_column(Integer, default=0)
-
-
-class Font(CreatedMixin, Base):
-    __tablename__ = "fonts"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(64))
-    set_name: Mapped[str | None] = mapped_column(String(128))
-    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
-    sort_order: Mapped[int] = mapped_column(Integer, default=0)
-
-    glyphs: Mapped[list[FontGlyph]] = relationship(
-        back_populates="font", lazy="selectin", cascade="all, delete-orphan"
-    )
-
-
-class FontGlyph(Base):
-    __tablename__ = "font_glyphs"
-    __table_args__ = (UniqueConstraint("font_id", "char"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    font_id: Mapped[int] = mapped_column(ForeignKey("fonts.id", ondelete="CASCADE"))
-    char: Mapped[str] = mapped_column(String(8))
-    emoji_id: Mapped[str] = mapped_column(String(32), index=True)
-    alt: Mapped[str] = mapped_column(String(32))
-
-    font: Mapped[Font] = relationship(back_populates="glyphs")
 
 
 class StaticPost(TimestampMixin, Base):

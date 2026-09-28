@@ -10,6 +10,7 @@ from app.domain.richtext import Fragment
 from app.services import catalog
 from app.services.selftest import diagnostics, selftest
 from app.services.settings import Runtime, Templates, get_settings, update_settings
+from tests.fixtures.channel import LETTERS
 from tests.helpers import MAIN, STORAGE, engine_for, imported_channel
 
 
@@ -28,13 +29,20 @@ async def test_go_live_only_changes_cta_links(tg, db, ctx):
     result = await engine.run_once(ids["channel_id"])
     assert result.errors == [] and result.sent == 0
     assert result.edited == 3  # three category posts: "[занять место]" now leads to the bot
+    letters = {emoji_id for emoji_id, _alt in LETTERS.values()}
     for key in ("travel", "vpn", "design"):
         msg = _posts(tg)[ids[key]]
-        assert msg["text"] == before[ids[key]]["text"]
+        lines_before = before[ids[key]]["text"].split("\n")
+        # a name of emoji letters (there are no more such options) is shown as the name itself
+        expected = ["      ↳  Crystalys" if "[тык.]" in line else line for line in lines_before]
+        assert msg["text"].split("\n") == expected
         assert f"https://t.me/servicelist_bot?start=add_{key}" in _link_urls(msg)
-        emoji_before = [e for e in before[ids[key]]["entities"] if e["type"] == "custom_emoji"]
-        emoji_after = [e for e in msg["entities"] if e["type"] == "custom_emoji"]
-        assert emoji_before == emoji_after
+        emoji_before = [
+            e["custom_emoji_id"]
+            for e in before[ids[key]]["entities"]
+            if e["type"] == "custom_emoji" and e["custom_emoji_id"] not in letters
+        ]
+        assert emoji_before == [e["custom_emoji_id"] for e in msg["entities"] if e["type"] == "custom_emoji"]
     assert _posts(tg)[ids["nav"]] == before[ids["nav"]]
     again = await engine.run_once(ids["channel_id"])
     assert again.edited == 0 and again.sent == 0

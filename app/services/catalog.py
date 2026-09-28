@@ -168,7 +168,7 @@ def service_badges(service: Service) -> str:
         elif feature.kind == "emoji":
             badges.append("😀")
         elif feature.kind == "font":
-            badges.append("🔤")
+            badges.append("🌟")
     if service.status != "active":
         badges.append(
             {"hidden": "🙈", "banned": "🚫", "pending": "⏳", "approved": "💳"}.get(service.status, "·")
@@ -177,7 +177,7 @@ def service_badges(service: Service) -> str:
 
 
 def feature_line(feature: Any, tz_format: Any) -> str:
-    names = {"top": "Топ", "emoji": "Премиум-эмодзи", "font": "Эмодзи-название"}
+    names = {"top": "Топ", "emoji": "Премиум-эмодзи", "font": "Светящийся ник"}
     title = names.get(feature.kind, feature.kind)
     if feature.kind == "top":
         title += f"-{feature.top_position}"

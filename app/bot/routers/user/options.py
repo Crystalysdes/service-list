@@ -1,4 +1,4 @@
-"""Paid options from the service card: top 1/2/3, premium emoji, emoji-letter name; renewals."""
+"""Paid options from the service card: top 1/2/3, a premium emoji before the name, a glowing name."""
 
 from __future__ import annotations
 
@@ -17,8 +17,7 @@ from app.bot.flows.start import show_screen
 from app.bot.i18n import Translator, h
 from app.bot.routers.user.payments import send_invoice
 from app.db.base import utcnow
-from app.db.models import Category, CustomEmoji, Font, Service
-from app.domain.fonts import glyphs_to_json
+from app.db.models import Category, CustomEmoji, Service
 from app.domain.render import ItemView, render_item
 from app.domain.richtext import Fragment, RichText
 from app.services import billing, glow, moderation, options, purchases, render_db
@@ -368,104 +367,15 @@ async def on_own_emoji_message(
     await moderation.post_card(data["ctx"], request.id)
 
 
-# ----------------------------------------------------------------------------------------- font
-@router.callback_query(F.data.regexp(r"^opt:\d+:font$"))
-async def on_font(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    t: Translator = data["t"]
-    service = await _service(session, call, data["user"].id)
-    if service is None:
-        return
-    if service.status != "active":
-        await call.answer(t("opt.not_active"), show_alert=True)
-        return
-    category = await session.get(Category, service.category_id)
-    base = await billing.base_price(session, category, "font")  # type: ignore[arg-type]
-    templates = await get_settings(session, Templates)
-    marker = Fragment.from_json(templates.emoji_name_marker).text or "[тык.]"
-    fonts = await options.enabled_fonts(session)
-    builder = InlineKeyboardBuilder()
-    if glow.available():  # drawn by the bot itself: no emoji font needed
-        builder.button(text=t("opt.glow_button"), callback_data=f"opt:{service.id}:glow", style="primary")
-    for font in fonts:
-        builder.button(text=font.name[:40], callback_data=f"opt:{service.id}:f:{font.id}")
-    builder.adjust(1)
-    text = t("opt.font_title", name=h(service.name), price=billing.money(base), marker=h(marker))
-    if not fonts:
-        text += "\n\n" + t("opt.font_empty")
-    await call.answer()
-    assert call.message is not None
-    await call.message.edit_text(text, reply_markup=_back(t, service.id, builder))
-
-
-@router.callback_query(F.data.regexp(r"^opt:\d+:f:\d+$"))
-async def on_font_pick(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    t: Translator = data["t"]
-    service = await _service(session, call, data["user"].id)
-    if service is None:
-        return
-    font = await session.get(Font, int((call.data or "").split(":")[3]))
-    if font is None or not font.is_enabled:
-        await call.answer()
-        return
-    glyphs, missing, fits = await options.spell(session, font, service.name)
-    limits = await get_settings(session, Limits)
-    if missing:
-        await call.answer(t("opt.font_missing", chars=" ".join(missing)), show_alert=True)
-        return
-    if not fits:
-        await call.answer(t("opt.font_too_long", max=limits.max_font_letters), show_alert=True)
-        return
-    if not await options.trial_fits(session, service, glyphs=glyphs):
-        await call.answer(t("opt.no_room"), show_alert=True)
-        return
-    tpl = await render_db.templates(session)
-    emoji_feature = render_db.active_feature(service, "emoji")
-    emoji = (
-        (emoji_feature.params["emoji_id"], emoji_feature.params.get("alt", "⭐")) if emoji_feature else None
-    )
-    preview = _line_preview(tpl, service, emoji=emoji, glyphs=glyphs)
-    builder = InlineKeyboardBuilder()
-    if render_db.active_feature(service, "font") is not None:  # switch for free, or extend (periods below)
-        builder.button(
-            text=t("opt.font_set_free"), callback_data=f"opt:{service.id}:fset:{font.id}", style="success"
-        )
-    category = await session.get(Category, service.category_id)
-    base = await billing.base_price(session, category, "font")  # type: ignore[arg-type]
-    markup = await _periods_keyboard(session, t, service.id, "font", str(font.id), base, builder)
-    await call.answer()
-    assert call.message is not None
-    await call.message.answer(t("opt.emoji_preview"))
-    await call.message.answer(
-        preview.text,
-        entities=preview.to_entities(),
-        parse_mode=None,
-        reply_markup=markup,
-        link_preview_options=NO_PREVIEW,
-    )
-
-
-@router.callback_query(F.data.regexp(r"^opt:\d+:fset:\d+$"))
-async def on_font_set(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    t: Translator = data["t"]
-    service = await _service(session, call, data["user"].id)
-    if service is None:
-        return
-    font = await session.get(Font, int((call.data or "").split(":")[3]))
-    if font is None or not font.is_enabled or render_db.active_feature(service, "font") is None:
-        await call.answer()
-        return
-    glyphs, missing, fits = await options.spell(session, font, service.name)
-    if missing or not fits:
-        await call.answer(t("opt.font_missing", chars=" ".join(missing)), show_alert=True)
-        return
-    await options.set_font_now(session, service, font, glyphs)
-    await session.flush()
-    request_sync(data["ctx"])
-    await call.answer(t("opt.font_changed"), show_alert=True)
+# ----------------------------------------------------------------------------------------- old buttons
+@router.callback_query(F.data.regexp(r"^opt:\d+:(f|fset):\d+$"))
+async def on_font_gone(call: CallbackQuery, **data: Any) -> None:
+    """A button of the name made of emoji letters (in an older message): that option is no more."""
+    await call.answer(data["t"]("opt.gone"), show_alert=True)
 
 
 # ----------------------------------------------------------------------------------------- glowing name
-@router.callback_query(F.data.regexp(r"^opt:\d+:glow$"))
+@router.callback_query(F.data.regexp(r"^opt:\d+:(glow|font)$"))  # "font": older buttons and reminders
 async def on_glow(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     t: Translator = data["t"]
     service = await _service(session, call, data["user"].id)
@@ -518,7 +428,7 @@ async def on_glow_pick(call: CallbackQuery, session: AsyncSession, **data: Any) 
     animation = await asyncio.to_thread(glow.preview_gif, text, palette)  # a second or so of drawing
     builder = InlineKeyboardBuilder()
     if render_db.active_feature(service, "font") is not None:  # switch for free, or extend (periods below)
-        builder.button(text=t("opt.font_set_free"), callback_data=f"opt:{service.id}:glset:{palette}")
+        builder.button(text=t("opt.glow_apply"), callback_data=f"opt:{service.id}:glset:{palette}")
     category = await session.get(Category, service.category_id)
     base = await billing.base_price(session, category, "font")  # type: ignore[arg-type]
     markup = await _periods_keyboard(session, t, service.id, "font", f"glow_{palette}", base, builder)
@@ -597,16 +507,9 @@ async def on_buy(call: CallbackQuery, session: AsyncSession, **data: Any) -> Non
             await call.answer(problem, show_alert=True)
             return
         params = {"glyphs": [], "plain": service.name, "font_id": None, "glow": palette}
-    else:
-        font = await session.get(Font, int(arg))
-        if font is None or not font.is_enabled:
-            await call.answer()
-            return
-        glyphs, missing, fits = await options.spell(session, font, service.name)
-        if missing or not fits or not await options.trial_fits(session, service, glyphs=glyphs):
-            await call.answer(t("opt.no_room"), show_alert=True)
-            return
-        params = {"glyphs": glyphs_to_json(glyphs), "plain": service.name, "font_id": font.id}
+    else:  # a name of emoji letters (an older button): that option is no more
+        await call.answer(t("opt.gone"), show_alert=True)
+        return
     order = await billing.create_order(
         session, user_id=data["user"].id, service=service, kind=kind, months=months, params=params
     )

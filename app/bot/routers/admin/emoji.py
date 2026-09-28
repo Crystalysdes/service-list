@@ -1,4 +1,4 @@
-"""Admin: premium emoji catalog, emoji-letter fonts, granting options manually."""
+"""Admin: the premium emoji catalog; options granted by hand (top, emoji before the name, glowing name)."""
 
 from __future__ import annotations
 
@@ -17,19 +17,18 @@ from app.bot.filters import RoleFilter
 from app.bot.i18n import h
 from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
-from app.db.models import CustomEmoji, Feature, Font, FontGlyph, Service
-from app.domain.fonts import alphabet_mapping, build_glyphs
+from app.db.models import CustomEmoji, Feature, Service
 from app.domain.richtext import Fragment, RichText
-from app.services import billing, options
+from app.services import billing, glow, options
 from app.services.audit import audit
 from app.services.catalog import request_sync
+from app.services.glownick import glow_params, placeholder_glyphs
 from app.services.settings import Limits, get_settings, update_settings
 
 router = Router(name="admin_emoji")
 router.message.filter(RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
-DEFAULT_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 PACK_RE = re.compile(r"(?:t\.me/addemoji/|t\.me/addstickers/)?([A-Za-z0-9_]{3,64})/?$")
 
 
@@ -69,8 +68,7 @@ async def _catalog_screen(session: AsyncSession) -> tuple[str, Any]:
         text=("✅" if limits.allow_own_emoji else "▫️") + " Свои эмодзи пользователей",
         callback_data="a:emoji:own",
     )
-    builder.button(text="🔤 Шрифты", callback_data="a:fonts")
-    builder.adjust(2, 2, 1, 1, 1)
+    builder.adjust(2, 2, 1, 1)
     text = (
         f"😀 <b>Каталог премиум-эмодзи</b>: {count or 0} шт.\n\n"
         "Из него пользователи выбирают эмодзи перед названием. Добавляйте эмодзи сообщением "
@@ -181,197 +179,6 @@ async def on_catalog_own(call: CallbackQuery, session: AsyncSession, **data: Any
     await call.message.edit_text(text, reply_markup=markup)
 
 
-# ----------------------------------------------------------------------------------------- fonts
-async def _fonts_screen(session: AsyncSession) -> tuple[str, Any]:
-    fonts = list((await session.execute(select(Font).order_by(Font.sort_order, Font.id))).scalars())
-    builder = InlineKeyboardBuilder()
-    lines = ["🔤 <b>Шрифты для названий из эмодзи</b>", ""]
-    for font in fonts:
-        lines.append(f"{'✅' if font.is_enabled else '⛔️'} {h(font.name)} — {len(font.glyphs)} симв.")
-        builder.button(text=font.name[:40], callback_data=f"a:font:{font.id}")
-    if not fonts:
-        lines.append("Шрифтов нет. Добавьте пак с анимированными буквами.")
-    builder.button(text="➕ Шрифт из пака", callback_data="a:fonts:pack")
-    builder.button(text="➕ Шрифт из сообщения", callback_data="a:fonts:msg")
-    builder.adjust(1)
-    return "\n".join(lines), back_home(builder, target="a:emoji")
-
-
-@router.callback_query(F.data == "a:fonts")
-async def on_fonts(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
-    await state.clear()
-    await call.answer()
-    text, markup = await _fonts_screen(session)
-    assert call.message is not None
-    await call.message.edit_text(text, reply_markup=markup)
-
-
-@router.callback_query(F.data == "a:fonts:pack")
-async def on_font_pack(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
-    await ask(call, state, "font_pack", "Ссылка на пак с буквами (t.me/addemoji/…):", back="a:fonts")
-
-
-@input_handler("font_pack")
-async def input_font_pack(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
-    result = await _pack_items(data["bot"], message.text or "")
-    if result is None:
-        await message.answer("Не удалось открыть пак. Проверьте ссылку.")
-        return False
-    name, items = result
-    await data["state"].update_data(purpose="font_alphabet", pack=name, items=items)
-    await message.answer(
-        f"В паке {len(items)} эмодзи. Пришлите строку символов в том же порядке, что и эмодзи в паке "
-        f"(например <code>{DEFAULT_ALPHABET}0123456789</code>) или «-» для A–Z."
-    )
-    return False
-
-
-@router.callback_query(F.data == "a:fonts:msg")
-async def on_font_msg(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
-    await ask(
-        call,
-        state,
-        "font_msg",
-        "Пришлите сообщение с эмодзи-буквами по порядку (например, A–Z):",
-        back="a:fonts",
-    )
-
-
-@input_handler("font_msg")
-async def input_font_msg(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
-    items = [(i, a) for i, a in _emoji_items(message)]
-    fragment = Fragment.from_message(message)
-    ordered = [
-        (e.custom_emoji_id, fragment.entity_text(e))
-        for e in fragment.sorted_entities()
-        if e.type == "custom_emoji" and e.custom_emoji_id
-    ]
-    if not items:
-        await message.answer("В сообщении нет премиум-эмодзи.")
-        return False
-    await data["state"].update_data(purpose="font_alphabet", pack=None, items=ordered)
-    await message.answer(
-        f"Получено {len(ordered)} эмодзи. Пришлите строку символов в том же порядке или «-» для A–Z."
-    )
-    return False
-
-
-@input_handler("font_alphabet")
-async def input_font_alphabet(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
-    alphabet = (message.text or "").strip()
-    if alphabet == "-":
-        alphabet = DEFAULT_ALPHABET
-    items = [tuple(i) for i in fsm.get("items", [])]
-    mapping = alphabet_mapping(alphabet, items)  # type: ignore[arg-type]
-    if not mapping:
-        await message.answer("Не получилось сопоставить символы, попробуйте ещё раз.")
-        return False
-    session: AsyncSession = data["session"]
-    count = await session.scalar(select(func.count()).select_from(Font)) or 0
-    set_name = fsm.get("pack")
-    font = Font(name=set_name or f"Шрифт {count + 1}", set_name=set_name, sort_order=count)
-    session.add(font)
-    await session.flush()
-    for char, (emoji_id, alt) in mapping.items():
-        session.add(FontGlyph(font_id=font.id, char=char, emoji_id=emoji_id, alt=alt))
-    await session.flush()
-    await audit(session, data["user"].id, "font.create", "font", font.id, {"chars": len(mapping)})
-    await message.answer(f"✅ Шрифт «{h(font.name)}» создан: {len(mapping)} символов.")
-    await _send_preview(message, session, font.id)
-    return True
-
-
-async def _send_preview(
-    message: Message, session: AsyncSession, font_id: int, text: str = "SERVICE LIST"
-) -> None:
-    font = await session.get(Font, font_id, populate_existing=True)
-    if font is None:
-        return
-    glyphs, missing = build_glyphs(text, {g.char: (g.emoji_id, g.alt) for g in font.glyphs})
-    rt = RichText()
-    for glyph in glyphs:
-        if glyph.emoji_id:
-            rt.emoji(glyph.emoji_id, glyph.alt)
-        else:
-            rt.text(glyph.alt)
-    fragment = rt.build()
-    if fragment.text:
-        await message.answer(fragment.text, entities=fragment.to_entities(), parse_mode=None)
-    if missing:
-        await message.answer(
-            f"Нет символов: {h(' '.join(missing))}", reply_markup=back_home(target=f"a:font:{font_id}")
-        )
-    else:
-        await message.answer("Превью выше.", reply_markup=back_home(target=f"a:font:{font_id}"))
-
-
-@router.callback_query(F.data.regexp(r"^a:font:\d+$"))
-async def on_font_card(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
-    await state.clear()
-    font = await session.get(Font, int((call.data or "").split(":")[2]), populate_existing=True)
-    await call.answer()
-    assert call.message is not None
-    if font is None:
-        return
-    chars = "".join(sorted(g.char for g in font.glyphs))
-    builder = InlineKeyboardBuilder()
-    builder.button(text="👁 Превью", callback_data=f"a:font:{font.id}:pv")
-    builder.button(text="✏️ Название", callback_data=f"a:font:{font.id}:name")
-    builder.button(
-        text="⛔️ Выключить" if font.is_enabled else "✅ Включить", callback_data=f"a:font:{font.id}:tg"
-    )
-    builder.button(text="🗑 Удалить", callback_data=f"a:font:{font.id}:del")
-    builder.adjust(2)
-    await call.message.edit_text(
-        f"🔤 <b>{h(font.name)}</b>\nСимволы ({len(font.glyphs)}): <code>{h(chars)}</code>",
-        reply_markup=back_home(builder, target="a:fonts"),
-    )
-
-
-@router.callback_query(F.data.regexp(r"^a:font:\d+:(pv|name|tg|del)$"))
-async def on_font_action(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
-    parts = (call.data or "").split(":")
-    font = await session.get(Font, int(parts[2]))
-    if font is None:
-        await call.answer()
-        return
-    action = parts[3]
-    assert call.message is not None
-    if action == "pv":
-        await call.answer()
-        await _send_preview(call.message, session, font.id)
-        return
-    if action == "name":
-        await ask(
-            call,
-            state,
-            "font_name",
-            "Новое название шрифта (его видят пользователи):",
-            back=f"a:font:{font.id}",
-            font_id=font.id,
-        )
-        return
-    if action == "tg":
-        font.is_enabled = not font.is_enabled
-        await call.answer("Сохранено")
-    else:
-        await session.delete(font)
-        await call.answer("Удалено")
-    await session.flush()
-    text, markup = await _fonts_screen(session)
-    await call.message.edit_text(text, reply_markup=markup)
-
-
-@input_handler("font_name")
-async def input_font_name(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
-    font = await data["session"].get(Font, fsm["font_id"])
-    name = (message.text or "").strip()[:64]
-    if font is not None and name:
-        font.name = name
-    await message.answer("✅ Сохранено.", reply_markup=back_home(target=f"a:font:{fsm['font_id']}"))
-    return True
-
-
 # ----------------------------------------------------------------------------------------- grant options
 @router.callback_query(F.data.regexp(r"^a:svc:\d+:grant$"))
 async def on_grant(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
@@ -384,8 +191,7 @@ async def on_grant(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
     for position in range(1, category.top_slots + 1):
         builder.button(text=f"⭐ Топ-{position}", callback_data=f"a:svc:{service.id}:g:top:{position}")
     builder.button(text="😀 Эмодзи", callback_data=f"a:svc:{service.id}:g:emoji:0")
-    for font in await options.enabled_fonts(session):
-        builder.button(text=f"🔤 {font.name[:24]}", callback_data=f"a:svc:{service.id}:g:font:{font.id}")
+    builder.button(text="🌟 Светящийся ник", callback_data=f"a:svc:{service.id}:g:glow:0")
     builder.adjust(3)
     await call.answer()
     assert call.message is not None
@@ -403,10 +209,24 @@ def _durations(service_id: int, kind: str, arg: str) -> Any:
     return back_home(builder, target=f"a:svc:{service_id}")
 
 
-@router.callback_query(F.data.regexp(r"^a:svc:\d+:g:(top|emoji|font):\d+$"))
+@router.callback_query(F.data.regexp(r"^a:svc:\d+:g:(top|emoji|glow):\w+$"))
 async def on_grant_kind(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
     parts = (call.data or "").split(":")
     service_id, kind, arg = int(parts[2]), parts[4], parts[5]
+    if kind == "glow" and arg not in glow.PALETTES:  # first the colours
+        builder = InlineKeyboardBuilder()
+        for palette in glow.PALETTES:
+            builder.button(
+                text=glow.PALETTE_TITLES[palette], callback_data=f"a:svc:{service_id}:g:glow:{palette}"
+            )
+        builder.adjust(2)
+        await call.answer()
+        assert call.message is not None
+        await call.message.edit_text(
+            "🌟 Светящийся ник: бот нарисует название переливающимися буквами. Какие цвета?",
+            reply_markup=back_home(builder, target=f"a:svc:{service_id}"),
+        )
+        return
     if kind == "emoji":
         await ask(
             call,
@@ -437,7 +257,18 @@ async def input_grant_emoji(message: Message, data: dict[str, Any], fsm: dict[st
     return True
 
 
-@router.callback_query(F.data.regexp(r"^a:svc:\d+:gd:(top|emoji|font):\d+:\d+$"))
+async def _glow_problem(session: AsyncSession, service: Service) -> str | None:
+    """Why the name cannot be drawn as a glowing name now, or None."""
+    if not glow.available():
+        return "Светящийся ник сейчас недоступен: на сервере нет библиотек для рисования."
+    if not glow.drawable(service.name):
+        return "В названии нет букв, которые можно нарисовать."
+    if not await options.trial_fits(session, service, glyphs=placeholder_glyphs(service.name)):
+        return "В посте этой ветки не осталось места для эмодзи."
+    return None
+
+
+@router.callback_query(F.data.regexp(r"^a:svc:\d+:gd:(top|emoji|glow):\w+:\d+$"))
 async def on_grant_do(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     parts = (call.data or "").split(":")
     service = await session.get(Service, int(parts[2]))
@@ -445,30 +276,28 @@ async def on_grant_do(call: CallbackQuery, session: AsyncSession, **data: Any) -
         await call.answer()
         return
     kind, arg, days = parts[4], parts[5], int(parts[6])
+    done = "Выдано"
     if kind == "top":
         params: dict[str, Any] = {"position": int(arg)}
     elif kind == "emoji":
         emoji = await session.get(CustomEmoji, arg)
         params = {"emoji_id": arg, "alt": emoji.alt if emoji else "⭐"}
-    else:
-        font = await session.get(Font, int(arg))
-        if font is None:
-            await call.answer()
+    else:  # a glowing name of these colours: the bot draws it (glownick) and puts it in the post
+        problem = await _glow_problem(session, service) if arg in glow.PALETTES else "—"
+        if problem:
+            await call.answer(problem, show_alert=True)
             return
-        glyphs, missing, _fits = await options.spell(session, font, service.name)
-        if missing:
-            await call.answer(f"В шрифте нет символов: {' '.join(missing)}", show_alert=True)
-            return
-        from app.domain.fonts import glyphs_to_json
-
-        params = {"glyphs": glyphs_to_json(glyphs), "plain": service.name, "font_id": font.id}
+        current = await billing.feature_row(session, service.id, "font")
+        params = glow_params(current.params if current is not None else None, arg, service.name)
+        kind, done = "font", "Выдано: бот нарисует светящийся ник в течение минуты."
     try:
         await options.grant_feature(session, service, kind, params, days)
     except billing.FulfilError as exc:
         await call.answer(str(exc), show_alert=True)
         return
+    what = "glow" if kind == "font" else kind
     await audit(
-        session, data["user"].id, "feature.grant", "service", service.id, {"kind": kind, "days": days}
+        session, data["user"].id, "feature.grant", "service", service.id, {"kind": what, "days": days}
     )
     request_sync(data["ctx"])
-    await call.answer("Выдано", show_alert=True)
+    await call.answer(done, show_alert=True)

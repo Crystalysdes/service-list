@@ -140,7 +140,7 @@ def card_keyboard(service: Service, t: Translator) -> Any:
     if service.status == "active":
         builder.button(text=t("my.btn_top"), callback_data=f"opt:{sid}:top", style="primary")
         builder.button(text=t("my.btn_emoji"), callback_data=f"opt:{sid}:emoji")
-        builder.button(text=t("my.btn_font"), callback_data=f"opt:{sid}:font")
+        builder.button(text=t("my.btn_font"), callback_data=f"opt:{sid}:glow")
     if service.status in ("active", "hidden", "approved"):
         builder.button(text=t("my.btn_edit"), callback_data=f"my:{sid}:edit")
     if service.status != "banned":

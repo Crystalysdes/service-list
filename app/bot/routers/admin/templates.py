@@ -47,7 +47,7 @@ FRAGMENTS: dict[str, tuple[str, str | None]] = {
         "Ссылка «#Авто-Гарант» рядом с «#навигация» (видна, пока гарант принимает сделки)",
         "bot:start:garant",
     ),
-    "emoji_name_marker": ("Метка у эмодзи-названия «[тык.]»", "service:url"),
+    "emoji_name_marker": ("Метка у светящегося ника «[тык.]»", "service:url"),
     "nav_header": ("Заголовок навигации", None),
     "scam_index_header": ("Заголовок индекса скам-листа", None),
 }

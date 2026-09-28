@@ -5,8 +5,7 @@ from datetime import timedelta
 from sqlalchemy import select
 
 from app.db.base import utcnow
-from app.db.models import Feature, Font, Service, TopWaitlist, User
-from app.domain.richtext import Fragment, validate
+from app.db.models import Feature, Service, TopWaitlist, User
 from app.jobs import job_poll_invoices
 from app.services import lifecycle, options
 from app.services.settings import Limits, update_settings
@@ -16,7 +15,6 @@ from tests.helpers import MAIN, engine_for, imported_channel
 
 USER = 7001
 OTHER = 7002
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 async def _setup(tg, db, ctx):
@@ -84,7 +82,7 @@ async def test_buy_top_waitlist_and_expiry(h, tg, db, ctx):
         top.expires_at = utcnow() - timedelta(minutes=1)
         await s.commit()
     await lifecycle.expire(ctx)
-    assert "закончилось" in h.last(USER)["text"]
+    assert "Закончился срок: Топ-1" in h.last(USER)["text"]
     assert "Position 1" in h.last(OTHER)["text"] and "is free" in h.last(OTHER)["text"]
     async with db.session() as s:
         hold = (await s.execute(select(TopWaitlist))).scalar_one()
@@ -133,41 +131,6 @@ async def test_emoji_from_catalog_and_budget(h, tg, db, ctx):
     await h.click(OTHER, picker, h.buttons(picker)[0]["callback_data"])
     alerts = [p for n, p in tg.calls[calls_before:] if n == "answerCallbackQuery"]
     assert alerts and "no room" in alerts[-1].get("text", "")
-
-
-async def test_font_from_pack_and_emoji_name(h, tg, db, ctx):
-    ids, pay, engine = await _setup(tg, db, ctx)
-    for index in range(len(ALPHABET)):
-        tg.add_custom_emoji(str(8000 + index), "🔤", "RainbowAZ")
-    tg.add_user(OWNER_ID, "Owner", "owner") if OWNER_ID not in tg.users else None
-    await h.say(OWNER_ID, "/admin")
-    await h.press(OWNER_ID, h.last(OWNER_ID), "Эмодзи")
-    await h.press(OWNER_ID, h.last(OWNER_ID), "Шрифты")
-    await h.press(OWNER_ID, h.last(OWNER_ID), "Шрифт из пака")
-    await h.say(OWNER_ID, "https://t.me/addemoji/RainbowAZ")
-    await h.say(OWNER_ID, "-")
-    assert any("Шрифт «RainbowAZ» создан: 26" in m.get("text", "") for m in tg.bot_messages(OWNER_ID))
-    async with db.session() as s:
-        font = (await s.execute(select(Font).where(Font.set_name == "RainbowAZ"))).scalar_one()
-        font_id = font.id
-
-    await _open_card(h, USER, ids["trip"])
-    await h.press(USER, h.last(USER), "Название из эмодзи")
-    fonts = h.last(USER)
-    assert "[тык.]" in fonts["text"]
-    await h.click(USER, fonts, f"opt:{ids['trip']}:f:{font_id}")
-    preview = h.last(USER)
-    assert sum(1 for e in preview["entities"] if e["type"] == "custom_emoji") == len("Tripmafia")
-    await h.press(USER, preview, "1 мес.")
-    pay.pay()
-    await job_poll_invoices(ctx)
-    await engine.run_once(ids["channel_id"])
-    post = tg.messages[MAIN][ids["travel"]]
-    assert "[тык.]" in post["text"]
-    fragment = Fragment.from_json({"text": post["text"], "entities": post["entities"]})
-    marker = next(e for e in fragment.entities if e.type == "text_link" and e.url == "https://t.me/tripmafia")
-    assert fragment.entity_text(marker) == "[тык.]"
-    assert validate(fragment) == []
 
 
 async def test_admin_grants_top(h, tg, db, ctx):

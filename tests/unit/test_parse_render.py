@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.domain.fonts import build_glyphs, learn_mapping, reverse_name
+from app.domain.fonts import learn_mapping, reverse_name
 from app.domain.parse import ChannelInfo, Snapshot, find_nav, parse_category, parse_nav, split_premium_emoji
 from app.domain.render import (
     CategoryView,
@@ -124,13 +124,6 @@ def _emoji_then_letters():
     rt.link("[тык.]", "https://t.me/cats")
     frag = rt.build()
     return frag.text, frag.entities
-
-
-def test_build_glyphs_missing_letters():
-    mapping = {char: value for char, value in LETTERS.items()}
-    glyphs, missing = build_glyphs("Crys  tal!", mapping)
-    assert missing == ["!"]
-    assert [g.alt for g in glyphs if g.emoji_id is None] == [" "]
 
 
 def test_nav_detection_and_render_roundtrip():

@@ -48,7 +48,6 @@ async def _bought(h, tg, db, ctx, palette_button: str = "Неон"):
     if OWNER_ID not in tg.users:
         tg.add_user(OWNER_ID, "Owner", "owner")  # the packs belong to the bot's owner
     await _open_card(h, USER, ids["trip"])
-    await h.press(USER, h.last(USER), "Название из эмодзи")
     await h.press(USER, h.last(USER), "Светящийся ник")
     colours = h.last(USER)
     assert "Светящийся ник" in colours["text"] and h.button(colours, "Радуга")
@@ -154,17 +153,62 @@ async def test_an_expired_glowing_name_loses_its_pack_and_is_drawn_anew_when_ren
     assert (await _feature(db, ids["trip"])).params["glow_set"] not in (None, pack)
 
 
-async def test_the_emoji_name_option_switches_to_a_glowing_name_for_free(h, tg, db, ctx):
+async def test_the_colours_of_a_glowing_name_change_for_free(h, tg, db, ctx):
     ids, _engine = await _bought(h, tg, db, ctx, palette_button="Золото")
     await glownick.job(ctx)
     await _open_card(h, USER, ids["trip"])
-    await h.press(USER, h.last(USER), "Название из эмодзи")
     await h.press(USER, h.last(USER), "Светящийся ник")
     await h.press(USER, h.last(USER), "Радуга")
-    await h.press(USER, h.last(USER), "Применить")
+    await h.press(USER, h.last(USER), "Применить эти цвета")
     feature = await _feature(db, ids["trip"])
     assert (
         feature.params["glow"] == "rainbow" and len(feature.params["glyphs"]) == 4
     )  # the gold one meanwhile
     await glownick.job(ctx)
     assert (await _feature(db, ids["trip"])).params["glow_drawn"] == ["Tripmafia", "rainbow"]
+
+
+async def test_the_admins_grant_a_glowing_name_and_no_emoji_letters(h, tg, db, ctx):
+    ids, _pay, engine = await _setup(tg, db, ctx)
+    if OWNER_ID not in tg.users:
+        tg.add_user(OWNER_ID, "Owner", "owner")
+    await h.say(OWNER_ID, "/admin")
+    await h.click(OWNER_ID, h.last(OWNER_ID), f"a:svc:{ids['trip']}")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Опции")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Выдать опцию")
+    menu = h.last(OWNER_ID)
+    labels = [b["text"] for b in h.buttons(menu)]
+    assert "🌟 Светящийся ник" in labels and "😀 Эмодзи" in labels and not [x for x in labels if "🔤" in x]
+    await h.press(OWNER_ID, menu, "Светящийся ник")
+    colours = h.last(OWNER_ID)
+    assert "Какие цвета" in colours["text"] and h.button(colours, "Золото")
+    await h.press(OWNER_ID, colours, "Радуга")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "30 дней")
+    assert "бот нарисует светящийся ник" in tg.called("answerCallbackQuery")[-1]["text"]
+    feature = await _feature(db, ids["trip"])
+    assert (feature.params["glow"], feature.params["plain"], feature.source) == (
+        "rainbow",
+        "Tripmafia",
+        "admin",
+    )
+    assert timedelta(days=29) < feature.expires_at - utcnow() <= timedelta(days=30)
+
+    await glownick.job(ctx)  # drawn like a bought one, then shown in the post
+    feature = await _feature(db, ids["trip"])
+    assert feature.params["glow_drawn"] == ["Tripmafia", "rainbow"] and len(feature.params["glyphs"]) == 4
+    await engine.run_once(ids["channel_id"])
+    assert {g[0] for g in feature.params["glyphs"]} <= set(_post_emoji(tg, ids["travel"]))
+
+
+async def test_buttons_of_the_old_emoji_letter_names_lead_to_the_glowing_name(h, tg, db, ctx):
+    ids, _pay, _engine = await _setup(tg, db, ctx)
+    await _open_card(h, USER, ids["trip"])
+    card = h.last(USER)
+    assert h.button(card, "Светящийся ник")["callback_data"] == f"opt:{ids['trip']}:glow"
+    await h.click(USER, card, f"opt:{ids['trip']}:font")  # a reminder sent before
+    assert "Выберите цвета" in h.last(USER)["text"]
+    await _open_card(h, USER, ids["trip"])
+    await h.click(USER, h.last(USER), f"opt:{ids['trip']}:f:1")
+    assert "Этой опции больше нет" in tg.called("answerCallbackQuery")[-1]["text"]
+    await h.click(USER, h.last(USER), f"opt:{ids['trip']}:buy:font:1:1")
+    assert "Этой опции больше нет" in tg.called("answerCallbackQuery")[-1]["text"]

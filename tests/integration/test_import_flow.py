@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import func, select
 
-from app.db.models import Category, ChannelPost, Feature, Font, Service, StaticPost
+from app.db.models import Category, ChannelPost, Feature, Service, StaticPost
 from app.services.channels import save_channel
 from app.services.importer import Importer
 from app.services.settings import Chats, Templates, get_settings, save_settings
@@ -74,10 +74,12 @@ async def test_full_import_flow(h, tg, db, ctx):
         assert cats["travel"].post_order < cats["vpn"].post_order < cats["design"].post_order
         emoji = await s.scalar(select(func.count()).select_from(Feature).where(Feature.kind == "emoji"))
         assert emoji == 7
-        font_feature = (await s.execute(select(Feature).where(Feature.kind == "font"))).scalar_one()
-        assert font_feature.params["plain"] == "Crystalys"
-        font = (await s.execute(select(Font))).scalar_one()
-        assert font.set_name == "RainbowLetters" and len(font.glyphs) >= 7
+        # the name written in emoji letters comes as the plain name typed in: no such option any more
+        assert not (await s.execute(select(Feature).where(Feature.kind == "font"))).scalars().all()
+        crystalys = (
+            await s.execute(select(Service).where(Service.url == "https://t.me/crystalys"))
+        ).scalar_one()
+        assert crystalys.name == "Crystalys" and crystalys.raw_fragment is None
         intro = (await s.execute(select(StaticPost))).scalar_one()
         assert intro.kind == "intro" and intro.media_id is not None
         posts = {(p.kind, p.message_id) for p in (await s.execute(select(ChannelPost))).scalars()}

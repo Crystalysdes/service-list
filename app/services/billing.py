@@ -199,9 +199,7 @@ def order_title(order: Order, service_name: str) -> str:
         return f"Топ-{order.params.get('position')} для «{service_name}», {order.months} мес."
     if order.kind == "emoji":
         return f"Премиум-эмодзи для «{service_name}», {order.months} мес."
-    if order.params.get("glow"):
-        return f"Светящийся ник для «{service_name}», {order.months} мес."
-    return f"Название из эмодзи для «{service_name}», {order.months} мес."
+    return f"Светящийся ник для «{service_name}», {order.months} мес."
 
 
 async def ensure_invoice(ctx: AppContext, session: AsyncSession, order: Order) -> Invoice:
@@ -495,16 +493,12 @@ async def fulfil(session: AsyncSession, order: Order, now: datetime) -> list[str
         feature.top_position = int(order.params["position"])
     elif order.kind == "emoji":
         feature.params = {"emoji_id": order.params["emoji_id"], "alt": order.params.get("alt", "⭐")}
-    elif order.kind == "font" and order.params.get("glow"):  # a glowing name: the bot draws it (glownick)
+    elif order.kind == "font":  # a glowing name: the bot draws it (glownick)
         from app.services.glownick import glow_params
 
-        feature.params = glow_params(feature.params, str(order.params["glow"]), service.name)
-    elif order.kind == "font":
-        feature.params = {
-            "glyphs": order.params["glyphs"],
-            "plain": order.params.get("plain") or service.name,
-            "font_id": order.params.get("font_id"),
-        }
+        # an older order for a name of emoji letters (no more) is paid with a glowing name
+        palette = str(order.params.get("glow") or "rainbow")
+        feature.params = glow_params(feature.params, palette, service.name)
     await session.flush()
     return notes
 

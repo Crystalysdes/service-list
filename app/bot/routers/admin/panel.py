@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import RoleFilter
-from app.db.models import CustomEmoji, Font, ImportRun, ModerationRequest, ReportCase, Setting
+from app.db.models import CustomEmoji, ImportRun, ModerationRequest, ReportCase, Setting
 from app.services.channels import active_channels
 from app.services.settings import Chats, Prices, Runtime, get_settings
 
@@ -27,7 +27,6 @@ async def wizard_steps(session: AsyncSession) -> list[tuple[str, bool]]:
     runtime = await get_settings(session, Runtime)
     channels = await active_channels(session, ("main", "scam", "mirror"))
     roles = {c.role for c in channels}
-    fonts = await session.scalar(select(func.count()).select_from(Font))
     catalog = await session.scalar(
         select(func.count()).select_from(CustomEmoji).where(CustomEmoji.in_catalog)
     )
@@ -41,7 +40,7 @@ async def wizard_steps(session: AsyncSession) -> list[tuple[str, bool]]:
         ("Основной канал", "main" in roles),
         ("Канал Scam list", "scam" in roles),
         ("Диагностика", runtime.selftest_ok_at is not None),
-        ("Шрифты и каталог эмодзи", bool(fonts) and bool(catalog)),
+        ("Каталог эмодзи", bool(catalog)),
         ("Импорт канала", bool(imported)),
         ("Цены", prices_saved),
         ("В эфир", runtime.live),
@@ -65,7 +64,6 @@ def home_keyboard(
     if role in ("admin", "owner"):
         builder.button(text="💵 Цены и сроки", callback_data="a:prices")
         builder.button(text="😀 Эмодзи", callback_data="a:emoji")
-        builder.button(text="🔤 Шрифты", callback_data="a:fonts")
         builder.button(text="🧾 Шаблоны", callback_data="a:tpl")
         builder.button(text="📡 Каналы", callback_data="a:ch")
         builder.button(text="📦 Импорт", callback_data="a:imp")

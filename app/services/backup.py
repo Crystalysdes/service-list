@@ -505,6 +505,14 @@ ARCHIVE_UPGRADES = {
         "WHERE key = 'escrow' AND jsonb_typeof(value) = 'object' AND value ? 'fee_bps'"
     ),
     10: "UPDATE deals SET gateway = 'cryptopay'",  # 0010: the deals before Apirone are Crypto Pay's
+    13: (  # 0013: names of emoji letters are no more (as in that migration)
+        "DELETE FROM features WHERE kind = 'font' AND NOT (params ? 'glow') "
+        "AND (source = 'import' OR status <> 'active')",
+        "UPDATE features SET params = jsonb_build_object("
+        "'glyphs', '[]'::jsonb, 'plain', services.name, 'font_id', NULL, 'glow', 'rainbow') "
+        "FROM services WHERE services.id = features.service_id AND features.kind = 'font' "
+        "AND NOT (features.params ? 'glow')",
+    ),
 }
 
 
@@ -520,7 +528,8 @@ async def _after_restore(session: AsyncSession, manifest: dict[str, Any] | None 
     revision = str((manifest or {}).get("alembic_revision") or "")
     for since, sql in ARCHIVE_UPGRADES.items():
         if revision.isdigit() and int(revision) < since:
-            await session.execute(text(sql))
+            for statement in sql if isinstance(sql, tuple) else (sql,):
+                await session.execute(text(statement))
     # the new server must prove premium emoji work again before posts with them are touched
     await update_settings(session, Runtime, selftest_ok_at=None, selftest_emoji_ok=None)
     from app.services.announce import cancel_unfinished

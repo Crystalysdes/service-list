@@ -42,7 +42,7 @@ REPORTABLE = ("active", "hidden")
 CASE_LOCK = 2  # first key of pg_advisory_xact_lock(int, int) for "one open case per service"
 CARD_BUDGET = 3900  # characters of a case card (Telegram: 4096)
 REJECT_REASONS = ("proof", "notscam", "resolved", "dup")
-FEATURE_TITLES = {"top": "топ", "emoji": "эмодзи", "font": "эмодзи-название"}
+FEATURE_TITLES = {"top": "топ", "emoji": "эмодзи", "font": "светящийся ник"}
 
 
 # ------------------------------------------------------------------------------------------ submitting

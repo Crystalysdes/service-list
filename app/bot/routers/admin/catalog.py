@@ -390,7 +390,7 @@ async def on_service_list(call: CallbackQuery, state: FSMContext, session: Async
     await call.message.edit_text(
         f"🧩 <b>{h(category.title)}</b> — сервисов: {len(visible)} в посте"
         + (f", ещё {len(others)} скрытых/на проверке" if others else "")
-        + "\n⭐ топ, 😀 эмодзи, 🔤 эмодзи-название, 🙈 скрыт",
+        + "\n⭐ топ, 😀 эмодзи, 🌟 светящийся ник, 🙈 скрыт",
         reply_markup=back_home(builder, target=f"a:cat:{category.id}"),
     )
 
@@ -819,7 +819,7 @@ async def on_features(call: CallbackQuery, session: AsyncSession, **data: Any) -
     builder = InlineKeyboardBuilder()
     for feature in service.features:
         if feature.status == "active":
-            name = {"top": f"Топ-{feature.top_position}", "emoji": "Эмодзи", "font": "Эмодзи-название"}[
+            name = {"top": f"Топ-{feature.top_position}", "emoji": "Эмодзи", "font": "Светящийся ник"}[
                 feature.kind
             ]
             builder.button(text=f"➕30 дн. {name}", callback_data=f"a:svc:{service.id}:fx:{feature.id}:30")

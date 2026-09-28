@@ -1,4 +1,5 @@
-"""Emoji-letter "fonts": mapping characters to custom emoji and back."""
+"""Glyphs: a name drawn as a row of custom emoji (the glowing name), and reading an imported name written
+in emoji letters back as text."""
 
 from __future__ import annotations
 
@@ -27,34 +28,6 @@ def glyphs_from_json(data: list[list[Any]] | None) -> list[Glyph]:
     return [Glyph.from_json(item) for item in (data or [])]
 
 
-def letter_count(glyphs: list[Glyph]) -> int:
-    return sum(1 for g in glyphs if g.emoji_id)
-
-
-def _lookup(mapping: dict[str, tuple[str, str]], char: str) -> tuple[str, str] | None:
-    for key in (char, char.upper(), char.lower()):
-        if key in mapping:
-            return mapping[key]
-    return None
-
-
-def build_glyphs(name: str, mapping: dict[str, tuple[str, str]]) -> tuple[list[Glyph], list[str]]:
-    """Spell ``name`` with the font. Returns the glyphs and the characters the font lacks."""
-    glyphs: list[Glyph] = []
-    missing: list[str] = []
-    for char in " ".join(name.split()):
-        if char == " ":
-            glyphs.append(Glyph(None, " "))
-            continue
-        found = _lookup(mapping, char)
-        if found is None:
-            if char not in missing:
-                missing.append(char)
-            continue
-        glyphs.append(Glyph(found[0], found[1]))
-    return glyphs, missing
-
-
 def reverse_name(glyphs: list[Glyph], reverse: dict[str, str]) -> str | None:
     """Plain text of an emoji-letter name, if every glyph is known."""
     chars = []
@@ -79,13 +52,4 @@ def learn_mapping(glyphs: list[Glyph], name: str) -> dict[str, tuple[str, str]] 
     for glyph, char in zip(letters, chars, strict=True):
         assert glyph.emoji_id is not None
         mapping.setdefault(char, (glyph.emoji_id, glyph.alt))
-    return mapping
-
-
-def alphabet_mapping(alphabet: str, stickers: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
-    """Pair alphabet characters (spaces ignored) with stickers in pack order."""
-    chars = [c for c in alphabet if not c.isspace()]
-    mapping: dict[str, tuple[str, str]] = {}
-    for char, (emoji_id, alt) in zip(chars, stickers, strict=False):
-        mapping.setdefault(char, (emoji_id, alt))
     return mapping

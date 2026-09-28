@@ -10,8 +10,8 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import utcnow
-from app.db.models import Category, CustomEmoji, Feature, Font, Invoice, Order, Service, TopWaitlist
-from app.domain.fonts import Glyph, build_glyphs, glyphs_to_json, letter_count
+from app.db.models import Category, CustomEmoji, Feature, Invoice, Order, Service, TopWaitlist
+from app.domain.fonts import Glyph
 from app.domain.render import ItemView, measure, render_category
 from app.domain.symbols import LinkContext
 from app.services import billing, render_db
@@ -142,7 +142,7 @@ async def trial_fits(
     return report.ok and len(view.items) <= settings.max_items_per_category
 
 
-# ----------------------------------------------------------------------------------------- emoji / fonts
+# ----------------------------------------------------------------------------------------- emoji
 async def catalog(session: AsyncSession) -> list[CustomEmoji]:
     return list(
         (
@@ -155,39 +155,14 @@ async def catalog(session: AsyncSession) -> list[CustomEmoji]:
     )
 
 
-async def enabled_fonts(session: AsyncSession) -> list[Font]:
-    return list(
-        (
-            await session.execute(select(Font).where(Font.is_enabled).order_by(Font.sort_order, Font.id))
-        ).scalars()
-    )
-
-
-def font_mapping(font: Font) -> dict[str, tuple[str, str]]:
-    return {g.char: (g.emoji_id, g.alt) for g in font.glyphs}
-
-
-async def spell(session: AsyncSession, font: Font, name: str) -> tuple[list[Glyph], list[str], bool]:
-    """Glyphs for ``name`` in ``font``, missing characters and whether the letter limit is respected."""
-    glyphs, missing = build_glyphs(name, font_mapping(font))
-    limits = await get_settings(session, Limits)
-    return glyphs, missing, letter_count(glyphs) <= limits.max_font_letters
-
-
 async def set_emoji_now(session: AsyncSession, service: Service, emoji_id: str, alt: str) -> None:
     feature = render_db.active_feature(service, "emoji")
     if feature is not None:
         feature.params = {"emoji_id": emoji_id, "alt": alt}
 
 
-async def set_font_now(session: AsyncSession, service: Service, font: Font, glyphs: list[Glyph]) -> None:
-    feature = render_db.active_feature(service, "font")
-    if feature is not None:
-        feature.params = {"glyphs": glyphs_to_json(glyphs), "plain": service.name, "font_id": font.id}
-
-
 async def set_glow_now(session: AsyncSession, service: Service, palette: str) -> None:
-    """The emoji-name option switches to a glowing name (or other colours); the job draws it."""
+    """The glowing name gets other colours; the job draws it anew."""
     from app.services.glownick import glow_params
 
     feature = render_db.active_feature(service, "font")

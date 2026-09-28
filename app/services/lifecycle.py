@@ -44,7 +44,10 @@ async def _user_t(session: AsyncSession, user_id: int | None) -> Translator:
 
 def _renew_kb(t: Translator, service_id: int, kind: str) -> Any:
     builder = InlineKeyboardBuilder()
-    target = f"opt:{service_id}:{kind}" if kind != "listing" else f"my:{service_id}:renew"
+    # the "font" option is the glowing name now
+    target = {"listing": f"my:{service_id}:renew", "font": f"opt:{service_id}:glow"}.get(
+        kind, f"opt:{service_id}:{kind}"
+    )
     builder.button(text=t("remind.renew"), callback_data=target, style="success")
     builder.button(text=t("pay.manage"), callback_data=f"my:{service_id}")
     builder.adjust(1)

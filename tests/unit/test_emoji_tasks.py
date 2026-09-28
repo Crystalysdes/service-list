@@ -90,7 +90,7 @@ def test_the_card_marks_what_is_new_and_what_went():
     before = [items[1], {"kind": "font", "service_id": 3, "service": "Old", "line": 3, "ids": ["11"]}]
     later = card("Travel", items, before, [])
     assert "\n🆕 💎 перед «Coco»" in later.text and "\n•  светящийся ник «Trip»" in later.text
-    assert "\n⌛ Снято: эмодзи-буквы у «Old»" in later.text
+    assert "\n⌛ Снято: светящийся ник у «Old»" in later.text
     assert "Наборы" not in later.text
 
     many = [{**items[0], "service_id": n, "service": f"S{n}"} for n in range(40)]

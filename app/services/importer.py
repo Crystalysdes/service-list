@@ -9,7 +9,6 @@ import asyncio
 import contextlib
 import hashlib
 import logging
-from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
@@ -34,8 +33,6 @@ from app.db.models import (
     ChannelPost,
     CustomEmoji,
     Feature,
-    Font,
-    FontGlyph,
     ImportMessage,
     ImportRun,
     MediaFile,
@@ -144,7 +141,6 @@ class Importer:
         snapshots = [Snapshot.from_raw(row.raw) for row in rows]
         await self._load_custom_emoji(session, snapshots)
         emoji_sets = dict((await session.execute(select(CustomEmoji.id, CustomEmoji.set_name))).all())
-        reverse = await reverse_letters(session)
         info = ChannelInfo(
             chat_id=scan["chat_id"],
             username=scan.get("username"),
@@ -156,7 +152,7 @@ class Importer:
                 snapshots=snapshots,
                 info=info,
                 emoji_sets=emoji_sets,
-                reverse_letters=reverse,
+                reverse_letters={},  # names of emoji letters: the admin types them in
                 channel_title=scan.get("title"),
             )
         )
@@ -321,11 +317,6 @@ def _classification(plan: dict[str, Any]) -> list[tuple[int, str]]:
     return result
 
 
-async def reverse_letters(session: AsyncSession) -> dict[str, str]:
-    rows = (await session.execute(select(FontGlyph.emoji_id, FontGlyph.char))).all()
-    return {emoji_id: char for emoji_id, char in rows}
-
-
 async def latest_run(session: AsyncSession) -> ImportRun | None:
     return (
         await session.execute(select(ImportRun).order_by(ImportRun.id.desc()).limit(1))
@@ -336,7 +327,8 @@ async def latest_run(session: AsyncSession) -> ImportRun | None:
 async def resolve_name(
     session: AsyncSession, run: ImportRun, cat_index: int, item_index: int, name: str
 ) -> str | None:
-    """Store an admin-typed plain name for an emoji-letter item; learn the font. Returns an error or None."""
+    """Store an admin-typed plain name for an item written in emoji letters (it is imported as that plain
+    name). The letters learned resolve the other such names of the run. Returns an error or None."""
     report = dict(run.report or {})
     plan = report["plan"]
     record = plan["categories"][cat_index]["items"][item_index]
@@ -347,16 +339,9 @@ async def resolve_name(
         letters = sum(1 for g in glyphs if g.emoji_id)
         return f"В эмодзи-названии {letters} букв(ы), а в тексте {sum(1 for c in name if not c.isspace())}."
     record["name"] = name
-    ids = [g.emoji_id for g in glyphs if g.emoji_id]
-    set_by_id = dict(
-        (
-            await session.execute(select(CustomEmoji.id, CustomEmoji.set_name).where(CustomEmoji.id.in_(ids)))
-        ).all()
-    )
-    sets = Counter(set_by_id.get(emoji_id) for emoji_id in ids)
-    set_name = sets.most_common(1)[0][0] if sets else None
-    await learn_font(session, set_name, mapping)
-    reverse = await reverse_letters(session)
+    reverse = dict(report.get("letters") or {})
+    reverse.update({emoji_id: char for char, (emoji_id, _alt) in mapping.items()})
+    report["letters"] = reverse
     remaining = []
     for cat_i, item_i in plan.get("unresolved", []):
         item = plan["categories"][cat_i]["items"][item_i]
@@ -372,27 +357,6 @@ async def resolve_name(
     flag_modified(run, "report")
     await session.flush()
     return None
-
-
-async def learn_font(
-    session: AsyncSession, set_name: str | None, mapping: dict[str, tuple[str, str]]
-) -> Font:
-    font = None
-    if set_name:
-        font = (await session.execute(select(Font).where(Font.set_name == set_name))).scalar_one_or_none()
-    if font is None:
-        count = await session.scalar(select(func.count()).select_from(Font))
-        font = Font(name=set_name or f"Шрифт {count + 1}", set_name=set_name, sort_order=count or 0)
-        session.add(font)
-        await session.flush()
-    existing = set(
-        (await session.execute(select(FontGlyph.char).where(FontGlyph.font_id == font.id))).scalars()
-    )
-    for char, (emoji_id, alt) in mapping.items():
-        if char not in existing:
-            session.add(FontGlyph(font_id=font.id, char=char, emoji_id=emoji_id, alt=alt))
-    await session.flush()
-    return font
 
 
 # ---------------------------------------------------------------------------------------------- apply
@@ -477,6 +441,7 @@ async def apply_import(session: AsyncSession, run: ImportRun, actor_id: int | No
             url = item.get("url") or ""
             link = try_normalize(url) if url else None
             raw = item.get("raw")
+            # a name written in emoji letters comes as the plain name the admin typed in
             name = item.get("name") or (Fragment.from_json(raw).text.strip()[:128] if raw else "") or "—"
             service = Service(
                 category_id=category.id,
@@ -503,19 +468,6 @@ async def apply_import(session: AsyncSession, run: ImportRun, actor_id: int | No
                         started_at=now,
                         expires_at=None,
                         params={"emoji_id": item["emoji"][0], "alt": item["emoji"][1]},
-                        source="import",
-                    )
-                )
-            if item.get("glyphs"):
-                session.add(
-                    Feature(
-                        service_id=service.id,
-                        category_id=category.id,
-                        kind="font",
-                        status="active",
-                        started_at=now,
-                        expires_at=None,
-                        params={"glyphs": item["glyphs"], "plain": name, "font_id": None},
                         source="import",
                     )
                 )

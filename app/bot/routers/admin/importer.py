@@ -214,7 +214,7 @@ async def on_name_input(
     await session.commit()
     if not await _ask_next_name(message, state, run):
         await state.clear()
-        await message.answer("✅ Все названия указаны, шрифт сохранён.")
+        await message.answer("✅ Все названия указаны.")
         await send_report(bot, message.chat.id, run)
 
 

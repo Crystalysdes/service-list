@@ -149,3 +149,61 @@ def test_the_garant_moves_to_apirone_and_keeps_its_old_deals():
         assert sql("SELECT count(*) FROM deal_receipts") == "0"
     finally:
         _psql(f"DROP DATABASE IF EXISTS {NAME}")
+
+
+def test_names_of_emoji_letters_go_and_a_bought_one_becomes_a_glowing_name():
+    """0013: the imported names of emoji letters and the ones no longer running go; a bought one still
+    running becomes a glowing name for the same term; the fonts' tables go."""
+    if not _psql(f"DROP DATABASE IF EXISTS {NAME}") or not _psql(f"CREATE DATABASE {NAME}"):
+        pytest.skip("cannot create a scratch database")
+    url = _admin_url().rsplit("/", 1)[0] + f"/{NAME}"
+
+    def sql(statement: str) -> str:
+        result = subprocess.run(
+            ["psql", url, "-v", "ON_ERROR_STOP=1", "-At", "-c", statement],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        return result.stdout.strip()
+
+    try:
+        assert _alembic("upgrade", "0012").returncode == 0
+        category = sql(
+            "INSERT INTO categories (slug, title, nav_label, header, post_order, nav_order, top_slots, "
+            "updated_at, created_at) VALUES ('travel', 'Travel', '#travel', '{}', 0, 0, 3, now(), now()) "
+            "RETURNING id"
+        ).splitlines()[0]
+        services = []
+        for name in ("Imported", "Bought", "Ended", "Glowing"):
+            service = (
+                "INSERT INTO services (category_id, name, url, url_kind, position, status, source, "
+                "link_state, link_dead_streak, updated_at, created_at) VALUES "
+                f"({category}, '{name}', 'https://t.me/x', 'telegram', 0, 'active', 'import', 'unknown', 0, "
+                "now(), now()) RETURNING id"
+            )
+            services.append(sql(service).splitlines()[0])
+        letters = '{"glyphs": [["1", "A"]], "plain": "x", "font_id": null}'
+        glowing = '{"glyphs": [], "plain": "Glowing", "font_id": null, "glow": "neon"}'
+        for sid, source, status, params in (
+            (services[0], "import", "active", letters),
+            (services[1], "order", "active", letters),
+            (services[2], "order", "expired", letters),
+            (services[3], "order", "active", glowing),
+        ):
+            sql(
+                "INSERT INTO features (service_id, category_id, kind, status, started_at, expires_at, "
+                f"params, source, updated_at, created_at) VALUES ({sid}, {category}, 'font', '{status}', "
+                f"now(), now() + interval '10 days', '{params}', '{source}', now(), now())"
+            )
+        sql("INSERT INTO fonts (name, sort_order) VALUES ('Rainbow', 0)")
+        assert _alembic("upgrade", "head").returncode == 0
+
+        rows = sql("SELECT service_id, params->>'glow', params->>'plain' FROM features ORDER BY service_id")
+        assert rows.splitlines() == [f"{services[1]}|rainbow|Bought", f"{services[3]}|neon|Glowing"]
+        assert sql("SELECT to_regclass('fonts') IS NULL, to_regclass('font_glyphs') IS NULL") == "t|t"
+        assert _alembic("downgrade", "0012").returncode == 0
+        assert sql("SELECT to_regclass('fonts') IS NOT NULL") == "t"
+    finally:
+        _psql(f"DROP DATABASE IF EXISTS {NAME}")

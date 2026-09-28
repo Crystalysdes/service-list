@@ -135,9 +135,7 @@ def _describe(rt: RichText, item: dict[str, Any], *, removed: bool = False) -> N
         if ids:
             rt.emoji(ids[0], item.get("alt") or "⭐")
         rt.text(f" у «{name}»" if removed else f" перед «{name}»")
-    elif kind == "font":
-        rt.text(f"эмодзи-буквы у «{name}»" if removed else f"«{name}» эмодзи-буквами")
-    elif kind == "glow":
+    elif kind in ("glow", "font"):  # "font": a task sent before the names of emoji letters went
         rt.text(f"светящийся ник у «{name}»" if removed else f"светящийся ник «{name}»")
     else:
         rt.text(f"остальные премиум-эмодзи поста (оформление, старые из канала) — {item.get('count', 0)}")
@@ -248,7 +246,7 @@ async def _items(session: AsyncSession, row: ChannelPost, desired: Fragment, tz:
                 items.append(
                     {
                         **base,
-                        "kind": "glow" if font.params.get("glow") else "font",
+                        "kind": "glow",
                         "ids": [str(g) for g in glyphs if g],
                         "until": _until(font.expires_at, tz),
                     }

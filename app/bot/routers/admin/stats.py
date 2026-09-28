@@ -26,7 +26,7 @@ from app.services.timefmt import zone
 router = Router(name="admin_stats")
 router.callback_query.filter(RoleFilter("moderator"))
 
-KIND_TITLES = {"listing": "размещение", "top": "топ", "emoji": "эмодзи", "font": "эмодзи-название"}
+KIND_TITLES = {"listing": "размещение", "top": "топ", "emoji": "эмодзи", "font": "светящийся ник"}
 STATUS_TITLES = {
     "active": "в канале",
     "hidden": "скрыто",

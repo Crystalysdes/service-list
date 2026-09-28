@@ -53,7 +53,10 @@ def summary(report: dict[str, Any]) -> str:
         lines.append(f"• Постов после навигации: {len(plan['trailing'])} — бот их не трогает")
     if plan.get("unresolved"):
         lines.append("")
-        lines.append(f"🔤 Нужно указать названия сервисов из эмодзи-букв: {len(plan['unresolved'])}")
+        lines.append(
+            f"🔤 Нужно указать названия сервисов из эмодзи-букв: {len(plan['unresolved'])} — "
+            "в канале они станут обычными названиями"
+        )
     lines.append("")
     lines.append("В канале ничего не меняется, пока вы не включите «В эфир».")
     return "\n".join(lines)
@@ -80,7 +83,7 @@ def detailed(report: dict[str, Any]) -> str:
             if item.get("emoji"):
                 flags.append("эмодзи")
             if item.get("glyphs"):
-                flags.append("эмодзи-название")
+                flags.append("из эмодзи-букв → обычное название")
             if item["kind"] == "raw":
                 flags.append("как есть")
             if item["kind"] == "text":

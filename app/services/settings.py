@@ -75,7 +75,6 @@ class Limits(SettingsGroup):
     max_user_entities: int = 100
     warn_ratio: float = 0.85
     max_name_len: int = 40
-    max_font_letters: int = 16
     description_min: int = 20
     description_max: int = 1000
     max_pending_per_user: int = 3
