@@ -293,6 +293,8 @@ class Runtime(SettingsGroup):
     # while the bot cannot put premium emoji: posts go without them and the admins get the text with them to
     # put in by hand (app/services/emoji_tasks.py)
     manual_emoji: bool = True
+    # what the staff were last told about the Premium account (app/services/premium_account.py)
+    account_note: str | None = None
     selftest_ok_at: datetime | None = None
     selftest_emoji_ok: bool | None = None
     custom_emoji_cap: int | None = None

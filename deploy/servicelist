@@ -8,6 +8,8 @@
 #   servicelist backup        make a backup archive now, kept on the server (the daily one also goes to
 #                             the storage channel; a copy made in /admin → 💾 too)
 #   servicelist restore FILE  restore a backup archive into the (empty) database
+#   servicelist account       connect the Telegram account with Premium that puts premium emoji into the
+#                             channel's posts (api_id/api_hash, phone, code); «servicelist account off» ends it
 #
 # The deploy key may run only "servicelist ssh-deploy", which accepts nothing but "deploy <commit sha>".
 set -euo pipefail
@@ -634,7 +636,13 @@ cmd_restore() {
 }
 
 usage() {
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+cmd_account() {  # the login runs inside the bot's container: the code and the password stay on this server
+    need_dir
+    [[ -n "$(docker compose ps -q bot 2>/dev/null)" ]] || die "Бот не запущен: сначала «servicelist start»"
+    compose exec bot python -m app account "$@"
 }
 
 main() {
@@ -652,6 +660,7 @@ main() {
     stop) need_dir && compose stop ;;
     backup) need_dir && compose exec bot python -m app backup ;;
     restore) cmd_restore "$@" ;;
+    account) cmd_account "$@" ;;
     "" | -h | --help | help) usage ;;
     *)
         usage

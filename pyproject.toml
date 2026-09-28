@@ -22,6 +22,8 @@ dependencies = [
   "pillow>=11",
   "numpy>=2",
   "av>=14",
+  # the Telegram account with Premium that puts premium emoji into the channel's posts (MTProto)
+  "telethon==1.45.0",
 ]
 
 [project.optional-dependencies]

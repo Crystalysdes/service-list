@@ -108,6 +108,12 @@ async def job_emoji_tasks(ctx: AppContext) -> None:
     await job(ctx)
 
 
+async def job_premium_account(ctx: AppContext) -> None:
+    from app.services.premium_account import job
+
+    await job(ctx)
+
+
 async def job_publish_watch(ctx: AppContext) -> None:
     from app.services.published import watch
 
@@ -163,6 +169,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_publish_watch, IntervalTrigger(minutes=2)),
         (job_glow, IntervalTrigger(seconds=15)),
         (job_emoji_tasks, IntervalTrigger(seconds=30)),
+        (job_premium_account, IntervalTrigger(seconds=30)),
         (job_moderation_cards, IntervalTrigger(minutes=5, jitter=30)),
         (job_escrow_poll, IntervalTrigger(seconds=20)),
         (job_escrow_sweep, IntervalTrigger(minutes=1)),
@@ -181,8 +188,9 @@ async def start_jobs(ctx: AppContext) -> AsyncIOScheduler:
             coalesce=True,
             misfire_grace_time=300,
         )
-    # run a self-test shortly after start
+    # run a self-test shortly after start; connect the Premium account right away
     scheduler.add_job(_safe(job_selftest, ctx), trigger="date", id="selftest_boot")
+    scheduler.add_job(_safe(job_premium_account, ctx), trigger="date", id="premium_account_boot")
     scheduler.start()
     return scheduler
 

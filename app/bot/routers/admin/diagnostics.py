@@ -10,7 +10,7 @@ from typing import Any
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, LinkPreviewOptions
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +20,7 @@ from app.bot.i18n import h
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.db.models import Channel, ChannelPost
+from app.services import premium_account
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.channels import INACTIVE_STATUSES
@@ -30,12 +31,15 @@ from app.services.sync.engine import emoji_allowed
 log = logging.getLogger(__name__)
 
 router = Router(name="admin_diagnostics")
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 router.message.filter(RoleFilter("admin"))
 router.callback_query.filter(RoleFilter("admin"))
 
 
-async def _screen(session: AsyncSession) -> tuple[str, Any]:
+async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     runtime = await get_settings(session, Runtime)
+    account = premium_account.get(ctx)
+    automatic = account is not None and account.covers_main()
     lines = []
     last = runtime.last_diagnostics or {}
     if last.get("checks"):
@@ -55,15 +59,16 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
             if runtime.manual_emoji
             else "🛡 Безопасный режим: посты с премиум-эмодзи не трогаются"
         )
+    if account is not None:
+        lines.append(account.short())
     if runtime.manual_emoji:
-        lines.append(
-            "✍️ Премиум-эмодзи вручную: включено — "
-            + (
-                "пока бот ставит их сам, не нужно"
-                if emoji_allowed(runtime)
-                else "посты выходят без них, готовый текст с ними приходит в админ-чат"
-            )
-        )
+        if emoji_allowed(runtime):
+            how = "пока бот ставит их сам, не нужно"
+        elif automatic:
+            how = "пока их ставит аккаунт с Premium, не нужно"
+        else:
+            how = "посты выходят без них, готовый текст с ними приходит в админ-чат"
+        lines.append(f"✍️ Премиум-эмодзи вручную: включено — {how}")
     else:
         lines.append("✍️ Премиум-эмодзи вручную: выключено")
     if runtime.plain_emoji_fallback:
@@ -75,6 +80,7 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         builder.button(text="🔄 Синхронизировать сейчас", callback_data="a:sync:now")
     else:
         builder.button(text="🚀 В эфир", callback_data="a:live:on")
+    builder.button(text="👤 Аккаунт с Premium", callback_data="a:acct")
     builder.button(
         text=("✍️ Выключить" if runtime.manual_emoji else "✍️ Включить") + " премиум-эмодзи вручную",
         callback_data="a:diag:manual",
@@ -91,7 +97,7 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
 @router.callback_query(F.data == "a:diag")
 async def on_diag(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     await call.answer()
-    text, markup = await _screen(session)
+    text, markup = await _screen(session, data["ctx"])
     assert call.message is not None
     await call.message.edit_text(text, reply_markup=markup)
 
@@ -151,7 +157,7 @@ async def _run(ctx: AppContext, chat_id: int, message_id: int) -> None:
         log.exception("diagnostics failed")
         note = f"❌ Диагностика прервалась: {h(str(exc)[:200])}. Попробуйте ещё раз."
     async with ctx.db.session() as session:
-        text, markup = await _screen(session)
+        text, markup = await _screen(session, ctx)
     with contextlib.suppress(TelegramAPIError):
         await show(f"{note}\n\n{text}", markup)
 
@@ -164,7 +170,7 @@ async def on_plain(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
         session, data["user"].id, "runtime.plain_emoji", data={"value": not runtime.plain_emoji_fallback}
     )
     await call.answer("Сохранено")
-    text, markup = await _screen(session)
+    text, markup = await _screen(session, data["ctx"])
     assert call.message is not None
     await call.message.edit_text(text, reply_markup=markup)
 
@@ -179,7 +185,7 @@ async def on_manual(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
     await session.commit()
     request_sync(data["ctx"])
     await call.answer("Сохранено")
-    text, markup = await _screen(session)
+    text, markup = await _screen(session, data["ctx"])
     assert call.message is not None
     await call.message.edit_text(text, reply_markup=markup)
 
@@ -235,7 +241,7 @@ async def on_live_yes(call: CallbackQuery, session: AsyncSession, **data: Any) -
     if engine is not None:
         await engine.wake_all()
     await call.answer("Эфир включён")
-    text, markup = await _screen(session)
+    text, markup = await _screen(session, data["ctx"])
     assert call.message is not None
     await call.message.edit_text(text, reply_markup=markup)
 
@@ -245,7 +251,7 @@ async def on_live_off(call: CallbackQuery, session: AsyncSession, **data: Any) -
     await update_settings(session, Runtime, live=False)
     await audit(session, data["user"].id, "runtime.live", data={"value": False})
     await call.answer("Эфир выключен")
-    text, markup = await _screen(session)
+    text, markup = await _screen(session, data["ctx"])
     assert call.message is not None
     await call.message.edit_text(text, reply_markup=markup)
 
@@ -256,3 +262,98 @@ async def on_sync_now(call: CallbackQuery, **data: Any) -> None:
     if engine is not None:
         await engine.wake_all()
     await call.answer("Синхронизация запущена")
+
+
+# ------------------------------------------------------------------------------------------ Premium account
+ACCOUNT_HOWTO = (
+    "Аккаунт с Telegram Premium сам ставит премиум-эмодзи в посты канала, пока бот не может (у бота нет "
+    "Fragment-юзернейма): светящиеся ники и эмодзи перед названиями появляются без администраторов.\n\n"
+    "<b>Как подключить</b>\n"
+    "1. Сделайте аккаунт администратором канала с правом «Редактировать чужие публикации» (владельцу канала "
+    "ничего делать не нужно).\n"
+    "2. На my.telegram.org войдите номером этого аккаунта → API development tools → создайте приложение "
+    "(название любое) и скопируйте api_id и api_hash.\n"
+    "3. На сервере выполните <code>servicelist account</code> и введите api_id, api_hash, номер телефона, "
+    "код из Telegram и облачный пароль, если он есть.\n\n"
+    "Код и пароль вводятся только на сервере — не присылайте их ни боту, ни в чаты."
+)
+
+
+def _account_screen(ctx: AppContext, role: str | None) -> tuple[str, Any]:
+    account = premium_account.get(ctx)
+    builder = InlineKeyboardBuilder()
+    if account is None or account.state == premium_account.OFF:
+        text = f"👤 <b>Аккаунт с Premium</b>: не подключён\n\n{ACCOUNT_HOWTO}"
+        builder.button(text="🔄 Проверить", callback_data="a:acct:check")
+    else:
+        lines = account.lines()
+        text = f"<b>{lines[0]}</b>\n" + "\n".join(lines[1:])
+        if account.covers_main():
+            text += "\n\nПремиум-эмодзи в постах канала ставит этот аккаунт."
+        else:
+            text += (
+                "\n\nПока аккаунт не может, посты выходят с обычными эмодзи вместо премиум. "
+                "Исправьте то, что отмечено ⛔️, и нажмите «🔄 Проверить»."
+            )
+        if account.checked_at is not None:
+            text += f"\n\n<i>Проверен: {account.checked_at.strftime('%d.%m %H:%M')} UTC</i>"
+        builder.button(text="🔄 Проверить", callback_data="a:acct:check")
+        if role == "owner":
+            builder.button(text="🚪 Отключить аккаунт", callback_data="a:acct:off")
+    builder.adjust(1)
+    return text, back_home(builder, "a:diag")
+
+
+@router.callback_query(F.data == "a:acct")
+async def on_account(call: CallbackQuery, **data: Any) -> None:
+    await call.answer()
+    text, markup = _account_screen(data["ctx"], data.get("role"))
+    assert call.message is not None
+    await call.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+
+@router.callback_query(F.data == "a:acct:check")
+async def on_account_check(call: CallbackQuery, **data: Any) -> None:
+    ctx: AppContext = data["ctx"]
+    await call.answer("Проверяю аккаунт…")
+    await premium_account.check(ctx, force=True)
+    text, markup = _account_screen(ctx, data.get("role"))
+    assert call.message is not None
+    with contextlib.suppress(TelegramBadRequest):  # nothing changed
+        await call.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+
+@router.callback_query(F.data == "a:acct:off", RoleFilter("owner"))
+async def on_account_off(call: CallbackQuery, **data: Any) -> None:
+    account = premium_account.get(data["ctx"])
+    if account is None or account.state == premium_account.OFF:
+        await call.answer("Аккаунт не подключён.", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚪 Да, отключить", callback_data="a:acct:off:yes")
+    builder.button(text="✖️ Отмена", callback_data="a:acct")
+    builder.adjust(2)
+    await call.answer()
+    assert call.message is not None
+    await call.message.edit_text(
+        f"Отключить аккаунт {h(account.name)}? Его сессия на сервере завершится (он пропадёт из «Устройств» "
+        "аккаунта), премиум-эмодзи в новые правки постов он ставить перестанет. Подключить снова: "
+        "<code>servicelist account</code> на сервере.",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "a:acct:off:yes", RoleFilter("owner"))
+async def on_account_off_yes(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    ctx: AppContext = data["ctx"]
+    account = premium_account.get(ctx)
+    if account is not None and account.state != premium_account.OFF:
+        name = account.name
+        await account.disconnect()
+        await audit(session, data["user"].id, "premium_account.off", data={"name": name})
+        await session.commit()
+        await premium_account.announce(ctx, account)
+    await call.answer("Аккаунт отключён")
+    text, markup = _account_screen(ctx, data.get("role"))
+    assert call.message is not None
+    await call.message.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)

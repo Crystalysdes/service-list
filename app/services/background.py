@@ -39,6 +39,12 @@ async def start_background(ctx: AppContext) -> None:
     from app.services.linkcheck import LinkChecker
 
     ctx.services["linkcheck"] = LinkChecker(ctx)
+    from app.services import premium_account
+
+    # the Premium account connected on the server («servicelist account»): checked by a job (app/jobs.py)
+    ctx.services[premium_account.SERVICE] = premium_account.PremiumAccount(
+        premium_account.file_path(ctx.config.data_dir)
+    )
     engine = SyncEngine(ctx)
     ctx.services["sync"] = engine
     await engine.start()
@@ -69,3 +75,6 @@ async def stop_background(ctx: AppContext) -> None:
     checker = ctx.services.get("linkcheck")
     if checker is not None:
         await checker.close()
+    account = ctx.services.get("premium_account")
+    if account is not None:
+        await account.close()

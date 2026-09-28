@@ -39,7 +39,7 @@ from app.db.models import Category, Channel, ChannelPost, EmojiTask, Service, Us
 from app.domain.fonts import glyphs_from_json
 from app.domain.richtext import Entity, Fragment, RichText, u16len
 from app.domain.symbols import channel_post_base
-from app.services import render_db
+from app.services import premium_account, render_db
 from app.services.channels import INACTIVE_STATUSES
 from app.services.notify import close_alert, notify_user, send_to_staff
 from app.services.settings import Runtime, get_settings
@@ -77,8 +77,15 @@ ACCEPTED = "✅ Пост «{title}» совпал с заданием «✨ Пр
 
 
 def active(runtime: Runtime) -> bool:
-    """The admins put premium emoji in by hand now (the bot cannot, and the mode is on)."""
+    """The mode is on and the bot cannot put premium emoji itself (tasks live; the Premium account may still
+    put them in: see ``by_hand``)."""
     return runtime.manual_emoji and not emoji_allowed(runtime)
+
+
+def by_hand(ctx: AppContext, runtime: Runtime) -> bool:
+    """The admins put premium emoji in by hand now: neither the bot nor the Premium account can
+    (premium_account.py)."""
+    return active(runtime) and not premium_account.covers_main(ctx)
 
 
 # ------------------------------------------------------------------------------------------ matching
@@ -477,6 +484,8 @@ async def _reconcile(
         if task is not None:
             done = row.sent_hash == task.content_hash and row.message_id == task.message_id
             await _finish(ctx.bot, task, "done" if done else "dropped", now)
+            if done:  # the Premium account put them in
+                await _tell_owners(ctx, session, task)
         return
     block = await render_db.render_block(session, row.kind, row.block_id, link_ctx, tpl)
     if block is None:
@@ -491,6 +500,9 @@ async def _reconcile(
         if task is not None:
             await _finish(ctx.bot, task, "dropped", now)
         return
+    account = premium_account.for_chat(ctx, channel.chat_id)
+    if account is not None and account.will_put(channel.chat_id, row.id, row.message_id, content_hash):
+        return  # the Premium account puts them in on the engine's next pass
     if task is not None and task.content_hash == content_hash and task.message_id == row.message_id:
         if task.status == "pending" and task.due_at <= now:
             await _send(ctx, session, channel, row, task, now)

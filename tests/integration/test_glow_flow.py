@@ -11,9 +11,10 @@ from sqlalchemy import select
 from app.db.base import utcnow
 from app.db.models import Feature, Service
 from app.jobs import job_poll_invoices
-from app.services import glow, glownick
+from app.services import glow, glownick, premium_account
 from app.services.settings import GlowPacks, Runtime, get_settings, update_settings
 from tests.conftest import OWNER_ID
+from tests.fakeaccount import connect
 from tests.helpers import MAIN
 from tests.integration.test_options_flow import USER, _open_card, _setup
 
@@ -93,6 +94,17 @@ async def test_while_the_admins_put_premium_emoji_in_by_hand_the_owner_is_told_s
     told = h.last(USER)["text"]
     assert "Светящийся ник для «Tripmafia» нарисован" in told and "поставят администраторы" in told
     assert "уже в канале" not in told
+
+
+async def test_with_the_premium_account_the_owner_hears_it_is_in_the_channel(h, tg, db, ctx):
+    await _bought(h, tg, db, ctx)
+    async with db.session() as s:  # the bot cannot put premium emoji in the channel: the account does
+        await update_settings(s, Runtime, selftest_emoji_ok=False, manual_emoji=True)
+        await s.commit()
+    connect(ctx, tg)
+    await premium_account.check(ctx)
+    await glownick.job(ctx)
+    assert "Светящийся ник для «Tripmafia» готов — он уже в канале" in h.last(USER)["text"]
 
 
 async def test_a_new_name_is_drawn_again_and_the_old_pack_goes_later(h, tg, db, ctx):

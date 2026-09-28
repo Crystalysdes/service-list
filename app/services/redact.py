@@ -61,3 +61,11 @@ def install(fmt: str, secrets: Iterable[str]) -> None:
     formatter = RedactingFormatter(fmt, secrets)
     for handler in logging.getLogger().handlers:
         handler.setFormatter(formatter)
+
+
+def add_secrets(values: Iterable[str]) -> None:
+    """Secrets known only later (the Premium account's session): blanked from the logs from now on."""
+    for handler in logging.getLogger().handlers:
+        formatter = handler.formatter
+        if isinstance(formatter, RedactingFormatter):
+            formatter.secrets.extend(v for v in values if v and v not in formatter.secrets)

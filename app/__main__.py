@@ -4,6 +4,8 @@ python -m app              run the bot (applies DB migrations first)
 python -m app migrate      only apply DB migrations
 python -m app restore FILE restore a backup archive into an EMPTY database
 python -m app backup       create a backup archive now (without sending it to Telegram)
+python -m app account      connect the Telegram account with Premium that puts premium emoji into the posts
+python -m app account off  end its session and forget it
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ def main(argv: list[str]) -> int:
     )
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)  # two lines per job run otherwise
+    logging.getLogger("telethon").setLevel(logging.WARNING)  # the Premium account's connection
     command = argv[0] if argv else "run"
     if command == "migrate":
         run_migrations(config.database_url)
@@ -66,6 +69,10 @@ def main(argv: list[str]) -> int:
         from app.services.backup import backup_cli
 
         return asyncio.run(backup_cli(config))
+    if command == "account":
+        from app.account_cli import main as account_main
+
+        return asyncio.run(account_main(config, argv[1:]))
     if command != "run":
         print(__doc__, file=sys.stderr)
         return 2

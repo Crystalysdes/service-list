@@ -33,7 +33,7 @@ from app.db.models import Channel, ChannelPost, MediaFile, Notification
 from app.domain.render import SPARE_TEXT, measure
 from app.domain.richtext import Fragment
 from app.domain.symbols import channel_post_base
-from app.services import render_db
+from app.services import premium_account, render_db
 from app.services.media import send_stored
 from app.services.notify import claim_notification, notify_staff
 from app.services.settings import ChannelLayout, Chats, Runtime, get_settings, update_settings
@@ -341,7 +341,12 @@ class SyncEngine:
                     continue
                 text_block = block.media is None
                 held = await self._gate(
-                    session, block.fragment, PassResult(), "", plain_ok=kind in ALWAYS_SHOWN
+                    session,
+                    block.fragment,
+                    PassResult(),
+                    "",
+                    plain_ok=kind in ALWAYS_SHOWN,
+                    channel_id=channel_id,
                 )
                 title = await self._block_title(session, kind, block_id)
             if held is None:  # nothing is moved for a post that could not be written now
@@ -408,7 +413,12 @@ class SyncEngine:
                 if block is None or block.media is not None:
                     return False
                 held = await self._gate(
-                    session, block.fragment, PassResult(), "", plain_ok=key[0] in ALWAYS_SHOWN
+                    session,
+                    block.fragment,
+                    PassResult(),
+                    "",
+                    plain_ok=key[0] in ALWAYS_SHOWN,
+                    channel_id=channel_id,
                 )
                 if held is None:
                     return False
@@ -1107,6 +1117,7 @@ class SyncEngine:
             f"{kind}:{block_id}",
             plain_ok=kind in ALWAYS_SHOWN,
             plain=block.plain,
+            channel_id=channel_id,
         )
         if fragment is None:
             return None
@@ -1189,6 +1200,8 @@ class SyncEngine:
             await session.commit()
         result.sent += 1
         await self._verify(out.fragment, message, f"{kind}:{block_id}")
+        if out.fragment is not out.block.fragment and premium_account.for_chat(self.ctx, out.chat_id):
+            await self._edit_block(channel_id, kind, block_id, limiter, result)  # the account puts them in
         async with self.ctx.db.session() as session:
             channel = await session.get(Channel, channel_id)
             base = channel_post_base(out.chat_id, channel.username if channel else None)
@@ -1255,23 +1268,37 @@ class SyncEngine:
             bases = kept_edits.post_bases(channel.chat_id, channel.username)
             target = kept_edits.target_for(row.manual, block.fragment, block.content_hash(), bases)
             content_hash = target.sent_hash
-            emoji_ok = True
-            if row.sent_hash == kept_edits.PLAIN + content_hash:
-                emoji_ok = emoji_allowed(await get_settings(session, Runtime))
+            key = f"{kind}:{block_id}"
+            # premium emoji the bot cannot put are put by the Premium account (premium_account.py)
+            account = None
+            bot_emoji = True
+            if target.fragment.custom_emoji_count():
+                bot_emoji = emoji_allowed(await get_settings(session, Runtime))
+                account = None if bot_emoji else premium_account.get(self.ctx)
+                if account is not None and not account.will_put(
+                    channel.chat_id, row.id, row.message_id, content_hash
+                ):
+                    account = None
+            emoji_ok = bot_emoji or account is not None
             if row.state in SETTLED and kept_edits.up_to_date(row.sent_hash, content_hash, emoji_ok):
                 if target.manual != row.manual:  # a just kept edit got its data fingerprint
                     row.manual = target.manual
                     await session.commit()
                 result.unchanged += 1
                 return
-            fragment = await self._gate(
-                session,
-                target.fragment,
-                result,
-                f"{kind}:{block_id}",
-                plain_ok=kind in ALWAYS_SHOWN,
-                plain=block.plain if target.fragment is block.fragment else None,
-            )
+            plain = block.plain if target.fragment is block.fragment else None
+            if account is not None:
+                fragment: Fragment | None = target.fragment
+            else:
+                fragment = await self._gate(
+                    session,
+                    target.fragment,
+                    result,
+                    key,
+                    plain_ok=kind in ALWAYS_SHOWN,
+                    plain=plain,
+                    channel_id=channel_id,
+                )
             if fragment is None:
                 return
             if fragment is block.fragment or fragment is block.plain:  # not an admin's kept edit
@@ -1284,7 +1311,7 @@ class SyncEngine:
                         "Правка не отправлена — уберите часть сервисов или опций.",
                     )
                     return
-            chat_id, message_id = channel.chat_id, row.message_id
+            chat_id, message_id, row_id = channel.chat_id, row.message_id, row.id
             post_url = bases[0] + str(message_id)
             channel_title = channel.title or str(channel.chat_id)
             is_caption = block.media is not None
@@ -1292,7 +1319,33 @@ class SyncEngine:
             markup = buttons_markup(block.buttons)
         message: Message | None = None
         status = "ok"
-        while True:
+        if account is not None:
+            status = await self._edit_by_account(
+                account,
+                chat_id,
+                message_id,
+                fragment,
+                preview=None if is_caption else block.link_preview,
+                markup=markup,
+                gave_up=(row_id, message_id, content_hash),
+                key=key,
+                limiter=limiter,
+            )
+            if status == "fallback":  # the bot writes the post without them meanwhile
+                async with self.ctx.db.session() as session:
+                    fragment = await self._gate(
+                        session,
+                        target.fragment,
+                        result,
+                        key,
+                        plain_ok=kind in ALWAYS_SHOWN,
+                        plain=plain,
+                        channel_id=channel_id,
+                    )
+                if fragment is None:
+                    return
+                account, status = None, "ok"
+        while account is None:
             await limiter.acquire()
             try:
                 if is_caption:
@@ -1464,23 +1517,89 @@ class SyncEngine:
         *,
         plain_ok: bool = False,
         plain: Fragment | None = None,
+        channel_id: int | None = None,
     ) -> Fragment | None:
         """Posts with premium emoji are only touched while the self-test confirms emoji work.
 
         ``plain_ok``: the post goes without them meanwhile (the navigation must never be missing). So does
         every post while the admins put the emoji in by hand (``Runtime.manual_emoji``, emoji_tasks.py) or
-        allowed plain emoji. ``plain``: the block's own version without them (names of emoji letters written
-        as names); otherwise the emoji are stripped, their stand-ins stay.
+        allowed plain emoji, and every post of a channel whose premium emoji the Premium account puts in right
+        after the bot (``channel_id``, premium_account.py). ``plain``: the block's own version without them
+        (the glowing name written as the name); otherwise the emoji are stripped, their stand-ins stay.
         """
         if not fragment.custom_emoji_count():
             return fragment
         runtime = await get_settings(session, Runtime)
         if emoji_allowed(runtime):
             return fragment
-        if runtime.plain_emoji_fallback or runtime.manual_emoji or plain_ok:
+        if (
+            runtime.plain_emoji_fallback
+            or runtime.manual_emoji
+            or plain_ok
+            or await self._account_puts(session, channel_id)
+        ):
             return plain if plain is not None else strip_custom_emoji(fragment)
         result.skipped.append(key)
         return None
+
+    async def _account_puts(self, session: AsyncSession, channel_id: int | None) -> bool:
+        """The Premium account can put premium emoji into this channel's posts now."""
+        if channel_id is None:
+            return False
+        channel = await session.get(Channel, channel_id)
+        return channel is not None and premium_account.for_chat(self.ctx, channel.chat_id) is not None
+
+    async def _edit_by_account(
+        self,
+        account: premium_account.PremiumAccount,
+        chat_id: int,
+        message_id: int,
+        fragment: Fragment,
+        *,
+        preview: bool | None,
+        markup: Any,
+        gave_up: tuple[int, int, str],
+        key: str,
+        limiter: RateLimiter,
+    ) -> str:
+        """The Premium account edits the post with its premium emoji: "ok", "unchanged", or "fallback" when it
+        could not (the bot then writes the post without them)."""
+        await limiter.acquire()
+        try:
+            edited = await account.edit(chat_id, message_id, fragment, preview=preview)
+        except premium_account.NotModified:
+            return "unchanged"
+        except premium_account.AccountError as exc:
+            if exc.kind == premium_account.POST:
+                account.give_up(*gave_up)
+                await self._alert_once(
+                    f"account_post:{chat_id}:{key}:{gave_up[2][:12]}",
+                    f"⚠️ Аккаунт с Premium не смог поставить премиум-эмодзи в пост {key}: {h(exc.detail)}. "
+                    "Пост обновлён с обычными эмодзи.",
+                )
+            else:  # the account itself: its screen and the staff say what (premium_account.announce)
+                log.warning("the Premium account did not edit %s: %s", key, exc.kind)
+            return "fallback"
+        wanted = fragment.custom_emoji_count()
+        if edited.custom_emoji is not None and edited.custom_emoji < wanted:
+            if edited.custom_emoji:  # some cannot be used by anyone (their pack deleted?)
+                account.give_up(*gave_up)
+                await self._alert_once(
+                    f"account_lost:{chat_id}:{key}:{gave_up[2][:12]}",
+                    f"⚠️ Telegram убрал {wanted - edited.custom_emoji} из {wanted} премиум-эмодзи из поста "
+                    f"{key}, который правил аккаунт с Premium: возможно, их набор удалён. Пост обновлён с "
+                    "обычными эмодзи.",
+                )
+            return "fallback"
+        if markup is not None and not edited.markup:  # the buttons under the post stay
+            bot = self.ctx.bot
+            assert bot is not None
+            await limiter.acquire()
+            with contextlib.suppress(TelegramAPIError):  # "not modified": they are there
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=message_id, reply_markup=markup
+                )
+        return "ok"
 
     async def _call(self, coro: Any, channel_id: int) -> Any:
         try:

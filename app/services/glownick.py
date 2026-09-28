@@ -119,14 +119,14 @@ async def draw(ctx: AppContext, feature_id: int) -> bool:
 
     request_sync(ctx)
     if owner_id:
-        from app.services.emoji_tasks import active
+        from app.services.emoji_tasks import by_hand
 
         async with ctx.db.session() as session:
             user = await session.get(User, owner_id)
-            by_hand = active(await get_settings(session, Runtime))  # the admins put it into the post
+            manual = by_hand(ctx, await get_settings(session, Runtime))  # the admins put it into the post
         t = Translator(user.lang if user else None)
         await notify_user(
-            ctx, owner_id, t("opt.glow_ready_manual" if by_hand else "opt.glow_ready", name=h(name))
+            ctx, owner_id, t("opt.glow_ready_manual" if manual else "opt.glow_ready", name=h(name))
         )
     return True
 

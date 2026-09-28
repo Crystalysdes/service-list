@@ -202,9 +202,9 @@ async def after_paid(ctx: AppContext, result: PaidResult) -> None:
             why = "; ".join(result.notes or []) or order.note or result.status
             staff_text += f"\n⚠️ Требует внимания: {h(why)} (заказ #{order.id})"
         elif order.kind in ("emoji", "font"):
-            from app.services.emoji_tasks import active
+            from app.services.emoji_tasks import by_hand
 
-            if active(await get_settings(session, Runtime)):
+            if by_hand(ctx, await get_settings(session, Runtime)):
                 staff_text += (
                     "\n✍️ Премиум-эмодзи бот сам поставить не может: задание с готовым текстом поста придёт "
                     "в админ-чат, его вставляют в пост вручную."
