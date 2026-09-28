@@ -151,6 +151,13 @@ async def community_url(session: AsyncSession) -> str | None:
     return None
 
 
+async def support_link(session: AsyncSession) -> tuple[str, str] | None:
+    """Support in ℹ️ Help: the contact as set in the settings and its link (None: not shown)."""
+    contact = (await get_settings(session, Chats)).support_contact
+    url = _as_url(contact) if contact else None
+    return (contact.strip(), url) if contact and url else None
+
+
 async def channel_urls(session: AsyncSession) -> dict[str, str]:
     urls: dict[str, str] = {}
     rows = await session.execute(

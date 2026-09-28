@@ -38,6 +38,8 @@ menu:
   links_failed: "Could not issue a link — please try again in a minute."
 help:
   text: "<b>How it works</b>\n\n➕ <b>Add service</b> — describe your service and send its link. After a moderator approves it, the bot sends an invoice; once paid, the service appears in its branch of the channel.\n\n🗂 <b>My services</b> — your services: top 1/2/3, a premium emoji before the name, a name made of animated emoji, renewals and stats.\n\n⚠️ <b>Report service</b> — report a service (screenshots and a detailed description are required).\n\n🚫 <b>Scam list</b> — services found to be scams.\n\n🛡 <b>Auto-garant</b> — a deal through the escrow: the money is held until both sides confirm."
+  support: "🆘 <b>Support</b> — {contact}: if something does not work or you have a question."
+  support_button: "🆘 Contact support"
 news:
   title: "🆕 New service in «{category}»"
   claimed: "✅ Its owner confirmed this service in «{category}»"

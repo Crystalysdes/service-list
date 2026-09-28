@@ -20,11 +20,12 @@ from app.bot.flows.start import (
     send_menu,
     show_screen,
 )
-from app.bot.i18n import LANGS, Translator
+from app.bot.i18n import LANGS, Translator, h
 from app.db.base import utcnow
 from app.domain.captcha import check, is_blocked, new_challenge
 from app.services import announce
 from app.services.invites import ttl_text
+from app.services.render_db import support_link
 from app.services.settings import Captcha, get_settings
 
 router = Router(name="user_start")
@@ -65,8 +66,8 @@ async def cmd_menu(message: Message, state: FSMContext, **data: Any) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, **data: Any) -> None:
-    t: Translator = data["t"]
-    await message.answer(t("help.text"), reply_markup=_help_keyboard(t, data["user"]))
+    text, markup = await _help(data)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(F.data.startswith("cap:"))
@@ -153,10 +154,10 @@ async def on_menu(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
 
 @router.callback_query(F.data == "m:help")
 async def on_help(call: CallbackQuery, **data: Any) -> None:
-    t: Translator = data["t"]
     await call.answer()
     assert call.message is not None
-    await show_screen(call.message, t("help.text"), reply_markup=_help_keyboard(t, data["user"]))
+    text, markup = await _help(data)
+    await show_screen(call.message, text, reply_markup=markup)
 
 
 @router.callback_query(F.data == "h:news")
@@ -167,8 +168,9 @@ async def on_news_switch(call: CallbackQuery, **data: Any) -> None:
     user.news_off = not user.news_off
     await call.answer(t("news.switched_off") if user.news_off else t("news.switched_on"))
     if isinstance(call.message, Message):
+        support = await support_link(data["session"])
         with contextlib.suppress(TelegramBadRequest):
-            await call.message.edit_reply_markup(reply_markup=_help_keyboard(t, user))
+            await call.message.edit_reply_markup(reply_markup=_help_keyboard(t, user, support))
 
 
 @router.callback_query(F.data == announce.MUTE)
@@ -217,8 +219,20 @@ async def on_refresh_links(call: CallbackQuery, **data: Any) -> None:
         await call.answer(t("menu.links_fresh", ttl=ttl_text(links.ttl, t.lang)))
 
 
-def _help_keyboard(t: Translator, user: Any) -> Any:
+async def _help(data: dict[str, Any]) -> tuple[str, Any]:
+    """ℹ️ Help: how it works, the support contact (when set), 🔔 / 🔕 for new services."""
+    t: Translator = data["t"]
+    support = await support_link(data["session"])
+    text = t("help.text")
+    if support is not None:
+        text += "\n\n" + t("help.support", contact=h(support[0]))
+    return text, _help_keyboard(t, data["user"], support)
+
+
+def _help_keyboard(t: Translator, user: Any, support: tuple[str, str] | None) -> Any:
     builder = InlineKeyboardBuilder()
+    if support is not None:
+        builder.button(text=t("help.support_button"), url=support[1])
     muted = user is not None and user.news_off
     builder.button(text=t("news.help_on") if muted else t("news.help_off"), callback_data="h:news")
     builder.button(text=t("common.menu"), callback_data="m:menu")

@@ -1,4 +1,4 @@
-"""Admin: settings — appeal contact, captcha, limits of reports and submissions."""
+"""Admin: settings — support and appeal contacts, captcha, limits of reports and submissions."""
 
 from __future__ import annotations
 
@@ -37,6 +37,15 @@ NUMBERS: dict[str, tuple[type, str, str, int, int]] = {
     "invite": (Limits, "invite_link_ttl_sec", "Личные ссылки в меню (канал, чат) живут, сек", 30, 3600),
 }
 
+# the support contact: a Telegram @username, a t.me link, or a site (a link Telegram refuses under a button
+# would break the whole help screen, so only plain ones)
+URL_PATH = r"[A-Za-z0-9_+/?=&%.~#-]"
+SUPPORT_RE = re.compile(
+    r"^@[A-Za-z0-9_]{4,32}$"
+    rf"|^(https?://)?(t\.me|telegram\.me)/{URL_PATH}+$"
+    rf"|^https://[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{{2,}}(/{URL_PATH}*)?$"
+)
+
 
 async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     chats = await get_settings(session, Chats)
@@ -46,6 +55,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     lines = [
         "⚙️ <b>Настройки</b>",
         "",
+        f"Поддержка (кнопка в «ℹ️ Помощь» бота): {h(chats.support_contact or 'не показывается')}",
         f"Контакт для апелляций: {h(chats.appeal_contact or 'не задан')}",
         "Ссылка на чат (кнопка «💬 Chat» в меню): "
         + h(chats.community_url or "не задана — берётся из строки «Chat:» главного поста"),
@@ -64,6 +74,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         "командой /bind в самой группе (см. 📡 Каналы).",
     ]
     builder = InlineKeyboardBuilder()
+    builder.button(text="🆘 Поддержка", callback_data="a:set:support")
     builder.button(text="✏️ Контакт для апелляций", callback_data="a:set:appeal")
     builder.button(text="💬 Ссылка на чат", callback_data="a:set:chat")
     builder.button(
@@ -129,6 +140,34 @@ async def on_own_emoji(call: CallbackQuery, session: AsyncSession, **data: Any) 
     await session.commit()
     await call.answer("Сохранено")
     await _show(call, session, data["ctx"])
+
+
+@router.callback_query(F.data == "a:set:support")
+async def on_support(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    await ask(
+        call,
+        state,
+        "set_support",
+        "Контакт поддержки для «ℹ️ Помощь» в боте (строка и кнопка «🆘 Написать в поддержку»): @username или "
+        "ссылка t.me/…. «-» — не показывать.",
+        "a:set",
+    )
+
+
+@input_handler("set_support")
+async def input_support(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
+    session: AsyncSession = data["session"]
+    value = (message.text or "").strip()
+    if value != "-" and not (len(value) <= 100 and SUPPORT_RE.match(value)):
+        await message.answer("Нужен @username или ссылка t.me/… / https://… (до 100 символов), или «-».")
+        return False
+    contact = None if value == "-" else value
+    await update_settings(session, Chats, support_contact=contact)
+    await audit(session, data["user"].id, "settings.support", data={"contact": contact})
+    await session.commit()
+    text, markup = await _screen(session, data["ctx"])
+    await message.answer("✅ Сохранено.\n\n" + text, reply_markup=markup)
+    return True
 
 
 @router.callback_query(F.data == "a:set:appeal")

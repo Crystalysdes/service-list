@@ -67,6 +67,46 @@ async def test_text_menu_layout_and_structure(h, tg, db):
     ]
 
 
+async def test_help_shows_support_and_the_admin_changes_or_hides_it(h, tg, db):
+    await _ready_user(tg, db)
+    await h.say(USER, "/menu")
+    await h.press(USER, h.last(USER), "Помощь")
+    screen = h.last(USER)
+    assert screen["text"].endswith(
+        "\n\n🆘 Поддержка — @hermesreneissance: если что-то не получается или остался вопрос."
+    )
+    assert [(b["text"], b.get("url")) for b in h.buttons(screen)] == [
+        ("🆘 Написать в поддержку", "https://t.me/hermesreneissance"),
+        ("🔕 Не присылать новые сервисы", None),
+        ("🏠 Меню", None),
+    ]
+    await h.press(USER, screen, "Не присылать новые сервисы")  # the keyboard is redrawn: support stays
+    assert h.button(tg.messages[USER][screen["message_id"]], "Написать в поддержку")
+
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Настройки")
+    assert "Поддержка (кнопка в «ℹ️ Помощь» бота): @hermesreneissance" in h.last(OWNER_ID)["text"]
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Поддержка")
+    await h.say(OWNER_ID, "hermes")  # not a contact: asked again
+    assert "Нужен @username" in h.last(OWNER_ID)["text"]
+    await h.say(OWNER_ID, "t.me/other_help")
+    assert "Поддержка (кнопка в «ℹ️ Помощь» бота): t.me/other_help" in h.last(OWNER_ID)["text"]
+
+    await h.say(USER, "/help")
+    screen = h.last(USER)
+    assert "🆘 Поддержка — t.me/other_help:" in screen["text"]
+    assert h.button(screen, "Написать в поддержку")["url"] == "https://t.me/other_help"
+
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Поддержка")
+    await h.say(OWNER_ID, "-")  # not shown at all
+    assert "Поддержка (кнопка в «ℹ️ Помощь» бота): не показывается" in h.last(OWNER_ID)["text"]
+    await h.say(USER, "/help")
+    screen = h.last(USER)
+    assert "Поддержка" not in screen["text"]
+    assert [b["text"] for b in h.buttons(screen)] == ["🔔 Присылать новые сервисы", "🏠 Меню"]
+
+
 async def test_admin_sets_a_menu_video_and_users_see_it(h, tg, db, ctx):
     note = await _upload_video(h, tg)
     assert "Заставка сохранена" in note["text"]
