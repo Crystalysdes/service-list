@@ -21,6 +21,7 @@ from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.db.models import Channel, ChannelPost
 from app.services.audit import audit
+from app.services.catalog import request_sync
 from app.services.channels import INACTIVE_STATUSES
 from app.services.selftest import Check, Diagnostics, check_lines, diagnostics, format_report
 from app.services.settings import Runtime, get_settings, update_settings
@@ -49,7 +50,22 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         f"Премиум-эмодзи: {'✅ разрешены' if emoji_allowed(runtime) else '⛔️ не подтверждены самотестом'}"
     )
     if runtime.safe_mode:
-        lines.append("🛡 Безопасный режим: посты с премиум-эмодзи не трогаются")
+        lines.append(
+            "🛡 Безопасный режим: бот не ставит премиум-эмодзи сам"
+            if runtime.manual_emoji
+            else "🛡 Безопасный режим: посты с премиум-эмодзи не трогаются"
+        )
+    if runtime.manual_emoji:
+        lines.append(
+            "✍️ Премиум-эмодзи вручную: включено — "
+            + (
+                "пока бот ставит их сам, не нужно"
+                if emoji_allowed(runtime)
+                else "посты выходят без них, готовый текст с ними приходит в админ-чат"
+            )
+        )
+    else:
+        lines.append("✍️ Премиум-эмодзи вручную: выключено")
     if runtime.plain_emoji_fallback:
         lines.append("🔤 Разрешено публиковать обычные эмодзи вместо премиум")
     builder = InlineKeyboardBuilder()
@@ -59,6 +75,10 @@ async def _screen(session: AsyncSession) -> tuple[str, Any]:
         builder.button(text="🔄 Синхронизировать сейчас", callback_data="a:sync:now")
     else:
         builder.button(text="🚀 В эфир", callback_data="a:live:on")
+    builder.button(
+        text=("✍️ Выключить" if runtime.manual_emoji else "✍️ Включить") + " премиум-эмодзи вручную",
+        callback_data="a:diag:manual",
+    )
     builder.button(
         text=("🔤 Запретить" if runtime.plain_emoji_fallback else "🔤 Разрешить")
         + " обычные эмодзи вместо премиум",
@@ -149,6 +169,21 @@ async def on_plain(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
     await call.message.edit_text(text, reply_markup=markup)
 
 
+@router.callback_query(F.data == "a:diag:manual")
+async def on_manual(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """While the bot cannot put premium emoji: posts go without them and the admins get the text with them
+    to put in by hand (emoji_tasks.py); off: such posts wait, as before."""
+    runtime = await get_settings(session, Runtime)
+    await update_settings(session, Runtime, manual_emoji=not runtime.manual_emoji)
+    await audit(session, data["user"].id, "runtime.manual_emoji", data={"value": not runtime.manual_emoji})
+    await session.commit()
+    request_sync(data["ctx"])
+    await call.answer("Сохранено")
+    text, markup = await _screen(session)
+    assert call.message is not None
+    await call.message.edit_text(text, reply_markup=markup)
+
+
 @router.callback_query(F.data == "a:live:on")
 async def on_live_on(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
     runtime = await get_settings(session, Runtime)
@@ -168,7 +203,12 @@ async def on_live_on(call: CallbackQuery, session: AsyncSession, **data: Any) ->
     builder.button(text="✖️ Отмена", callback_data="a:diag")
     builder.adjust(2)
     warning = ""
-    if not emoji_allowed(runtime):
+    if not emoji_allowed(runtime) and runtime.manual_emoji:
+        warning = (
+            "\n\n⚠️ Самотест премиум-эмодзи не пройден: посты выйдут без премиум-эмодзи, а готовый текст "
+            "с ними придёт в админ-чат — его вставляют в пост вручную (✍️)."
+        )
+    elif not emoji_allowed(runtime):
         warning = (
             "\n\n⚠️ Самотест премиум-эмодзи не пройден: посты с премиум-эмодзи бот трогать не будет, "
             "пока диагностика не станет зелёной."

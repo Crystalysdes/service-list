@@ -161,7 +161,8 @@ async def why_not_shown(ctx: AppContext, session: AsyncSession, service: Service
     block = await render_db.render_block(session, "category", service.category_id, link_ctx, tpl)
     if block is not None:
         premium = block.fragment.custom_emoji_count() > 0
-        if premium and not emoji_allowed(runtime) and not runtime.plain_emoji_fallback:
+        held = not (runtime.plain_emoji_fallback or runtime.manual_emoji)
+        if premium and not emoji_allowed(runtime) and held:
             why = "безопасный режим" if runtime.safe_mode else "самопроверка премиум-эмодзи не подтверждена"
             return (
                 f"пауза премиум-эмодзи ({why}): посты с ними не правятся — /admin → 🩺 Диагностика → "

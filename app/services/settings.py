@@ -172,6 +172,7 @@ class Chats(SettingsGroup):
     topic_reports: int | None = None
     topic_log: int | None = None
     topic_deals: int | None = None  # Auto-garant disputes
+    topic_emoji: int | None = None  # premium emoji to put in by hand; None: the applications topic
     appeal_contact: str | None = None  # shown to banned owners, e.g. "@support"
     support_contact: str | None = "@hermesreneissance"  # «🆘 Поддержка» in ℹ️ Help; None: not shown
     community_url: str | None = None  # the community chat ("💬 Chat" in the menu); None: from the main post
@@ -290,6 +291,9 @@ class Runtime(SettingsGroup):
     live: bool = False  # "В эфир": allowed to edit channel posts
     safe_mode: bool = False  # custom emoji broken -> do not touch posts with custom emoji
     plain_emoji_fallback: bool = False  # owner explicitly allowed rendering without custom emoji
+    # while the bot cannot put premium emoji: posts go without them and the admins get the text with them to
+    # put in by hand (app/services/emoji_tasks.py)
+    manual_emoji: bool = True
     selftest_ok_at: datetime | None = None
     selftest_emoji_ok: bool | None = None
     custom_emoji_cap: int | None = None

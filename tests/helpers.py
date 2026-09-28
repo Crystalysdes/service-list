@@ -14,8 +14,13 @@ MAIN = -1001234567890
 STORAGE = -1005550000001
 
 
-async def imported_channel(tg, db, ctx, *, live: bool = True, emoji_ok: bool = True) -> dict:
-    """Build the synthetic channel in FakeTelegram and import it through the real services."""
+async def imported_channel(
+    tg, db, ctx, *, live: bool = True, emoji_ok: bool = True, manual_emoji: bool = False
+) -> dict:
+    """Build the synthetic channel in FakeTelegram and import it through the real services.
+
+    ``manual_emoji``: posts with premium emoji the bot cannot put go without them and the admins get tasks
+    (off here: such posts wait, as the tests of that expect)."""
     from tests.conftest import OWNER_ID
 
     if OWNER_ID not in tg.users:
@@ -51,6 +56,7 @@ async def imported_channel(tg, db, ctx, *, live: bool = True, emoji_ok: bool = T
             live=live,
             selftest_emoji_ok=emoji_ok,
             selftest_ok_at=utcnow() if emoji_ok else None,
+            manual_emoji=manual_emoji,
         )
         await s.commit()
     ids["channel_id"] = channel_id

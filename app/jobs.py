@@ -102,6 +102,12 @@ async def job_glow(ctx: AppContext) -> None:
     await job(ctx)
 
 
+async def job_emoji_tasks(ctx: AppContext) -> None:
+    from app.services.emoji_tasks import job
+
+    await job(ctx)
+
+
 async def job_publish_watch(ctx: AppContext) -> None:
     from app.services.published import watch
 
@@ -156,6 +162,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_announce, IntervalTrigger(seconds=10)),
         (job_publish_watch, IntervalTrigger(minutes=2)),
         (job_glow, IntervalTrigger(seconds=15)),
+        (job_emoji_tasks, IntervalTrigger(seconds=30)),
         (job_moderation_cards, IntervalTrigger(minutes=5, jitter=30)),
         (job_escrow_poll, IntervalTrigger(seconds=20)),
         (job_escrow_sweep, IntervalTrigger(minutes=1)),

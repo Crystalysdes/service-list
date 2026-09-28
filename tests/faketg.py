@@ -88,6 +88,8 @@ class FakeTelegram:
         self.injected: dict[str, list[FakeError]] = {}
         self.clock = 1_760_000_000
         self.custom_emoji_in_channels = True
+        # False: the bot's owner has no Telegram Premium, so groups drop the bot's custom emoji too
+        self.custom_emoji_in_groups = True
         self.custom_emoji_cap: int | None = None
         self.max_user_entities = 100
         self.custom_emoji: dict[str, dict[str, Any]] = {}
@@ -328,6 +330,8 @@ class FakeTelegram:
             return _strip_html(text), []
         result = [dict(e) for e in (entities or [])]
         if chat["type"] == "channel" and not self.custom_emoji_in_channels:
+            result = [e for e in result if e["type"] != "custom_emoji"]
+        if chat["type"] in ("group", "supergroup") and not self.custom_emoji_in_groups:
             result = [e for e in result if e["type"] != "custom_emoji"]
         if self.custom_emoji_cap is not None:
             kept = []

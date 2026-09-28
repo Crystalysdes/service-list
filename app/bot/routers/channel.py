@@ -19,6 +19,7 @@ from app.db.models import Channel, ChannelPost
 from app.domain.render import compare
 from app.domain.richtext import Fragment
 from app.domain.symbols import channel_post_base
+from app.services import emoji_tasks
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.channels import remember_chat
@@ -143,6 +144,10 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
     edited = Fragment.from_message(message)
     if compare(Fragment.from_json(row.snapshot), edited).equal:
         return
+    # the admins putting in the premium emoji the bot could not (a task in the admin chat): no alert
+    task = await emoji_tasks.on_edit(data["ctx"], session, row, edited)
+    if task in ("done", "partial"):
+        return
     edit_date = message.edit_date or 0
     if kept_edits.is_kept(row.manual):  # the admins keep this post by hand: a new edit is kept as well
         row.manual = {
@@ -169,9 +174,10 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
     builder.button(text="↩️ Вернуть как было", callback_data=f"a:revert:{row.id}:{edit_date}")
     builder.button(text="✅ Оставить", callback_data=f"a:keep:{row.id}:{edit_date}")
     builder.adjust(2)
-    sent = await notify_staff(
-        data["ctx"], edit_alert_text(channel, row), reply_markup=builder.as_markup(), session=session
-    )
+    text = edit_alert_text(channel, row)
+    if task == "mismatch":
+        text += "\n\n" + h(emoji_tasks.MISMATCH)
+    sent = await notify_staff(data["ctx"], text, reply_markup=builder.as_markup(), session=session)
     remember_alert(session, "post_edit", row.id, sent)
 
 

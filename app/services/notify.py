@@ -20,8 +20,14 @@ from app.services.settings import Chats, get_settings
 
 log = logging.getLogger(__name__)
 
-TOPICS = ("log", "applications", "reports", "deals")
-TOPIC_TITLES = {"log": "Лог", "applications": "Заявки", "reports": "Жалобы", "deals": "Сделки"}
+TOPICS = ("log", "applications", "reports", "deals", "emoji")
+TOPIC_TITLES = {
+    "log": "Лог",
+    "applications": "Заявки",
+    "reports": "Жалобы",
+    "deals": "Сделки",
+    "emoji": "Премиум-эмодзи",
+}
 # Telegram's words for a topic that is not there any more (deleted, closed, a wrong id)
 _THREAD_GONE = ("thread", "topic")
 
@@ -34,13 +40,14 @@ def _thread(chats: Chats, topic: str) -> int | None:
         "applications": chats.topic_applications,
         "reports": chats.topic_reports,
         "deals": chats.topic_deals,
+        "emoji": chats.topic_emoji or chats.topic_applications,  # premium emoji to put in by hand
     }.get(topic)
 
 
 async def _private_staff(ctx: AppContext, session: AsyncSession, topic: str) -> list[int]:
     from app.services.users import staff_ids
 
-    min_role = "admin" if topic == "log" else "moderator"
+    min_role = "admin" if topic in ("log", "emoji") else "moderator"
     return await staff_ids(session, ctx.config.owner_ids, min_role)
 
 

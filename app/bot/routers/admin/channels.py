@@ -60,8 +60,9 @@ CONNECT_HELP = (
 )
 BIND_HINT = (
     "Если в группе включены темы, отправьте в нужных темах <code>/bind applications</code>, "
-    "<code>/bind reports</code>, <code>/bind log</code> и <code>/bind deals</code> — тогда заявки, "
-    "жалобы, лог и споры по сделкам гаранта пойдут по своим темам."
+    "<code>/bind reports</code>, <code>/bind log</code>, <code>/bind deals</code> и "
+    "<code>/bind emoji</code> — тогда заявки, жалобы, лог, споры по сделкам гаранта и премиум-эмодзи, "
+    "которые ставят вручную, пойдут по своим темам."
 )
 
 
@@ -95,6 +96,7 @@ async def channels_text(session: AsyncSession) -> str:
             f"жалобы #{chats.topic_reports}" if chats.topic_reports else None,
             f"лог #{chats.topic_log}" if chats.topic_log else None,
             f"сделки #{chats.topic_deals}" if chats.topic_deals else None,
+            f"премиум-эмодзи #{chats.topic_emoji}" if chats.topic_emoji else None,
         ]
         extra = ", ".join(x for x in topics if x)
         lines.append(
@@ -347,6 +349,7 @@ async def connect(
         else:
             if chats.moderation_chat_id != chat.id:
                 chats.topic_applications = chats.topic_reports = chats.topic_log = chats.topic_deals = None
+                chats.topic_emoji = None
             chats.moderation_chat_id = chat.id
             note = f"✅ Группа модерации подключена: {h(chat.title or chat.id)}\n\n{BIND_HINT}"
         await save_settings(session, chats)
@@ -427,6 +430,7 @@ async def cmd_bind(message: Message, command: CommandObject, session: AsyncSessi
     thread = message.message_thread_id if message.is_topic_message else None
     if chats.moderation_chat_id not in (None, message.chat.id):
         chats.topic_applications = chats.topic_reports = chats.topic_log = chats.topic_deals = None
+        chats.topic_emoji = None
     chats.moderation_chat_id = message.chat.id
     if arg in ("applications", "заявки"):
         chats.topic_applications = thread
@@ -440,6 +444,9 @@ async def cmd_bind(message: Message, command: CommandObject, session: AsyncSessi
     elif arg in ("deals", "сделки"):
         chats.topic_deals = thread
         what = "сделки гаранта"
+    elif arg in ("emoji", "эмодзи"):
+        chats.topic_emoji = thread
+        what = "премиум-эмодзи вручную"
     else:
         what = "модерация"
     await save_settings(session, chats)

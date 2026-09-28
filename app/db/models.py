@@ -414,6 +414,46 @@ class ChannelPost(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class EmojiTask(CreatedMixin, Base):
+    """A post the bot published without its premium emoji (Telegram does not let it put them): the admins put
+    them in by hand (app/services/emoji_tasks.py).
+
+    ``desired`` is the post's text with the emoji; the admins copy it into the post, and the bot, seeing the
+    edit, gives the post ``content_hash`` as what it shows."""
+
+    __tablename__ = "emoji_tasks"
+    __table_args__ = (
+        Index(
+            "uq_emoji_tasks_one_open",
+            "channel_post_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'open')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_post_id: Mapped[int] = mapped_column(
+        ForeignKey("channel_posts.id", ondelete="CASCADE"), index=True
+    )
+    message_id: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(80))
+    desired: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    # what the post has: [{"kind": "emoji"/"font"/"glow"/"design", "service", "line", "ids", "until", ...}]
+    items: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", index=True
+    )  # pending/open/done/stale/dropped
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # the messages in the admin chat: [{"chat_id", "card_id", "text_id"}] (a copy per chat it went to)
+    messages: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    notes: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+
+
 class ImportRun(Base):
     __tablename__ = "import_runs"
 

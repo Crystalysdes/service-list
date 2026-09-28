@@ -1101,7 +1101,12 @@ class SyncEngine:
         if block is None:
             return None
         fragment = await self._gate(
-            session, block.fragment, result, f"{kind}:{block_id}", plain_ok=kind in ALWAYS_SHOWN
+            session,
+            block.fragment,
+            result,
+            f"{kind}:{block_id}",
+            plain_ok=kind in ALWAYS_SHOWN,
+            plain=block.plain,
         )
         if fragment is None:
             return None
@@ -1260,11 +1265,16 @@ class SyncEngine:
                 result.unchanged += 1
                 return
             fragment = await self._gate(
-                session, target.fragment, result, f"{kind}:{block_id}", plain_ok=kind in ALWAYS_SHOWN
+                session,
+                target.fragment,
+                result,
+                f"{kind}:{block_id}",
+                plain_ok=kind in ALWAYS_SHOWN,
+                plain=block.plain if target.fragment is block.fragment else None,
             )
             if fragment is None:
                 return
-            if fragment is block.fragment:
+            if fragment is block.fragment or fragment is block.plain:  # not an admin's kept edit
                 report = measure(fragment, await render_db.limits(session))
                 if not report.ok:
                     result.errors.append(f"{kind}:{block_id}: {report.describe()}")
@@ -1453,18 +1463,22 @@ class SyncEngine:
         key: str,
         *,
         plain_ok: bool = False,
+        plain: Fragment | None = None,
     ) -> Fragment | None:
         """Posts with premium emoji are only touched while the self-test confirms emoji work.
 
-        ``plain_ok``: the post goes without them meanwhile (the navigation must never be missing).
+        ``plain_ok``: the post goes without them meanwhile (the navigation must never be missing). So does
+        every post while the admins put the emoji in by hand (``Runtime.manual_emoji``, emoji_tasks.py) or
+        allowed plain emoji. ``plain``: the block's own version without them (names of emoji letters written
+        as names); otherwise the emoji are stripped, their stand-ins stay.
         """
         if not fragment.custom_emoji_count():
             return fragment
         runtime = await get_settings(session, Runtime)
         if emoji_allowed(runtime):
             return fragment
-        if runtime.plain_emoji_fallback or plain_ok:
-            return strip_custom_emoji(fragment)
+        if runtime.plain_emoji_fallback or runtime.manual_emoji or plain_ok:
+            return plain if plain is not None else strip_custom_emoji(fragment)
         result.skipped.append(key)
         return None
 

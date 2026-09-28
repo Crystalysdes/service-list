@@ -204,6 +204,8 @@ class RenderedBlock:
     media_kind: str | None = None
     link_preview: bool = False
     buttons: tuple[tuple[str, str], ...] = ()  # (text, url) of inline buttons under the post
+    # the post without premium emoji, when the bot cannot put them (None: the fragment with them stripped)
+    plain: Fragment | None = None
 
     @property
     def is_caption(self) -> bool:
@@ -258,7 +260,11 @@ async def render_block(
         if category is None:
             return None
         view = await category_view(session, category)
-        return RenderedBlock(kind, block_id, render_category(view, tpl, ctx))
+        fragment = render_category(view, tpl, ctx)
+        plain = None
+        if fragment.custom_emoji_count():  # names of emoji letters are written as names then
+            plain = render_category(view, tpl, ctx, plain=True).without({"custom_emoji"})
+        return RenderedBlock(kind, block_id, fragment, plain=plain)
     if kind == "static":
         post = await session.get(StaticPost, block_id)
         if post is None:

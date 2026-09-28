@@ -20,7 +20,7 @@ from app.services.billing import PaidResult, feature_row, money
 from app.services.catalog import request_sync
 from app.services.channels import INACTIVE_STATUSES
 from app.services.notify import notify_staff, notify_user
-from app.services.settings import Prices, get_settings
+from app.services.settings import Prices, Runtime, get_settings
 from app.services.timefmt import fmt_date
 
 
@@ -201,5 +201,13 @@ async def after_paid(ctx: AppContext, result: PaidResult) -> None:
         if result.status != "ok":
             why = "; ".join(result.notes or []) or order.note or result.status
             staff_text += f"\n⚠️ Требует внимания: {h(why)} (заказ #{order.id})"
+        elif order.kind in ("emoji", "font"):
+            from app.services.emoji_tasks import active
+
+            if active(await get_settings(session, Runtime)):
+                staff_text += (
+                    "\n✍️ Премиум-эмодзи бот сам поставить не может: задание с готовым текстом поста придёт "
+                    "в админ-чат, его вставляют в пост вручную."
+                )
     await notify_user(ctx, order.user_id, text, reply_markup=builder.as_markup())
     await notify_staff(ctx, staff_text)
