@@ -387,3 +387,60 @@ async def test_diagnostics_failure_is_reported(h, tg, db, ctx, monkeypatch):
     await asyncio.gather(*list(ctx.services["diagnostics_tasks"]))
     assert "❌ Диагностика прервалась: Telegram не отвечает" in screen["text"]
     assert h.button(screen, "Запустить диагностику")  # can be started again
+
+
+async def test_services_nobody_confirmed_are_marked(h, tg, db, ctx):
+    """Imported services have no owner until one confirms them («🙋 Это мой сервис»): staff see them marked ❔
+    in the lists, the search and the card, and all of them in one list."""
+    from itertools import pairwise
+
+    from app.db.models import User
+    from app.services import claims
+
+    await imported_channel(tg, db, ctx)
+    async with db.session() as s:
+        listed = select(Service).where(Service.status.in_(claims.CLAIMABLE))
+        services = list((await s.execute(listed.order_by(Service.category_id, Service.id))).scalars())
+        owned, unowned = next((a, b) for a, b in pairwise(services) if a.category_id == b.category_id)
+        s.add(User(id=4242, username="sky_owner", first_name="Sky"))
+        owned.owner_id = 4242  # named by an admin («👤 Владелец»): it has its owner
+        await s.commit()
+        total = await catalog.unowned_count(s)
+        unowned_name, cid, owned_id, unowned_id = unowned.name, owned.category_id, owned.id, unowned.id
+    assert total == len(services) - 1
+
+    await h.say(OWNER_ID, "/admin")
+    await h.click(OWNER_ID, h.last(OWNER_ID), "a:svc")
+    root = h.last(OWNER_ID)
+    assert h.button(root, f"❔ Без владельца ({total})")
+    await h.press(OWNER_ID, root, "Без владельца")
+    screen = h.last(OWNER_ID)
+    assert f"Без владельца — {total}" in screen["text"]
+    shown = [b for b in h.buttons(screen) if " · " in b["text"]]
+    assert len(shown) == min(total, 10) and all("❔" in b["text"] for b in shown)
+    assert f"a:svc:{owned_id}" not in {b["callback_data"] for b in shown}
+
+    await h.click(OWNER_ID, screen, f"a:svc:c:{cid}:0")
+    branch = h.last(OWNER_ID)
+    assert "❔" in h.button(branch, f"a:svc:{unowned_id}")["text"]
+    assert "❔" not in h.button(branch, f"a:svc:{owned_id}")["text"]
+    assert "без владельца:" in branch["text"] and "❔ без владельца" in branch["text"]
+
+    await h.click(OWNER_ID, branch, "a:svc:find")
+    await h.say(OWNER_ID, unowned_name)
+    found = h.button(h.last(OWNER_ID), f"a:svc:{unowned_id}")
+    assert found["text"].startswith(unowned_name[:30]) and "❔" in found["text"]
+    await h.click(OWNER_ID, h.last(OWNER_ID), f"a:svc:{unowned_id}")
+    assert "Владелец: ❔ не подтверждён" in h.last(OWNER_ID)["text"]
+
+    async with db.session() as s:  # the owner confirms it: the mark goes
+        service = await s.get(Service, unowned_id)
+        await claims.assign_owner(ctx, s, service, await s.get(User, 4242), "ссылка ведёт на его профиль")
+    await h.click(OWNER_ID, h.last(OWNER_ID), f"a:svc:{unowned_id}")
+    assert "Владелец: @sky_owner" in h.last(OWNER_ID)["text"]
+    await h.click(OWNER_ID, h.last(OWNER_ID), "a:svc")
+    assert h.button(h.last(OWNER_ID), f"❔ Без владельца ({total - 1})")
+
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Статистика")
+    assert f"без владельца {total - 1}" in h.last(OWNER_ID)["text"]

@@ -21,6 +21,7 @@ from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Deal, Feature, ModerationRequest, Order, ReportCase, ScamEntry, Service, User
 from app.services.billing import money
+from app.services.catalog import unowned_count
 from app.services.timefmt import zone
 
 router = Router(name="admin_stats")
@@ -198,6 +199,7 @@ async def stats_text(session: AsyncSession, tz: str) -> str:
         + ", ".join(
             f"{STATUS_TITLES.get(k, k)} {n}" for k, n in sorted(services.items(), key=lambda x: -x[1])
         )
+        + f"; без владельца {await unowned_count(session)}"
     )
     open_cases = await session.scalar(
         select(func.count()).select_from(ReportCase).where(ReportCase.status == "open")

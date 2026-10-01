@@ -22,6 +22,7 @@ from app.domain.links import LinkError, clean_text, normalize, without_emoji
 from app.domain.richtext import Fragment
 from app.services import billing, catalog
 from app.services.audit import audit
+from app.services.claims import CLAIMABLE
 from app.services.purchases import listing_renewable
 from app.services.render_db import category_services
 from app.services.settings import Limits, Prices, get_settings
@@ -304,10 +305,45 @@ async def on_services_root(
     builder = InlineKeyboardBuilder()
     for category in (await session.execute(select(Category).order_by(Category.post_order))).scalars():
         builder.button(text=category.title[:40], callback_data=f"a:svc:c:{category.id}:0")
+    unowned = await catalog.unowned_count(session)
+    builder.button(text=f"{catalog.NO_OWNER} Без владельца ({unowned})", callback_data="a:svc:u:0")
     builder.button(text="🔎 Найти по названию/ссылке", callback_data="a:svc:find")
     builder.adjust(1)
     assert call.message is not None
     await call.message.edit_text("🧩 <b>Сервисы</b>\n\nВыберите ветку:", reply_markup=back_home(builder))
+
+
+@router.callback_query(F.data.regexp(r"^a:svc:u:\d+$"))
+async def on_unowned(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
+    """Services nobody confirmed as theirs, across the branches: to reach their owners, or to name them."""
+    await state.clear()
+    await call.answer()
+    page = int((call.data or "").rsplit(":", 1)[1])
+    total = await catalog.unowned_count(session)
+    rows = await catalog.unowned_page(session, page * PAGE, PAGE)
+    builder = InlineKeyboardBuilder()
+    for service in rows:
+        builder.button(
+            text=f"{service.name[:24]} · {service.category.title[:16]} {catalog.service_badges(service)}",
+            callback_data=f"a:svc:{service.id}",
+        )
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"a:svc:u:{page - 1}"))
+    if (page + 1) * PAGE < total:
+        nav.append(("▶️", f"a:svc:u:{page + 1}"))
+    for text, cb in nav:
+        builder.button(text=text, callback_data=cb)
+    builder.adjust(*([1] * len(rows)), *([len(nav)] if nav else []))
+    text = (
+        f"{catalog.NO_OWNER} <b>Без владельца</b> — {total}\n\n"
+        "Эти сервисы владелец ещё не подтвердил через «🙋 Это мой сервис». Привязать можно и вручную: "
+        "карточка сервиса → «👤 Владелец»."
+        if total
+        else f"{catalog.NO_OWNER} <b>Без владельца</b>\n\nВсе сервисы в канале подтверждены владельцами."
+    )
+    assert call.message is not None
+    await call.message.edit_text(text, reply_markup=back_home(builder, target="a:svc"))
 
 
 @router.callback_query(F.data == "a:svc:find")
@@ -387,21 +423,24 @@ async def on_service_list(call: CallbackQuery, state: FSMContext, session: Async
     builder.button(text="➕ Добавить сервис", callback_data=f"a:svc:add:{category.id}")
     sizes = [1] * len(chunk) + ([len(nav)] if nav else []) + [1]
     builder.adjust(*sizes)
+    unowned = sum(1 for service in rows if service.owner_id is None)
     await call.message.edit_text(
         f"🧩 <b>{h(category.title)}</b> — сервисов: {len(visible)} в посте"
         + (f", ещё {len(others)} скрытых/на проверке" if others else "")
-        + "\n⭐ топ, 😀 эмодзи, 🌟 светящийся ник, 🙈 скрыт",
+        + (f", без владельца: {unowned}" if unowned else "")
+        + f"\n⭐ топ, 😀 эмодзи, 🌟 светящийся ник, 🙈 скрыт, {catalog.NO_OWNER} без владельца",
         reply_markup=back_home(builder, target=f"a:cat:{category.id}"),
     )
 
 
 async def _service_card(session: AsyncSession, service: Service, tz: str) -> tuple[str, Any]:
     owner = await session.get(User, service.owner_id) if service.owner_id else None
-    owner_text = (
-        (f"@{owner.username}" if owner and owner.username else str(service.owner_id))
-        if service.owner_id
-        else "—"
-    )
+    if service.owner_id:
+        owner_text = f"@{owner.username}" if owner and owner.username else str(service.owner_id)
+    else:
+        owner_text = f"{catalog.NO_OWNER} не подтверждён"
+        if service.status in CLAIMABLE:
+            owner_text += " — сам привязывает через «🙋 Это мой сервис» или назначьте кнопкой «👤 Владелец»"
     lines = [
         f"🧩 <b>{h(service.name)}</b>",
         f"Ссылка: {h(service.url or '—')}",

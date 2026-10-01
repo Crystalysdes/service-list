@@ -13,7 +13,10 @@ from app.db.models import Category, Feature, Service
 from app.domain.links import NAME_MAX, normalize, shorten_name, tidy_name, tidy_prefix
 from app.domain.parse import make_slug
 from app.domain.richtext import Entity, Fragment
+from app.services.claims import CLAIMABLE
 from app.services.settings import Limits, Templates, get_settings, update_settings
+
+NO_OWNER = "❔"  # nobody confirmed the service as theirs («🙋 Это мой сервис») and no admin named an owner
 
 
 def style_fragment(fragment: Fragment, styles: list[str]) -> Fragment:
@@ -200,7 +203,31 @@ def service_badges(service: Service) -> str:
         badges.append(
             {"hidden": "🙈", "banned": "🚫", "pending": "⏳", "approved": "💳"}.get(service.status, "·")
         )
+    if service.owner_id is None:
+        badges.append(NO_OWNER)
     return " ".join(badges)
+
+
+def _unowned() -> tuple[Any, ...]:
+    """Services an owner could still claim and nobody has: in the channel or hidden, with no owner."""
+    return (Service.owner_id.is_(None), Service.status.in_(CLAIMABLE))
+
+
+async def unowned_count(session: AsyncSession) -> int:
+    return int(await session.scalar(select(func.count()).select_from(Service).where(*_unowned())) or 0)
+
+
+async def unowned_page(session: AsyncSession, offset: int, limit: int) -> list[Service]:
+    """A page of them, branch by branch in the channel's order."""
+    rows = await session.execute(
+        select(Service)
+        .join(Category, Category.id == Service.category_id)
+        .where(*_unowned())
+        .order_by(Category.post_order, Service.position, Service.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(rows.unique().scalars())
 
 
 def feature_line(feature: Any, tz_format: Any) -> str:
