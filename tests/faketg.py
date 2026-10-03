@@ -11,8 +11,10 @@ import html
 import itertools
 import json
 import re
+import time
 import urllib.parse
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 
 from aiogram import Bot
@@ -87,6 +89,7 @@ class FakeTelegram:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.injected: dict[str, list[FakeError]] = {}
         self.clock = 1_760_000_000
+        self.server_offset = 0.0  # Telegram's wall clock minus the real time: >0 is a server whose clock lags
         self.custom_emoji_in_channels = True
         # False: the bot's owner has no Telegram Premium, so groups drop the bot's custom emoji too
         self.custom_emoji_in_groups = True
@@ -100,6 +103,14 @@ class FakeTelegram:
         self.invoices: dict[int, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ test helpers
+    def server_now(self) -> float:
+        """Telegram's wall clock (expiry dates are judged by it)."""
+        return time.time() + self.server_offset
+
+    async def clock_probe(self) -> datetime:
+        """What the Date header of api.telegram.org would say (app.services.tgclock)."""
+        return datetime.fromtimestamp(self.server_now(), UTC)
+
     def tick(self, seconds: int = 1) -> int:
         self.clock += seconds
         return self.clock
@@ -693,6 +704,9 @@ class FakeTelegram:
     def m_createChatInviteLink(self, params: dict, files: dict) -> dict:
         chat = self._chat(params["chat_id"])
         self._require(chat, "can_invite_users")
+        expire = params.get("expire_date")
+        if expire is not None and int(expire) <= self.server_now():  # already past by Telegram's clock
+            raise FakeError(400, "Bad Request: EXPIRE_DATE_INVALID")
         link = {
             "invite_link": f"https://t.me/+inv{abs(chat['id'])}x{next(self._ids)}",
             "creator": dict(self.bot_user),

@@ -59,6 +59,12 @@ repair_dpkg || die "Не удалось завершить прерванную 
 "${APT[@]}" update
 "${APT[@]}" install -y git curl ca-certificates openssl ufw openssh-client openssh-server iproute2 >/dev/null
 systemctl enable --now ssh >/dev/null 2>&1 || true
+# invite links are dated by this clock: a server that lost its time (a VPS resumed after a pause) would have
+# them refused by Telegram — keep it synchronized
+if ! timedatectl set-ntp true >/dev/null 2>&1; then
+    "${APT[@]}" install -y systemd-timesyncd >/dev/null 2>&1 || true
+    timedatectl set-ntp true >/dev/null 2>&1 || warn "Не удалось включить синхронизацию времени: выполните «timedatectl set-ntp true»."
+fi
 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     step "Устанавливаю Docker"

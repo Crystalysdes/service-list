@@ -518,6 +518,14 @@ wait_healthy() {
     die "Бот не запустился стабильно. Посмотрите «servicelist logs» и проверьте «servicelist config»."
 }
 
+check_clock() {  # invite links are dated by this clock: say so when it is not kept in sync
+    [[ "${SL_DRY_RUN:-}" == 1 ]] && return 0
+    command -v timedatectl >/dev/null 2>&1 || return 0
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != yes ]]; then
+        warn "Часы сервера не синхронизированы: выполните «timedatectl set-ntp true» (иначе Telegram отклоняет ссылки-приглашения из меню)."
+    fi
+}
+
 cmd_deploy() {
     need_dir
     local sha=${1-} forward_only=${2-} target current_branch
@@ -544,6 +552,7 @@ cmd_deploy() {
     compose up -d --build --remove-orphans
     run docker image prune -f >/dev/null
     wait_healthy
+    check_clock
 }
 
 cmd_ssh_deploy() {

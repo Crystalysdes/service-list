@@ -986,6 +986,8 @@ async def _make_admin(ctx: AppContext, account: PremiumAccount, chat: ChatInfo, 
     """None: the account is the channel's admin with the right to edit; else what stood in the way."""
     from aiogram.exceptions import TelegramAPIError
 
+    from app.services import tgclock
+
     bot = ctx.bot
     assert bot is not None and account.me is not None
     if problem == NOT_MEMBER:
@@ -993,7 +995,10 @@ async def _make_admin(ctx: AppContext, account: PremiumAccount, chat: ChatInfo, 
         if not chat.username:  # a private channel: a link of its own, one join, a few minutes
             try:
                 link = await bot.create_chat_invite_link(
-                    chat.chat_id, name="Аккаунт с Premium", expire_date=utcnow() + INVITE_TTL, member_limit=1
+                    chat.chat_id,
+                    name="Аккаунт с Premium",
+                    expire_date=tgclock.now(ctx) + INVITE_TTL,
+                    member_limit=1,
                 )
             except TelegramAPIError as exc:
                 return await _admin_trouble(

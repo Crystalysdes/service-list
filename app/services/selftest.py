@@ -15,6 +15,7 @@ from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Channel, ChannelPost, CustomEmoji
 from app.domain.richtext import Fragment, RichText
+from app.services import tgclock
 from app.services.channels import RIGHT_NAMES, inspect_chat
 from app.services.settings import Chats, Runtime, get_settings, update_settings
 
@@ -125,6 +126,18 @@ async def selftest(ctx: AppContext) -> Check:
     )
 
 
+async def clock_check(ctx: AppContext) -> Check:
+    """The server's clock against Telegram's: invite links expire by Telegram's time."""
+    difference = await tgclock.measure(ctx)
+    if difference is None:
+        return Check("Часы сервера", None, "не удалось сверить с Telegram")
+    if abs(difference) <= tgclock.SKEW_OK:
+        return Check("Часы сервера", True, "совпадают с Telegram")
+    return Check(
+        "Часы сервера", False, f"{tgclock.describe(difference)} от Telegram — на сервере: {tgclock.FIX}"
+    )
+
+
 Progress = Callable[["Diagnostics", str], Awaitable[None]]
 
 
@@ -143,6 +156,8 @@ async def diagnostics(ctx: AppContext, progress: Progress | None = None) -> Diag
 
     await step("премиум-эмодзи в канале")
     report.checks.append(await selftest(ctx))
+    await step("часы сервера")
+    report.checks.append(await clock_check(ctx))
     async with ctx.db.session() as session:
         chats = await get_settings(session, Chats)
         channels = list((await session.execute(select(Channel).where(Channel.status != "retired"))).scalars())

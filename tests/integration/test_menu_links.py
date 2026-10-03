@@ -148,10 +148,37 @@ async def test_a_refused_link_asks_to_try_again_instead_of_the_permanent_one(h, 
     assert _last_alert(tg)["show_alert"] and "попробуйте ещё раз" in _last_alert(tg)["text"]
     notices = [m for m in tg.bot_messages(OWNER_ID) if "личную ссылку" in (m.get("text") or "")]
     assert len(notices) == 1  # staff hear about it once an hour, not on every tap
+    # staff see which chat and which button it is, and what to check for this answer
+    assert f"«Service List» ({PRIVATE}) — кнопка «📋 Service List» в меню" in notices[0]["text"]
+    assert "администратор этого чата с правом «Приглашение пользователей»" in notices[0]["text"]
 
     await h.press(ANN, menu, "Service List")  # Telegram gives links again
     assert _url(h, tg.messages[ANN][menu["message_id"]], "Service List").startswith("https://t.me/+inv")
     assert _last_alert(tg)["text"] == "🔄 Новые ссылки — действуют 1 мин"
+
+
+async def test_a_server_clock_behind_telegrams_still_gives_links_and_staff_hear_why(h, tg, db):
+    await _people(tg, db, ANN, BOB)
+    tg.add_user(OWNER_ID, "Owner", "owner")
+    await _main_channel(tg, db)
+    tg.server_offset = 2 * 3600 + 5 * 60  # a VPS resumed after a pause: our minute ends 2 h ago by Telegram
+    await h.say(ANN, "/menu")
+    assert _url(h, h.last(ANN), "Service List").startswith("https://t.me/+inv")  # a working link at once
+    refused, made = tg.called("createChatInviteLink")
+    assert int(refused["expire_date"]) < tg.server_now()  # dated by our clock: already past for Telegram
+    assert abs(int(made["expire_date"]) - (tg.server_now() + 60)) < 15  # dated again by Telegram's clock
+
+    def notes() -> list[str]:
+        return [m.get("text") or "" for m in tg.bot_messages(OWNER_ID)]
+
+    clock = [note for note in notes() if "Часы сервера" in note]
+    assert len(clock) == 1 and "отстают на 2 ч 5 мин" in clock[0] and "timedatectl set-ntp true" in clock[0]
+    assert not any("личную ссылку" in note for note in notes())  # the links work: no "try again" notice
+
+    await h.say(BOB, "/menu")  # the difference is remembered: no refused attempt for the next person
+    assert _url(h, h.last(BOB), "Service List").startswith("https://t.me/+inv")
+    assert len(tg.called("createChatInviteLink")) == 3
+    assert len([note for note in notes() if "Часы сервера" in note]) == 1
 
 
 async def test_a_public_channel_keeps_its_public_link(h, tg, db):
