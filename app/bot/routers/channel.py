@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import timedelta
 from typing import Any
 
@@ -32,6 +33,7 @@ from app.services.sync.engine import OWNER_RANK, is_own_edit, request_nav_move
 from app.services.sync.foreign import OWN_POSTS, remember_album, remember_pin
 
 router = Router(name="channel_events")
+log = logging.getLogger(__name__)
 
 # Telegram sends the bot its own channel posts and edits too. By this many seconds later the engine has saved
 # them (the post's id, the edit's snapshot), so they are not taken for somebody else's.
@@ -41,6 +43,7 @@ OWN_POST_GRACE = 3.0
 AFTER_NAV_QUIET = timedelta(minutes=2)
 AFTER_NAV_LOCK = 0x4E415649  # "NAVI": a channel's posts after the navigation are looked at one at a time
 AFTER_NAV_AGAIN = "🔁 После навигации появился ещё пост — актуальное уведомление ниже."
+KEPT_AGAIN = "✏️ Пост правили ещё раз — актуальное уведомление ниже."
 SERVICE_TYPES = {
     ContentType.PINNED_MESSAGE,
     ContentType.NEW_CHAT_TITLE,
@@ -83,6 +86,17 @@ def edit_alert_text(channel: Channel, row: ChannelPost) -> str:
         "↩️ «Вернуть как было» — бот сразу вернёт свою версию.\n"
         "✅ «Оставить» — правка останется, пока не изменятся данные этого поста (сервисы, опции). Тогда бот "
         "обновит пост и напишет сюда."
+    )
+
+
+def kept_edit_text(channel: Channel, row: ChannelPost) -> str:
+    """A post the admins keep by hand («✅ Оставить» earlier) edited once more: the edit stays by itself."""
+    url = channel_post_base(channel.chat_id, channel.username) + str(row.message_id)
+    return (
+        f"✍️ Пост {row.message_id} в канале «{_title(channel)}» снова изменён вручную: {url}\n\n"
+        "✅ Правка сохранена: этот пост раньше оставили в ручной редакции, поэтому новые правки остаются "
+        "сами, пока не изменятся данные поста (сервисы, опции).\n"
+        "↩️ «Вернуть версию бота» — бот сразу вернёт свою версию."
     )
 
 
@@ -185,15 +199,19 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
             await infofeed.on_edit(session, channel, message)
             _wake(data["ctx"], channel.id)
         return
+    where = f"message {message.message_id} of {message.chat.id}"
     if row is None or row.snapshot is None:
+        log.info("edit of %s: not a post the bot shows", where)
         return
     edited = Fragment.from_message(message)
     # the bot is shown the post without the premium emoji the Premium account put inside links
     if compare(Fragment.from_json(row.snapshot).as_bot_sees(), edited).equal:
+        log.info("edit of %s: nothing the bot can see has changed (premium emoji inside links?)", where)
         return
     # the admins putting in the premium emoji the bot could not (a task in the admin chat): no alert
     task = await emoji_tasks.on_edit(data["ctx"], session, row, edited)
     if task in ("done", "partial"):
+        log.info("edit of %s: premium emoji task %s", where, task)
         return
     edit_date = message.edit_date or 0
     if kept_edits.is_kept(row.manual):  # the admins keep this post by hand: a new edit is kept as well
@@ -205,6 +223,7 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
         }
         row.snapshot = edited.to_json()
         row.sent_hash = kept_edits.MANUAL + edited.content_hash()
+        await _kept_edit_notice(data["ctx"], session, channel, row, edit_date)
         return
     earlier = row.manual
     row.manual = {"fragment": edited.to_json(), "edit_date": edit_date}
@@ -228,10 +247,26 @@ async def on_channel_edit(message: Message, session: AsyncSession, **data: Any) 
     remember_alert(session, "post_edit", row.id, sent)
 
 
+async def _kept_edit_notice(
+    ctx: AppContext, session: AsyncSession, channel: Channel, row: ChannelPost, edit_date: int
+) -> None:
+    """The staff see every new edit of a post kept by hand, and can still bring the bot's version back."""
+    if not await claim_notification(session, f"kept_edit:{row.id}:{edit_date}"):
+        return
+    text = kept_edit_text(channel, row)
+    # the notice about the previous edit, if its button was not pressed
+    await close_alert(ctx, "post_edit", row.id, f"{text}\n\n{KEPT_AGAIN}")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="↩️ Вернуть версию бота", callback_data=f"a:unkeep:{row.id}:{edit_date}")
+    sent = await notify_staff(ctx, text, reply_markup=builder.as_markup(), session=session)
+    remember_alert(session, "post_edit", row.id, sent)
+
+
 async def _decided(
-    session: AsyncSession, call: CallbackQuery, row_id: int, edit_date: int
+    session: AsyncSession, call: CallbackQuery, row_id: int, edit_date: int, *, kept: bool = False
 ) -> ChannelPost | None:
-    """The post the alert is about, if the decision is still open; otherwise explain and return None."""
+    """The post the alert is about, if the decision is still open; otherwise explain and return None.
+    ``kept``: the notice of a new edit of a post kept by hand (its edit is kept already)."""
     row = await session.get(ChannelPost, row_id)
     problem = None
     if row is None or not row.message_id:
@@ -240,7 +275,7 @@ async def _decided(
         problem = "Уже решено: бот вернул свою версию поста."
     elif row.manual.get("edit_date") != edit_date:
         problem = "Пост правили ещё раз — решите в новом уведомлении."
-    elif kept_edits.is_kept(row.manual):
+    elif kept_edits.is_kept(row.manual) and not kept:
         problem = "Уже решено: правку оставили."
     if problem is not None:
         await call.answer(problem, show_alert=True)
@@ -274,10 +309,12 @@ async def on_keep(call: CallbackQuery, session: AsyncSession, **data: Any) -> No
     request_sync(data["ctx"])
 
 
-@router.callback_query(F.data.regexp(r"^a:revert:\d+:\d+$"), RoleFilter("admin"))
+@router.callback_query(F.data.regexp(r"^a:(revert|unkeep):\d+:\d+$"), RoleFilter("admin"))
 async def on_revert(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
-    _, _, row_id, edit_date = (call.data or "").split(":")
-    row = await _decided(session, call, int(row_id), int(edit_date))
+    """«↩️ Вернуть как было» of an alert; «↩️ Вернуть версию бота» of a new edit of a post kept by hand."""
+    _, action, row_id, edit_date = (call.data or "").split(":")
+    kept = action == "unkeep"
+    row = await _decided(session, call, int(row_id), int(edit_date), kept=kept)
     if row is None:
         return
     channel = await session.get(Channel, row.channel_id)
@@ -289,7 +326,8 @@ async def on_revert(call: CallbackQuery, session: AsyncSession, **data: Any) -> 
     await session.commit()
     request_sync(data["ctx"])
     await call.answer("Возвращаю версию бота")
-    text = f"{edit_alert_text(channel, row)}\n\n↩️ Возвращена версия бота — {h(_who(data))}."
+    alert = kept_edit_text(channel, row) if kept else edit_alert_text(channel, row)
+    text = f"{alert}\n\n↩️ Возвращена версия бота — {h(_who(data))}."
     if not await close_alert(data["ctx"], "post_edit", row.id, text) and isinstance(call.message, Message):
         await call.message.edit_text(text, reply_markup=None)
 

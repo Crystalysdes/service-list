@@ -307,6 +307,15 @@ async def test_kept_manual_edit_survives_until_the_data_changes(h, tg, db, ctx):
         row = (await s.execute(_travel_row(ids))).scalar_one()
         assert row.manual["base"] not in (None, "pending") and row.manual["links"]
 
+    # edited again once kept: the new edit stays as well, and the staff see it
+    again = _edit_by_hand(tg, ids["travel"], "TripMafia", "TripMafiA")
+    await h.feed({"edited_channel_post": tg._export(again)})
+    notice = h.last(OWNER_ID)
+    assert "снова изменён вручную" in notice["text"] and "✅ Правка сохранена" in notice["text"]
+    assert [b["text"] for b in h.buttons(notice)] == ["↩️ Вернуть версию бота"]
+    assert (await engine.run_once(ids["channel_id"])).edited == 0
+    assert "TripMafiA" in tg.messages[MAIN][ids["travel"]]["text"]
+
     # the navigation moves: the kept version stays, only its «#навигация» link follows the navigation
     ad = tg.post(MAIN, "реклама")
     await h.feed({"channel_post": tg._export(ad)})
@@ -314,9 +323,10 @@ async def test_kept_manual_edit_survives_until_the_data_changes(h, tg, db, ctx):
     await engine.run_once(ids["channel_id"])
     new_nav = max(tg.messages[MAIN])
     travel = tg.messages[MAIN][ids["travel"]]
-    assert "TripMafia" in travel["text"]
+    assert "TripMafiA" in travel["text"]
     assert f"https://t.me/servicelist/{new_nav}" in [e.get("url") for e in travel["entities"]]
     assert (await engine.run_once(ids["channel_id"])).edited == 0
+    assert h.buttons(tg.messages[OWNER_ID][notice["message_id"]])  # still to be decided
 
     # the data of the post changes: the bot's version comes back and the staff are told
     async with db.session() as s:
@@ -327,8 +337,45 @@ async def test_kept_manual_edit_survives_until_the_data_changes(h, tg, db, ctx):
     travel = tg.messages[MAIN][ids["travel"]]["text"]
     assert "Tripmafia" in travel and "New Trip" in travel
     assert "ручная правка заменена версией бота" in h.last(OWNER_ID)["text"]
+    notice = tg.messages[OWNER_ID][notice["message_id"]]
+    assert "🔄 Данные поста изменились" in notice["text"] and "reply_markup" not in notice
     async with db.session() as s:
         assert (await s.execute(_travel_row(ids))).scalar_one().manual is None
+
+
+async def test_the_bots_version_back_from_the_notice_of_a_kept_post(h, tg, db, ctx):
+    ids = await imported_channel(tg, db, ctx)
+    engine = engine_for(ctx)
+    await engine.run_once(ids["channel_id"])
+    first = _edit_by_hand(tg, ids["travel"], "Tripmafia", "TripMafia")
+    await h.feed({"edited_channel_post": tg._export(first)})
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Оставить")
+    second = _edit_by_hand(tg, ids["travel"], "TripMafia", "TripMafiA")
+    await h.feed({"edited_channel_post": tg._export(second)})
+    stale = h.last(OWNER_ID)
+    stale_back = h.button(stale, "Вернуть версию бота")["callback_data"]
+    third = _edit_by_hand(tg, ids["travel"], "TripMafiA", "TRIPMAFIA")
+    await h.feed({"edited_channel_post": tg._export(third)})
+    await h.feed({"edited_channel_post": tg._export(third)})  # Telegram told it twice: one notice
+    closed = tg.messages[OWNER_ID][stale["message_id"]]
+    assert "Пост правили ещё раз" in closed["text"] and "reply_markup" not in closed
+    notices = [m for m in tg.bot_messages(OWNER_ID) if "снова изменён вручную" in (m.get("text") or "")]
+    assert len(notices) == 2
+    await h.click(OWNER_ID, closed, stale_back)  # pressed in a copy opened before
+    assert "решите в новом уведомлении" in tg.called("answerCallbackQuery")[-1]["text"]
+    assert "TRIPMAFIA" in tg.messages[MAIN][ids["travel"]]["text"]
+
+    notice = h.last(OWNER_ID)
+    back = h.button(notice, "Вернуть версию бота")["callback_data"]
+    await h.click(OWNER_ID, notice, back)
+    pressed = tg.messages[OWNER_ID][notice["message_id"]]
+    assert "↩️ Возвращена версия бота — @owner" in pressed["text"] and "reply_markup" not in pressed
+    await engine.run_once(ids["channel_id"])
+    assert "Tripmafia" in tg.messages[MAIN][ids["travel"]]["text"]
+    async with db.session() as s:
+        assert (await s.execute(_travel_row(ids))).scalar_one().manual is None
+    await h.click(OWNER_ID, pressed, back)  # pressed again
+    assert "Уже решено: бот вернул свою версию" in tg.called("answerCallbackQuery")[-1]["text"]
 
 
 async def test_post_without_premium_emoji_is_not_rewritten_every_pass(h, tg, db, ctx):
@@ -363,13 +410,16 @@ async def test_keep_after_the_bot_already_rewrote_the_post(h, tg, db, ctx):
     edited = _edit_by_hand(tg, ids["travel"], "Tripmafia", "TripMafia")
     await h.feed({"edited_channel_post": tg._export(edited)})
     alert = h.last(OWNER_ID)
+    keep = h.button(alert, "Оставить")["callback_data"]
     async with db.session() as s:  # the data changes before anyone presses a button
         category = (await s.execute(select(Category).where(Category.slug == "travel"))).scalar_one()
         await catalog.add_service(s, category.id, "New Trip", "@new_trip_bot")
         await s.commit()
     await engine.run_once(ids["channel_id"])
     assert "Tripmafia" in tg.messages[MAIN][ids["travel"]]["text"]
-    await h.press(OWNER_ID, alert, "Оставить")
+    closed = tg.messages[OWNER_ID][alert["message_id"]]  # nothing left to decide
+    assert "🔄 Данные поста изменились" in closed["text"] and "reply_markup" not in closed
+    await h.click(OWNER_ID, closed, keep)  # pressed in a copy opened before
     assert "Уже решено: бот вернул свою версию" in tg.called("answerCallbackQuery")[-1]["text"]
 
 

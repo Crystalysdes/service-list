@@ -35,7 +35,7 @@ from app.domain.richtext import Fragment
 from app.domain.symbols import channel_post_base
 from app.services import premium_account, render_db
 from app.services.media import send_stored
-from app.services.notify import claim_notification, notify_staff
+from app.services.notify import claim_notification, close_alert, notify_staff
 from app.services.settings import ChannelLayout, Chats, Runtime, get_settings, update_settings
 from app.services.sync import foreign, own_links
 from app.services.sync import manual as kept_edits
@@ -1465,6 +1465,16 @@ class SyncEngine:
                 f"manual_dropped:{channel_id}:{kind}:{block_id}:{content_hash[:16]}",
                 f"🔄 Пост {message_id} в канале «{h(channel_title)}» обновлён: изменились его данные, "
                 f"поэтому оставленная ручная правка заменена версией бота.\n{post_url}",
+            )
+        overwritten = target.manual is not None and not kept_edits.is_kept(target.manual)
+        if status in ("ok", "unchanged") and (target.dropped or overwritten):
+            # a manual edit gave way to the bot's version: its alert has nothing left to decide
+            await close_alert(
+                self.ctx,
+                "post_edit",
+                row_id,
+                f"✍️ Пост {message_id} в канале «{h(channel_title)}» правили вручную: {post_url}\n\n"
+                "🔄 Данные поста изменились — бот обновил его и вернул свою версию.",
             )
         if status == "ok":
             result.edited += 1
