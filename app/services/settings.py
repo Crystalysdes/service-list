@@ -132,6 +132,21 @@ class Templates(SettingsGroup):
     scam_removed: str = "✅ Запись снята администрацией."
 
 
+class UiEmoji(SettingsGroup):
+    """The bot's animated icons on its buttons and at the start of its lines (app/services/ui_emoji.py)."""
+
+    KEY: ClassVar[str] = "ui_emoji"
+
+    enabled: bool = True  # ⚙️ Настройки → 🎨
+    version: str | None = None  # of app/assets/ui_emoji the pack was made from
+    set_name: str | None = None  # t.me/addemoji/<set_name>
+    pending: str | None = None  # the pack an upload is making (an interrupted one goes on into it)
+    ids: dict[str, str] = Field(default_factory=dict)  # icon key -> custom emoji id
+    error: str | None = None  # the last upload's failure
+    failed_at: datetime | None = None
+    refused_at: datetime | None = None  # Telegram did not show them (no Premium): tried again later
+
+
 class MenuMedia(SettingsGroup):
     """The video / GIF / picture shown above the bot's main menu (/admin → 🧾 Шаблоны → 🎬)."""
 

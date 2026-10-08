@@ -19,7 +19,7 @@ from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.services.audit import audit
-from app.services.settings import Announce, Captcha, Chats, Limits, get_settings, update_settings
+from app.services.settings import Announce, Captcha, Chats, Limits, UiEmoji, get_settings, update_settings
 
 router = Router(name="admin_settings")
 router.callback_query.filter(RoleFilter("admin"))
@@ -52,6 +52,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     captcha = await get_settings(session, Captcha)
     limits = await get_settings(session, Limits)
     announce = await get_settings(session, Announce)
+    icons = await get_settings(session, UiEmoji)
     lines = [
         "⚙️ <b>Настройки</b>",
         "",
@@ -64,6 +65,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         + ("включена" if announce.new_services else "выключена"),
         "Свои премиум-эмодзи от пользователей (через модерацию): "
         + ("да" if limits.allow_own_emoji else "нет"),
+        "Анимированные иконки на кнопках и в текстах бота: " + ("включены" if icons.enabled else "выключены"),
     ]
     for group, field, title, _lo, _hi in NUMBERS.values():
         value = getattr(await get_settings(session, group), field)
@@ -89,6 +91,9 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     builder.button(
         text="😀 Запретить свои эмодзи" if limits.allow_own_emoji else "😀 Разрешить свои эмодзи",
         callback_data="a:set:own_emoji",
+    )
+    builder.button(
+        text="🎨 Выключить иконки" if icons.enabled else "🎨 Включить иконки", callback_data="a:set:icons"
     )
     for key, (_group, _field, title, _lo, _hi) in NUMBERS.items():
         builder.button(text=f"✏️ {title}"[:60], callback_data=f"a:set:n:{key}")
@@ -129,6 +134,20 @@ async def on_announce(call: CallbackQuery, session: AsyncSession, **data: Any) -
     await call.answer(
         "Рассылка о новых сервисах " + ("выключена" if announce.new_services else "включена"), show_alert=True
     )
+    await _show(call, session, data["ctx"])
+
+
+@router.callback_query(F.data == "a:set:icons")
+async def on_icons(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """The animated icons off, or on again (then tried at once, even after Telegram refused them)."""
+    from app.services import ui_emoji
+
+    icons = await get_settings(session, UiEmoji)
+    await update_settings(session, UiEmoji, enabled=not icons.enabled, refused_at=None)
+    await audit(session, data["user"].id, "settings.icons", data={"enabled": not icons.enabled})
+    await session.commit()
+    await ui_emoji.load(data["ctx"])
+    await call.answer("Иконки " + ("выключены" if icons.enabled else "включены"))
     await _show(call, session, data["ctx"])
 
 

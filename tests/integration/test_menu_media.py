@@ -50,8 +50,8 @@ async def test_text_menu_layout_and_structure(h, tg, db):
     await h.say(USER, "/menu")
     menu = h.last(USER)
     assert menu["text"] == (  # the title and one short line: what the buttons do is in Help
-        "📋 Service List\nПроверенные сервисы в одном месте.\n\n"
-        "👇 Выберите нужное ниже. Как всё устроено — в «ℹ️ Помощь»."
+        "📋 Service List\nПроверенные сервисы — в одном месте.\n\n"
+        "👇 Выберите раздел ниже. Как всё устроено — в «ℹ️ Помощь»."
     )
     assert _rows(menu) == [1, 1, 2, 2, 2]
     texts = [b["text"] for b in h.buttons(menu)]
@@ -148,7 +148,7 @@ async def test_admin_sets_a_menu_video_and_users_see_it(h, tg, db, ctx):
     assert "Выберите язык" in choose["text"]
     await h.press(USER, choose, "English")
     menu = tg.messages[USER][choose["message_id"]]
-    assert menu["video"]["file_id"] == "vid1" and "Trusted services in one place" in menu["caption"]
+    assert menu["video"]["file_id"] == "vid1" and "Trusted services — in one place" in menu["caption"]
 
 
 async def test_menu_video_survives_a_bot_change_and_can_be_removed(h, tg, db, ctx):

@@ -71,11 +71,13 @@ async def test_a_private_channel_gives_each_person_a_link_of_their_own(h, tg, db
     await h.say(BOB, "/menu")
     ann, bob = h.last(ANN), h.last(BOB)
     rows = _rows(ann)  # Service List across the width; 🔄 next to Language and Help
-    assert rows[0] == ["📋 Service List"] and rows[-1] == ["🌐 Язык", "ℹ️ Помощь", "🔄"]
+    assert rows[0] == ["📋 Service List"] and rows[-1] == ["🌐 Язык", "ℹ️ Помощь", "🔄 Ссылки"]
     assert h.button(ann, "🔄")["callback_data"] == "m:links"
     assert _url(h, ann, "Service List").startswith("https://t.me/+inv")
     assert _url(h, ann, "Service List") != _url(h, bob, "Service List")
-    assert ann["text"].endswith("🔐 Ссылки на каналы и чат личные и живут 1 мин. Истекли — 🔄 или /start.")
+    assert ann["text"].endswith(
+        "🔐 Ссылки на каналы и чат — личные и живут 1 мин. Истекли — нажмите 🔄 или /start."
+    )
     made = tg.called("createChatInviteLink")
     assert [p["name"] for p in made] == [f"u{ANN}", f"u{BOB}"]
     assert all(p["chat_id"] == PRIVATE and p["member_limit"] == 1 for p in made)
@@ -187,7 +189,7 @@ async def test_a_public_channel_keeps_its_public_link(h, tg, db):
     await h.say(ANN, "/menu")
     menu = h.last(ANN)
     assert _url(h, menu, "Service List") == "https://t.me/servicelist"
-    assert "🔄" not in [text for row in _rows(menu) for text in row]
+    assert "🔄 Ссылки" not in [text for row in _rows(menu) for text in row]
     assert not tg.called("createChatInviteLink") and "личные" not in menu["text"]
 
 
@@ -244,7 +246,7 @@ async def test_a_private_info_channel_gives_each_person_a_link_of_their_own(h, t
     menu = h.last(ANN)
     first = _url(h, menu, "Service List Info")
     assert first.startswith(f"https://t.me/+inv{abs(INFO_CHANNEL)}x")
-    assert "🔄" in [text for row in _rows(menu) for text in row] and "личные" in menu["text"]
+    assert "🔄 Ссылки" in [text for row in _rows(menu) for text in row] and "личные" in menu["text"]
     _later(ctx)
     await h.press(ANN, menu, "🔄")
     fresh = _url(h, tg.messages[ANN][menu["message_id"]], "Service List Info")

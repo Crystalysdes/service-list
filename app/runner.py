@@ -47,7 +47,10 @@ async def run_bot(config: Config) -> int:
     me = await bot.get_me()
     ctx = AppContext(config=config, db=db, bot=bot, bot_id=me.id, bot_username=me.username)
     dp = build_dispatcher(ctx)
+    from app.services import ui_emoji
     from app.services.background import start_background, stop_background
+
+    ui_emoji.install(ctx)  # the bot's animated icons on its buttons and lines
 
     await start_background(ctx)
     try:

@@ -65,6 +65,33 @@ def _strip_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="([^"]+)">(.*?)</tg-emoji>', re.S)
+
+
+def _u16(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _html_emoji(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Telegram HTML -> its plain text and its custom emoji (the fake keeps no other formatting of HTML)."""
+    out: list[str] = []
+    entities: list[dict[str, Any]] = []
+    pos = 0
+    last = 0
+    for match in TG_EMOJI_RE.finditer(text):
+        plain = _strip_html(text[last : match.start()])
+        alt = html.unescape(match.group(2))
+        out += [plain, alt]
+        pos += _u16(plain)
+        entities.append(
+            {"type": "custom_emoji", "offset": pos, "length": _u16(alt), "custom_emoji_id": match.group(1)}
+        )
+        pos += _u16(alt)
+        last = match.end()
+    out.append(_strip_html(text[last:]))
+    return "".join(out), entities
+
+
 # what Telegram trims from both ends of a text (TDLib's strip_empty_characters): a text made only of these,
 # like the Braille blank "⠀" or the Hangul filler "ㅤ", counts as empty
 EMPTY_CHARS = (
@@ -93,6 +120,9 @@ class FakeTelegram:
         self.custom_emoji_in_channels = True
         # False: the bot's owner has no Telegram Premium, so groups drop the bot's custom emoji too
         self.custom_emoji_in_groups = True
+        # False: the bot's owner has no Telegram Premium: private chats drop its custom emoji and button icons
+        self.custom_emoji_in_private = True
+        self.refuse_icons = False  # True: Telegram answers an error to a keyboard with icons
         self.custom_emoji_cap: int | None = None
         self.max_user_entities = 100
         self.custom_emoji: dict[str, dict[str, Any]] = {}
@@ -338,8 +368,10 @@ class FakeTelegram:
         self, chat: dict[str, Any], text: str, entities: list[dict] | None, parse_mode: str | None
     ) -> tuple[str, list[dict]]:
         if parse_mode and not entities:
-            return _strip_html(text), []
+            text, entities = _html_emoji(text)
         result = [dict(e) for e in (entities or [])]
+        if not self._emoji_allowed(chat):
+            result = [e for e in result if e["type"] != "custom_emoji"]
         if chat["type"] == "channel" and not self.custom_emoji_in_channels:
             result = [e for e in result if e["type"] != "custom_emoji"]
         if chat["type"] in ("group", "supergroup") and not self.custom_emoji_in_groups:
@@ -378,12 +410,38 @@ class FakeTelegram:
             msg["from"] = dict(self.bot_user)
         return msg
 
-    @staticmethod
-    def _reply_markup(chat: dict[str, Any], msg: dict[str, Any], markup: dict[str, Any] | None) -> None:
+    def _emoji_allowed(self, chat: dict[str, Any]) -> bool:
+        """The bot's custom emoji (and button icons) are kept in this chat."""
+        if chat["type"] == "private":
+            return self.custom_emoji_in_private
+        if chat["type"] in ("group", "supergroup"):
+            return self.custom_emoji_in_groups
+        return self.custom_emoji_in_channels
+
+    def _icons(self, chat: dict[str, Any], markup: Any) -> Any:
+        """A keyboard as Telegram keeps it: the icons go where the bot's custom emoji go."""
+        if not isinstance(markup, dict):
+            return markup
+        key = (
+            "inline_keyboard" if "inline_keyboard" in markup else "keyboard" if "keyboard" in markup else None
+        )
+        if key is None or not any(b.get("icon_custom_emoji_id") for row in markup[key] for b in row):
+            return markup
+        if self.refuse_icons:
+            raise FakeError(400, "Bad Request: BUTTON_ICON_INVALID")
+        if self._emoji_allowed(chat):
+            return markup
+        rows = [
+            [{k: v for k, v in b.items() if k != "icon_custom_emoji_id"} for b in row] for row in markup[key]
+        ]
+        return {**markup, key: rows}
+
+    def _reply_markup(self, chat: dict[str, Any], msg: dict[str, Any], markup: dict[str, Any] | None) -> None:
         """Only an inline keyboard belongs to the message; a reply keyboard replaces the one under the
         input field of the chat until it is removed."""
         if not markup:
             return
+        markup = self._icons(chat, markup)
         if "inline_keyboard" in markup:
             msg["reply_markup"] = markup
         elif markup.get("remove_keyboard"):
@@ -448,7 +506,7 @@ class FakeTelegram:
             chat, params["text"], params.get("entities"), params.get("parse_mode")
         )
         _require_text(text)
-        markup = params.get("reply_markup")
+        markup = self._icons(chat, params.get("reply_markup"))
         if (
             msg.get("text") == text
             and (msg.get("entities") or []) == entities
@@ -524,7 +582,7 @@ class FakeTelegram:
         if msg is None:
             raise FakeError(400, "Bad Request: message to edit not found")
         self._require(chat, "can_edit_messages")
-        markup = params.get("reply_markup")
+        markup = self._icons(chat, params.get("reply_markup"))
         if msg.get("reply_markup") == markup or (not markup and not msg.get("reply_markup")):
             raise FakeError(400, NOT_MODIFIED)
         if markup:
@@ -902,7 +960,7 @@ class FakeTelegram:
             raise FakeError(400, "Bad Request: STICKERSET_INVALID")
         return {
             "name": name,
-            "title": name,
+            "title": getattr(self, "sticker_titles", {}).get(name, name),
             "sticker_type": "custom_emoji",
             "stickers": [self._sticker(i, self.custom_emoji[i]) for i in self.sticker_sets[name]],
         }
@@ -921,6 +979,8 @@ class FakeTelegram:
         if not 1 <= len(stickers) <= 50:
             raise FakeError(400, "Bad Request: wrong number of stickers")
         self.sticker_sets[name] = []
+        self.sticker_titles = getattr(self, "sticker_titles", {})
+        self.sticker_titles[name] = params["title"]
         self.sticker_uploads = getattr(self, "sticker_uploads", {})
         for item in stickers:
             if item.get("format") != "video" or params.get("sticker_type") != "custom_emoji":
@@ -929,6 +989,27 @@ class FakeTelegram:
             emoji_id = str(5_000_000_000_000_000_000 + next(self._ids))
             self.sticker_uploads[emoji_id] = data
             self.add_custom_emoji(emoji_id, item["emoji_list"][0], name)
+        return True
+
+    def m_setStickerSetTitle(self, params: dict, files: dict) -> bool:
+        if params["name"] not in self.sticker_sets:
+            raise FakeError(400, "Bad Request: STICKERSET_INVALID")
+        self.sticker_titles = getattr(self, "sticker_titles", {})
+        self.sticker_titles[params["name"]] = params["title"]
+        return True
+
+    def m_addStickerToSet(self, params: dict, files: dict) -> bool:
+        name = params["name"]
+        if name not in self.sticker_sets:
+            raise FakeError(400, "Bad Request: STICKERSET_INVALID")
+        item = params["sticker"]
+        if item.get("format") != "video":
+            raise FakeError(400, "Bad Request: STICKER_VIDEO_EXPECTED")
+        data = getattr(files.get(str(item["sticker"]).removeprefix("attach://")), "data", b"")
+        emoji_id = str(5_000_000_000_000_000_000 + next(self._ids))
+        self.sticker_uploads = getattr(self, "sticker_uploads", {})
+        self.sticker_uploads[emoji_id] = data
+        self.add_custom_emoji(emoji_id, item["emoji_list"][0], name)
         return True
 
     def m_deleteStickerSet(self, params: dict, files: dict) -> bool:

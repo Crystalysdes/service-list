@@ -141,6 +141,14 @@ async def clock_check(ctx: AppContext) -> Check:
 Progress = Callable[["Diagnostics", str], Awaitable[None]]
 
 
+async def icons_check(ctx: AppContext) -> Check:
+    """The bot's animated icons on its buttons and lines (app/services/ui_emoji.py)."""
+    from app.services import ui_emoji
+
+    ok, detail = await ui_emoji.status(ctx)
+    return Check("Анимированные иконки", ok, detail)
+
+
 async def diagnostics(ctx: AppContext, progress: Progress | None = None) -> Diagnostics:
     """All live checks; ``progress(report so far, next step)`` is called before each step."""
     report = Diagnostics()
@@ -158,6 +166,8 @@ async def diagnostics(ctx: AppContext, progress: Progress | None = None) -> Diag
     report.checks.append(await selftest(ctx))
     await step("часы сервера")
     report.checks.append(await clock_check(ctx))
+    await step("анимированные иконки")
+    report.checks.append(await icons_check(ctx))
     async with ctx.db.session() as session:
         chats = await get_settings(session, Chats)
         channels = list((await session.execute(select(Channel).where(Channel.status != "retired"))).scalars())

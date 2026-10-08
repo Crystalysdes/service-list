@@ -90,6 +90,9 @@ async def ctx(db, bot, config, tg):
     )
     context.services["throttle"] = (100_000, 1.0)
     context.services["tg_clock_probe"] = tg.clock_probe  # Telegram's time from the fake, not the network
+    from app.services import ui_emoji
+
+    ui_emoji.install(context)  # as in production; it changes nothing until the icons are uploaded
     yield context
     # background work started by handlers (sync workers, link checks, moves) must not outlive the test
     engine = context.services.get("sync")
