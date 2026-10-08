@@ -33,7 +33,7 @@ dev = ["pytest>=8", "pytest-asyncio==1.4.0", "ruff>=0.16"]
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["locales/*.yaml", "assets/ui_emoji/*"]
+app = ["locales/*.yaml", "assets/ui_emoji/*", "assets/menu/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

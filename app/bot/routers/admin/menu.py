@@ -1,4 +1,4 @@
-"""Admin: the video / GIF / picture shown above the bot's main menu."""
+"""Admin: the video / GIF / picture shown above the bot's main menu (by default the logo animation)."""
 
 from __future__ import annotations
 
@@ -16,9 +16,10 @@ from app.bot.routers.admin.inputs import input_handler
 from app.bot.routers.admin.panel import back_home
 from app.bot.states import AdminInput
 from app.context import AppContext
+from app.services import menu_logo
 from app.services.audit import audit
 from app.services.media import DOWNLOAD_LIMIT, media_of, store_file
-from app.services.settings import MenuMedia, save_settings
+from app.services.settings import MenuMedia, update_settings
 
 router = Router(name="admin_menu")
 router.callback_query.filter(RoleFilter("admin"))
@@ -39,14 +40,24 @@ async def _screen(session: AsyncSession, *, waiting: bool) -> tuple[str, Any]:
         "",
     ]
     builder = InlineKeyboardBuilder()
+    logo = menu_logo.is_logo(media)
     if media is None:
         lines.append("Сейчас заставки нет — меню показывается текстом.")
     else:
         size = f", {media.size / 1024 / 1024:.1f} МБ" if media.size else ""
         copy = "копия сохранена" if media.local_path else "без копии у бота"
-        lines.append(f"Сейчас: {KIND_NAMES.get(media.kind, media.kind)}{size}, {copy}.")
+        if logo:
+            lines.append(f"Сейчас: анимация логотипа Service List (GIF{size}), {copy}.")
+        else:
+            lines.append(f"Сейчас: {KIND_NAMES.get(media.kind, media.kind)}{size}, {copy}.")
         builder.button(text="👁 Показать меню", callback_data="a:menu:show")
         builder.button(text="🗑 Убрать заставку", callback_data="a:menu:del")
+    if not logo and menu_logo.version():
+        builder.button(text="✨ Поставить анимацию логотипа", callback_data="a:menu:logo")
+    before = await menu_logo.previous(session)
+    if before is not None:
+        name = KIND_NAMES.get(before.kind, before.kind)
+        builder.button(text=f"↩️ Вернуть прежнюю заставку ({name})", callback_data="a:menu:prev")
     if waiting:
         lines += ["", "Чтобы поставить или заменить, пришлите видео, GIF или картинку следующим сообщением."]
     else:
@@ -75,10 +86,40 @@ async def on_show(call: CallbackQuery, session: AsyncSession, **data: Any) -> No
 @router.callback_query(F.data == "a:menu:del")
 async def on_delete(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
     await state.clear()
-    await save_settings(session, MenuMedia())
+    await update_settings(session, MenuMedia, media_id=None, kind=None)
     await audit(session, data["user"].id, "menu.media_remove", "settings", MenuMedia.KEY)
     await session.commit()
     await call.answer("Заставка убрана")
+    text, markup = await _screen(session, waiting=False)
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "a:menu:logo")
+async def on_logo(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
+    """The logo animation into the menu (what it replaces can be put back)."""
+    await state.clear()
+    record = await menu_logo.put(data["ctx"], session)
+    await audit(session, data["user"].id, "menu.media_logo", "media", record.id if record else None)
+    await session.commit()
+    await call.answer("Поставлена анимация логотипа" if record else "Файла анимации нет у бота")
+    text, markup = await _screen(session, waiting=False)
+    assert call.message is not None
+    await show_screen(call.message, text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "a:menu:prev")
+async def on_previous(call: CallbackQuery, state: FSMContext, session: AsyncSession, **data: Any) -> None:
+    """Back to what the logo animation replaced."""
+    await state.clear()
+    before = await menu_logo.previous(session)
+    if before is None:
+        await call.answer("Прежней заставки нет")
+    else:
+        await update_settings(session, MenuMedia, media_id=before.id, kind=before.kind, previous_id=None)
+        await audit(session, data["user"].id, "menu.media_back", "media", before.id)
+        await session.commit()
+        await call.answer("Прежняя заставка вернулась")
     text, markup = await _screen(session, waiting=False)
     assert call.message is not None
     await show_screen(call.message, text, reply_markup=markup)
@@ -105,11 +146,11 @@ async def input_menu_media(message: Message, data: dict[str, Any], fsm: dict[str
             await message.answer("Не удалось скачать файл. Отправьте его как видео, а не как файл.")
             return False
         record.file_id = None  # a document's file_id cannot be sent as a video: the local copy is uploaded
-    await save_settings(session, MenuMedia(media_id=record.id, kind=kind))
+    await update_settings(session, MenuMedia, media_id=record.id, kind=kind, previous_id=None)
     await audit(session, data["user"].id, "menu.media", "media", record.id, {"kind": kind})
     await session.commit()
     if not await show_media_menu(message.chat.id, data, record):
-        await save_settings(session, MenuMedia())
+        await update_settings(session, MenuMedia, media_id=None, kind=None)
         await session.commit()
         await message.answer(
             "⚠️ Telegram не принял этот файл как заставку. Попробуйте другой: mp4 до 50 МБ, GIF или картинку."

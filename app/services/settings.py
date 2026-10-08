@@ -154,6 +154,8 @@ class MenuMedia(SettingsGroup):
 
     media_id: int | None = None  # MediaFile row
     kind: str | None = None  # video / animation / photo
+    logo: str | None = None  # the version of the logo animation put in last (app/services/menu_logo.py)
+    previous_id: int | None = None  # what the logo animation replaced, to put back
 
 
 class Announce(SettingsGroup):

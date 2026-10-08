@@ -120,6 +120,12 @@ async def job_ui_emoji(ctx: AppContext) -> None:
     await job(ctx)
 
 
+async def job_menu_logo(ctx: AppContext) -> None:
+    from app.services.menu_logo import job
+
+    await job(ctx)
+
+
 async def job_publish_watch(ctx: AppContext) -> None:
     from app.services.published import watch
 
@@ -177,6 +183,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_emoji_tasks, IntervalTrigger(seconds=30)),
         (job_premium_account, IntervalTrigger(seconds=30)),
         (job_ui_emoji, IntervalTrigger(minutes=10, jitter=30)),
+        (job_menu_logo, IntervalTrigger(hours=1, jitter=60)),
         (job_moderation_cards, IntervalTrigger(minutes=5, jitter=30)),
         (job_escrow_poll, IntervalTrigger(seconds=20)),
         (job_escrow_sweep, IntervalTrigger(minutes=1)),
@@ -195,10 +202,12 @@ async def start_jobs(ctx: AppContext) -> AsyncIOScheduler:
             coalesce=True,
             misfire_grace_time=300,
         )
-    # run a self-test shortly after start; connect the Premium account and load the icons right away
+    # run a self-test shortly after start; connect the Premium account, load the icons and put a new menu
+    # animation in right away
     scheduler.add_job(_safe(job_selftest, ctx), trigger="date", id="selftest_boot")
     scheduler.add_job(_safe(job_premium_account, ctx), trigger="date", id="premium_account_boot")
     scheduler.add_job(_safe(job_ui_emoji, ctx), trigger="date", id="ui_emoji_boot")
+    scheduler.add_job(_safe(job_menu_logo, ctx), trigger="date", id="menu_logo_boot")
     scheduler.start()
     return scheduler
 
