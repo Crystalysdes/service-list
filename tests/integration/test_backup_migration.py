@@ -184,7 +184,7 @@ async def test_move_to_a_new_channel(h, tg, db, ctx):
     posts = sorted(tg.messages[NEW_MAIN].values(), key=lambda m: m["message_id"])
     assert posts[0].get("photo") and "Travel" in posts[1]["text"]
     nav = posts[-1]
-    assert nav["text"].startswith("Навигационная панель") and tg.pins[NEW_MAIN] == [nav["message_id"]]
+    assert nav["text"].startswith("Навигационная панель") and not tg.pins.get(NEW_MAIN)  # last, not pinned
     footer_links = [
         e["url"] for e in posts[1]["entities"] if e.get("url", "").startswith("https://t.me/servicelist2/")
     ]

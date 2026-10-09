@@ -617,6 +617,8 @@ class FakeTelegram:
         source = self._get_msg(source_chat["id"], params["message_id"])
         if source is None or "new_chat_title" in source:
             raise FakeError(400, "Bad Request: message to forward not found")
+        if "pinned_message" in source:  # "… pinned «…»"
+            raise FakeError(400, "Bad Request: message can't be forwarded")
         if source_chat.get("_protected"):
             raise FakeError(400, "Bad Request: message has protected content and can't be forwarded")
         target = self._chat(params["chat_id"])
@@ -655,6 +657,9 @@ class FakeTelegram:
         return self._export(msg)
 
     def m_copyMessage(self, params: dict, files: dict) -> dict:
+        source = self._get_msg(self._chat(params["from_chat_id"])["id"], params["message_id"])
+        if source is not None and ("pinned_message" in source or "new_chat_title" in source):
+            raise FakeError(400, "Bad Request: message can't be copied")  # a service message
         forwarded = self.m_forwardMessage(params, files)
         stored = self.messages[self._chat(params["chat_id"])["id"]][forwarded["message_id"]]
         stored.pop("forward_origin", None)
@@ -1407,14 +1412,15 @@ class Harness:
         await self.feed({"edited_channel_post": self.tg._export(msg)})
         return msg
 
-    async def channel_pin(self, chat_id: int, message_id: int) -> None:
-        """An admin pins a channel post: Telegram posts the service message that says which."""
+    async def channel_pin(self, chat_id: int, message_id: int) -> bool:
+        """An admin pins a channel post: Telegram posts the service message that says which. True when the
+        bot deleted that message (whatever is left of it goes after the update, as before)."""
         self.tg.pins.setdefault(chat_id, []).append(message_id)
         pin = self.tg.post(chat_id, service=True)
         pin.pop("new_chat_title", None)
         pin["pinned_message"] = self.tg._export(self.tg.messages[chat_id][message_id])
         await self.feed({"channel_post": self.tg._export(pin)})
-        del self.tg.messages[chat_id][pin["message_id"]]
+        return self.tg.messages[chat_id].pop(pin["message_id"], None) is None
 
     async def group_say(self, chat_id: int, user_id: int, text: str, thread_id: int | None = None) -> None:
         msg = self.tg.group_message(chat_id, user_id, text, thread_id)

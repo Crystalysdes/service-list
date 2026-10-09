@@ -37,12 +37,8 @@ async def _ads(h, tg, ids) -> dict[str, int]:
     }
     for message in posted.values():
         await h.feed({"channel_post": tg._export(message)})
-    tg.pins.setdefault(MAIN, []).append(posted["plain"]["message_id"])  # an admin pins the first ad
-    pin = tg.post(MAIN, service=True)
-    pin.pop("new_chat_title", None)
-    pin["pinned_message"] = tg._export(posted["plain"])
-    await h.feed({"channel_post": tg._export(pin)})
-    del tg.messages[MAIN][pin["message_id"]]
+    # an admin pins the first ad: the bot deletes "… pinned «…»" and remembers the pin
+    assert await h.channel_pin(MAIN, posted["plain"]["message_id"])
     await h.press(OWNER_ID, h.last(OWNER_ID), "Перенести навигацию вниз")
     return {key: m["message_id"] for key, m in posted.items()}
 
@@ -81,7 +77,7 @@ async def test_a_new_category_comes_right_after_the_last_and_the_ads_move_below(
     assert _text(tg.messages[MAIN][nav]).startswith("Навигационная панель") and "#sms" in _text(
         tg.messages[MAIN][nav]
     )
-    assert tg.pins[MAIN][-1] == nav and plain in tg.pins[MAIN]  # the ad's pin moved to its copy
+    assert tg.pins[MAIN] == [plain]  # the ad's pin moved to its copy; the navigation is not pinned
     for call in [*tg.called("copyMessage"), *tg.called("copyMessages"), *tg.called("forwardMessages")]:
         if int(call["chat_id"]) == MAIN:
             assert call.get("disable_notification") in (True, "true")  # nobody is notified of a copy

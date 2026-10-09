@@ -50,7 +50,7 @@ async def test_admin_creates_category_and_manages_service(h, tg, db, ctx):
     nav_text = tg.messages[MAIN][nav_id]["text"]
     assert nav_text.startswith("Навигационная панель") and "#proxy" in nav_text
     proxy_post = next(i for i, m in tg.messages[MAIN].items() if m.get("text", "").startswith("🔐Proxy"))
-    assert proxy_post < nav_id and tg.pins[MAIN] == [nav_id]
+    assert proxy_post < nav_id and not tg.pins[MAIN]  # nothing pinned: the imported navigation's pin is off
 
     await h.press(OWNER_ID, h.last(OWNER_ID), "Назад")
     card = h.last(OWNER_ID)
@@ -114,7 +114,7 @@ async def test_manual_post_after_nav_and_manual_edit(h, tg, db, ctx):
     last = max(tg.messages[MAIN])
     assert tg.messages[MAIN][last]["text"].startswith("Навигационная панель")
     assert ids["nav"] not in tg.messages[MAIN]  # the old one is deleted: Telegram allows it for 48 hours
-    assert tg.pins[MAIN] == [last]
+    assert not tg.pins[MAIN]  # the navigation is the last post anyway: not pinned
     assert not [m for m in tg.bot_messages(OWNER_ID) if "🧹" in (m.get("text") or "")]
 
     edited = dict(tg.messages[MAIN][ids["travel"]])
@@ -229,7 +229,7 @@ async def test_an_old_navigation_becomes_a_dot_and_every_link_follows_the_new_on
     new_link = f"https://t.me/servicelist/{max(tg.messages[MAIN])}"
     old_nav = tg.messages[MAIN][ids["nav"]]  # kept by Telegram: only a link to the new navigation is left
     assert old_nav["text"] == "#навигация" and _links(old_nav) == [new_link]
-    assert tg.pins[MAIN] == [max(tg.messages[MAIN])]
+    assert not tg.pins[MAIN]  # the kept old message is unpinned too
     note = next(m["text"] for m in reversed(tg.bot_messages(OWNER_ID)) if "🧹" in (m.get("text") or ""))
     assert "старше 48 часов" in note and f"Удалите старую вручную: {old_link}" in note
     for key in ("intro", "travel", "vpn", "design"):  # the main post as well as every category
@@ -257,6 +257,7 @@ async def test_the_bots_own_posts_and_pins_raise_no_alert(h, tg, db, ctx):
     pin["pinned_message"] = tg._export(tg.messages[MAIN][ids["nav"]])
     await h.feed({"channel_post": pin})
     assert not [m for m in tg.bot_messages(OWNER_ID) if "после навигации" in (m.get("text") or "")]
+    assert pin["message_id"] not in tg.messages[MAIN]  # "… pinned «…»" is deleted
 
     await h.feed({"channel_post": tg._export(tg.post(MAIN, "реклама"))})  # an admin's post: alert
     assert "после навигации" in h.last(OWNER_ID)["text"]

@@ -82,7 +82,7 @@ async def test_a_deleted_navigation_comes_back_at_the_bottom(tg, db, ctx):
         tg.messages[MAIN][new]["text"].startswith(NAV_TITLE) and "#travel" in tg.messages[MAIN][new]["text"]
     )
     assert ids["nav"] not in tg.messages[MAIN]  # the leftover is gone: younger than 48 hours
-    assert await _rows(db, "spare") == [] and tg.pins[MAIN] == [new]
+    assert await _rows(db, "spare") == [] and not tg.pins[MAIN]
     for key in ("travel", "vpn", "design"):
         assert f"https://t.me/servicelist/{new}" in _links(tg.messages[MAIN][ids[key]])
     assert _notes(tg, f"Навигация (пост {deleted}) удалена из канала")

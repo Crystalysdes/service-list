@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import timedelta
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.enums import ContentType
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, or_, select
@@ -27,7 +29,7 @@ from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.channels import INACTIVE_STATUSES, remember_chat
 from app.services.notify import claim_notification, close_alert, notify_staff, remember_alert
-from app.services.settings import Runtime, get_settings
+from app.services.settings import Chats, Runtime, get_settings
 from app.services.sync import manual as kept_edits
 from app.services.sync.engine import OWNER_RANK, is_own_edit, request_nav_move
 from app.services.sync.foreign import OWN_POSTS, remember_album, remember_pin
@@ -110,6 +112,13 @@ async def _owned(session: AsyncSession, channel_id: int, message_id: int) -> boo
     return any(own == message_id or message_id in (extra or []) for own, extra in rows.all())
 
 
+async def _ours(session: AsyncSession, chat_id: int) -> bool:
+    """One of the bot's channels: the list's, Service List Info, Scam list or the storage channel."""
+    if await _channel(session, chat_id) is not None:
+        return True
+    return (await get_settings(session, Chats)).storage_chat_id == chat_id
+
+
 def _wake(ctx: AppContext, channel_id: int) -> None:
     engine = ctx.get("sync")
     if engine is not None:
@@ -122,6 +131,9 @@ async def on_channel_post(message: Message, session: AsyncSession, **data: Any) 
         if message.pinned_message is not None:  # an admin's pinned post keeps its pin when it is moved
             await remember_pin(session, message.chat.id, message.pinned_message.message_id)
             await infofeed.on_pin(session, message.chat.id, message.pinned_message.message_id)
+            if await _ours(session, message.chat.id):  # the post stays pinned; "… pinned «…»" goes
+                with contextlib.suppress(TelegramAPIError):
+                    await message.delete()
         return
     if message.media_group_id:  # an album is moved as one (a forward of one photo does not tell)
         await remember_album(session, message.chat.id, message.message_id, message.media_group_id)

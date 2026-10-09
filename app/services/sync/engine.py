@@ -1500,39 +1500,67 @@ class SyncEngine:
             )
 
     async def _sync_pins(self, channel_id: int, limiter: RateLimiter) -> None:
+        """The bot pins none of its posts in a list channel: the navigation is the last post anyway. A pin it
+        made before (the navigation's, or one its old message took along to a block) is taken off."""
         bot = self.ctx.bot
         assert bot is not None
         async with self.ctx.db.session() as session:
             channel = await session.get(Channel, channel_id)
             assert channel is not None
-            rows = list(
-                (
-                    await session.execute(select(ChannelPost).where(ChannelPost.channel_id == channel_id))
-                ).scalars()
-            )
-            todo = []
-            for row in rows:
-                should = row.kind == "nav" and bool(row.message_id)
-                if row.message_id and row.pinned != should:
-                    todo.append((row.id, row.message_id, should))
+            todo = (
+                await session.execute(
+                    select(ChannelPost.id, ChannelPost.message_id).where(
+                        ChannelPost.channel_id == channel_id,
+                        ChannelPost.pinned.is_(True),
+                        ChannelPost.message_id.is_not(None),
+                    )
+                )
+            ).all()
             chat_id = channel.chat_id
-        for row_id, message_id, should in todo:
+            storage = (await get_settings(session, Chats)).storage_chat_id
+        for row_id, message_id in todo:
             await limiter.acquire()
             try:
-                if should:
-                    await self._call(
-                        bot.pin_chat_message(chat_id, message_id, disable_notification=True), channel_id
-                    )
-                else:
-                    await self._call(bot.unpin_chat_message(chat_id, message_id=message_id), channel_id)
-            except TelegramBadRequest:
-                log.warning("pin change failed for %s", message_id, exc_info=True)
-                continue
+                await self._call(bot.unpin_chat_message(chat_id, message_id=message_id), channel_id)
+            except TelegramBadRequest as exc:  # not pinned any more (taken off by hand) or gone
+                log.info("unpinning %s in %s: %s", message_id, chat_id, exc.message)
+            if storage:
+                await self._drop_pin_notice(chat_id, message_id + 1, storage, limiter)
             async with self.ctx.db.session() as session:
                 row = await session.get(ChannelPost, row_id)
-                if row is not None:
-                    row.pinned = should
+                if row is not None and row.message_id == message_id:
+                    row.pinned = False
                     await session.commit()
+
+    async def _drop_pin_notice(
+        self, chat_id: int, message_id: int, storage: int, limiter: RateLimiter
+    ) -> None:
+        """The bot pinned its post right after sending it, so "… pinned «…»" came next: deleted while Telegram
+        allows (48 hours). Only a message that can be neither forwarded nor copied is taken for it (a service
+        message); a post forwards or copies (a poll, paid media) into the storage channel, where its copy goes
+        at once, and stays."""
+        bot = self.ctx.bot
+        assert bot is not None
+        probes = (
+            lambda: bot.forward_message(storage, chat_id, message_id, disable_notification=True),
+            lambda: bot.copy_message(storage, chat_id, message_id, disable_notification=True),
+        )
+        for probe in probes:
+            await limiter.acquire()
+            try:
+                copy = await probe()
+            except TelegramBadRequest as exc:
+                text = exc.message.lower()
+                if "protected" in text or ("be forwarded" not in text and "be copied" not in text):
+                    return  # not there (any more), or a protected channel: nothing tells what it is
+                continue
+            except TelegramAPIError:
+                return
+            with contextlib.suppress(TelegramAPIError):
+                await bot.delete_message(storage, copy.message_id)
+            return
+        with contextlib.suppress(TelegramAPIError):
+            await bot.delete_message(chat_id, message_id)
 
     # ------------------------------------------------------------------ helpers
     async def _row(

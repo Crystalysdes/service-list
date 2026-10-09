@@ -93,7 +93,7 @@ async def test_new_service_and_new_category_keep_nav_last(tg, db, ctx):
     new_nav = _posts(tg)[new_nav_id]
     assert new_nav["text"].startswith("Навигационная панель")
     assert "#proxy" in new_nav["text"]
-    assert tg.pins[MAIN] == [new_nav_id]
+    assert not tg.pins[MAIN]  # the pin the old message had went with it; the navigation is not pinned
     for key in ("travel", "vpn", "design"):
         assert f"https://t.me/servicelist/{new_nav_id}" in _link_urls(_posts(tg)[ids[key]])
     assert f"https://t.me/servicelist/{ids['nav']}" in _link_urls(new_nav)  # link to the proxy post
@@ -114,7 +114,7 @@ async def test_deleted_post_is_restored(tg, db, ctx):
     assert _posts(tg)[ids["nav"]]["text"].startswith("✏️Design")  # the last one took the navigation's place
     last = max(_posts(tg))
     assert _posts(tg)[last]["text"].startswith("Навигационная панель")
-    assert tg.pins[MAIN] == [last]
+    assert not tg.pins[MAIN]
     notes = [m.get("text") or "" for m in tg.bot_messages(1001)]
     assert any("Категория «✏️VPN [Впн]»" in n and "удалена из канала" in n for n in notes)
     assert any(
@@ -152,7 +152,7 @@ async def test_a_post_telegram_refuses_does_not_stop_the_channel(tg, db, ctx):
         "new",
         "Bad Request: message is too long",
     )
-    assert _posts(tg)[ids["nav"]]["text"].startswith("Навигационная панель") and tg.pins[MAIN] == [ids["nav"]]
+    assert _posts(tg)[ids["nav"]]["text"].startswith("Навигационная панель") and not tg.pins[MAIN]
     notes = [m["text"] for m in tg.bot_messages(1001) if "Не удалось опубликовать пост" in m.get("text", "")]
     assert len(notes) == 1 and "message is too long" in notes[0]
 

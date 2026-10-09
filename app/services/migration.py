@@ -1,7 +1,7 @@
 """Moving to a new channel, mirrors and channel health.
 
 A move: the new channel is connected with status ``migrating`` — the sync engine fills it exactly like the
-current one (posts, navigation last and pinned; cards and index for the Scam list) while nothing else
+current one (posts, the navigation last; cards and index for the Scam list) while nothing else
 points to it yet. "Make main" retires the old channel; the menu buttons and every link that uses the
 ``channel:main`` / ``channel:scam`` symbols switch to the new one on the next render.
 A mirror is a second copy kept in sync all the time, so switching to it is instant.
