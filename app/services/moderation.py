@@ -604,8 +604,8 @@ async def approve(
                 service.link_dead_streak = 0
                 service.link_first_dead_at = None
                 service.link_fingerprint = None
-                if service.status == "hidden" and service.hidden_reason == "dead_link":
-                    service.status = "active"
+                if service.status == "hidden" and service.hidden_reason in ("dead_link", "link_update"):
+                    service.status = "active"  # the owner's new link brings back a service it took down
                     service.hidden_reason = None
         if "description" in payload:
             service.description = payload["description"]

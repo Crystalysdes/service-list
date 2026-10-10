@@ -292,3 +292,61 @@ async def test_claim_by_username_code_and_manual_review(h, tg, db, ctx):
     # an owned service cannot be claimed again
     await h.click(OTHER, h.last(OTHER), f"claim:svc:{coco.id}")
     assert "уже есть владелец" in tg.called("answerCallbackQuery")[-1]["text"]
+
+
+async def test_dead_links_are_removed_and_owners_keep_theirs_down_until_a_new_link(h, tg, db, ctx):
+    ids, engine, checker, fetcher = await _setup(tg, db, ctx)
+    hannibal = await _service(db, "Hannibal Lecter")  # nobody in the bot owns it: removed
+    trip = await _service(db, "Tripmafia")  # its owner is in the bot: down until a new link
+    lucky = await _service(db, "LuckyManTravel")  # its owner was banned: as good as none
+    await _patch(db, trip.id, owner_id=SELLER)
+    await _patch(db, lucky.id, owner_id=LUCKY)
+    async with db.session() as s:
+        (await s.get(User, LUCKY)).is_banned = True
+        await s.commit()
+    for service in (hannibal, trip, lucky):
+        await _patch(db, service.id, status="hidden", hidden_reason="dead_link", link_state="dead")
+    await engine.run_once(ids["channel_id"])
+
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Ссылки")
+    screen = h.last(OWNER_ID)
+    await h.press(OWNER_ID, screen, "Удалить нерабочие (3)")
+    confirm = h.last(OWNER_ID)
+    assert "удалятся из базы (2): Hannibal Lecter, LuckyManTravel." in confirm["text"]
+    assert "пока владелец не заменит ссылку (1): Tripmafia." in confirm["text"]
+    assert (await _service(db, "Hannibal Lecter")).status == "hidden"  # nothing happens before "yes"
+    await h.press(OWNER_ID, confirm, "Да, удалить")
+    result = h.last(OWNER_ID)["text"]
+    assert "Удалено сервисов без владельца: 2" in result
+    assert "Сняты до новой ссылки от владельца: 1, уведомление получили 1." in result
+    assert (await _service(db, "Hannibal Lecter")).status == "removed"
+    assert (await _service(db, "LuckyManTravel")).status == "removed"
+    trip = await _service(db, "Tripmafia")
+    assert (trip.status, trip.hidden_reason) == ("hidden", "link_update")
+    notice = h.last(SELLER)
+    assert "снят из списка, пока ссылка не будет заменена" in notice["text"]
+    assert h.button(notice, "Изменить ссылку")["callback_data"] == f"my:{trip.id}:ef:url"
+    await h.press(OWNER_ID, h.last(OWNER_ID), "К проверке ссылок")
+    screen = h.last(OWNER_ID)
+    assert "ждут новую ссылку от владельцев 1" in screen["text"]
+    assert not any("Удалить нерабочие" in b["text"] for b in h.buttons(screen))
+
+    fetcher.tme("tripmafia", "Tripmafia")  # the old link opens again: it stays down all the same
+    report = await checker.run_pass()
+    assert trip.id not in report.restored and (await _service(db, "Tripmafia")).status == "hidden"
+
+    await h.say(SELLER, "/menu")
+    await h.press(SELLER, h.last(SELLER), "My services")
+    await h.press(SELLER, h.last(SELLER), "Tripmafia")
+    card = h.last(SELLER)
+    assert "Ссылка не открывается — сервис снят из списка" in card["text"]
+    await h.press(SELLER, card, "Изменить ссылку")
+    await h.say(SELLER, "https://t.me/tripmafia_new")
+    request = next(m for m in reversed(tg.bot_messages(OWNER_ID)) if "Правка сервиса" in m.get("text", ""))
+    await h.click(OWNER_ID, request, h.button(request, "Одобрить")["callback_data"])
+    trip = await _service(db, "Tripmafia")
+    assert (trip.status, trip.hidden_reason, trip.url) == ("active", None, "https://t.me/tripmafia_new")
+    await engine.run_once(ids["channel_id"])
+    assert "Tripmafia" in _travel_lines(tg, ids)
+    assert "Hannibal Lecter" not in _travel_lines(tg, ids)

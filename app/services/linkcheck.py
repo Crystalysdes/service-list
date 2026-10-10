@@ -8,6 +8,10 @@ first gets ``paid_grace_hours`` to change the link. Any alive verdict resets the
 link whose known title comes back within ``auto_restore_days`` returns by itself, a site that opens again is
 shown to staff first (its domain may have a new owner). A changed page title (another owner took the
 username) is reported to the admins instead of being trusted.
+
+"🗑 Удалить нерабочие" (admin) clears the services hidden for a dead link: one without an owner in the bot is
+removed; one with an owner stays down (``LINK_UPDATE``, no longer checked or brought back by itself) until a
+new link of its owner is approved, and the owner is told.
 """
 
 from __future__ import annotations
@@ -234,6 +238,93 @@ def hide_for_dead_link(service: Service, settings: LinkCheckSettings, now: datet
     service.extra = {**(service.extra or {}), "dead_hidden_at": now.isoformat()}
 
 
+LINK_UPDATE = "link_update"  # hidden until its owner gives a new link (after "🗑 Удалить нерабочие")
+DEAD_REASONS = ("dead_link", LINK_UPDATE)  # an approved new link of the owner brings the service back
+
+
+@dataclass
+class DeadSplit:
+    """The services hidden for a dead link: with an owner in the bot, and without one."""
+
+    owned: list[Service]
+    lone: list[Service]
+
+
+async def dead_split(session: AsyncSession) -> DeadSplit:
+    rows = list(
+        (
+            await session.execute(
+                select(Service)
+                .where(Service.status == "hidden", Service.hidden_reason == "dead_link")
+                .order_by(Service.id)
+            )
+        ).scalars()
+    )
+    owner_ids = {s.owner_id for s in rows if s.owner_id}
+    owners = set()
+    if owner_ids:
+        owners = set(
+            (await session.execute(select(User.id).where(User.id.in_(owner_ids), User.is_banned.is_(False))))
+            .scalars()
+            .all()
+        )
+    owned = [s for s in rows if s.owner_id in owners]
+    return DeadSplit(owned=owned, lone=[s for s in rows if s.owner_id not in owners])
+
+
+@dataclass
+class Removal:
+    removed: list[int]  # without an owner in the bot: removed
+    kept: list[int]  # with an owner: down until the owner's new link is approved
+    tell: list[int]  # of those, the ones whose owners are told (not those already sending a new link)
+
+
+async def remove_dead(session: AsyncSession, actor_id: int | None) -> Removal:
+    """The dead links out: a service without an owner in the bot is removed (its options end, open orders
+    close); one with an owner stays down until a new link of the owner is approved."""
+    from app.services import billing, moderation
+
+    split = await dead_split(session)
+    for service in split.lone:
+        service.status = "removed"  # hidden_reason stays "dead_link": why it went
+        for feature in service.features:
+            if feature.status == "active":
+                feature.status = "revoked"
+        await billing.cancel_open_orders(session, service.id, "ссылка не открывается: сервис удалён")
+        await audit(session, actor_id, "service.remove_dead", "service", service.id)
+    tell = []
+    for service in split.owned:
+        service.hidden_reason = LINK_UPDATE
+        await audit(session, actor_id, "service.link_update", "service", service.id)
+        sending = await moderation.open_request(session, service.id, "edit")
+        if sending is None or "url" not in (sending.payload or {}):
+            tell.append(service.id)
+    await session.flush()
+    return Removal(removed=[s.id for s in split.lone], kept=[s.id for s in split.owned], tell=tell)
+
+
+async def tell_link_update(ctx: AppContext, service_ids: list[int]) -> tuple[int, int]:
+    """The owners hear that their service is down until they replace its link. (delivered, not delivered)"""
+    delivered = failed = 0
+    for service_id in service_ids:
+        async with ctx.db.session() as session:
+            service = await session.get(Service, service_id)
+            owner = await session.get(User, service.owner_id) if service and service.owner_id else None
+        if service is None or owner is None:
+            continue
+        t = Translator(owner.lang)
+        builder = InlineKeyboardBuilder()
+        builder.button(text=t("lnk.change"), callback_data=f"my:{service.id}:ef:url")
+        builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
+        builder.adjust(1)
+        text = t("lnk.update", name=h(service.name), url=h(service.url))
+        if await notify_user(ctx, owner.id, text, reply_markup=builder.as_markup()):
+            delivered += 1
+        else:
+            failed += 1
+    return delivered, failed
+
+
 def restore_service(service: Service) -> bool:
     """Admin "return": back to the list, link state reset; a reviewed title change is accepted."""
     extra = dict(service.extra or {})
@@ -247,7 +338,7 @@ def restore_service(service: Service) -> bool:
     service.link_dead_streak = 0
     service.link_first_dead_at = None
     service.link_grace_until = None
-    if service.status == "hidden" and service.hidden_reason in ("dead_link", "review"):
+    if service.status == "hidden" and service.hidden_reason in (*DEAD_REASONS, "review"):
         service.status = "active"
         service.hidden_reason = None
         return True

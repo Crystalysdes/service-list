@@ -30,6 +30,11 @@ router.callback_query.filter(F.message.chat.type == "private")
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 VISIBLE = ("pending", "approved", "active", "hidden", "banned", "rejected")
+LINK_DOWN = ("dead_link", "link_update")  # hidden for a link that does not open: a new link brings it back
+
+
+def _link_down(service: Service) -> bool:
+    return service.status == "hidden" and service.hidden_reason in LINK_DOWN
 
 
 async def _owned(session: AsyncSession, user_id: int, service_id: int) -> Service | None:
@@ -92,6 +97,8 @@ async def card_text(session: AsyncSession, service: Service, t: Translator, tz: 
         ).scalar_one_or_none()
         if request is not None and request.reason:
             lines.append(t("my.reason", reason=h(request.reason)))
+    if _link_down(service):
+        lines.append(t("my.link_down"))
     grace_days = (await get_settings(session, Prices)).listing_grace_days
     term = listing_state(t, service, tz, grace_days)
     if term:
@@ -144,6 +151,8 @@ def card_keyboard(service: Service, t: Translator, *, options_offer: bool = Fals
         builder.button(text=t("my.btn_top"), callback_data=f"opt:{sid}:top", style="primary")
         builder.button(text=t("my.btn_emoji"), callback_data=f"opt:{sid}:emoji")
         builder.button(text=t("my.btn_font"), callback_data=f"opt:{sid}:glow")
+    if _link_down(service):
+        builder.button(text=t("lnk.change"), callback_data=f"my:{sid}:ef:url", style="primary")
     if service.status in ("active", "hidden", "approved"):
         builder.button(text=t("my.btn_edit"), callback_data=f"my:{sid}:edit")
     if service.status != "banned":

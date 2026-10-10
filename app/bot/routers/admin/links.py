@@ -1,4 +1,5 @@
-"""Admin: dead-link checker — status, manual pass, hidden services, title changes (username takeover)."""
+"""Admin: dead-link checker — status, manual pass, hidden services, title changes (username takeover), removal
+of the dead links (owners keep their services down until they give a new link)."""
 
 from __future__ import annotations
 
@@ -20,13 +21,27 @@ from app.context import AppContext
 from app.db.models import Category, Service
 from app.services.audit import audit
 from app.services.catalog import request_sync
-from app.services.linkcheck import report_lines, restore_service, start_background_pass
+from app.services.linkcheck import (
+    LINK_UPDATE,
+    dead_split,
+    remove_dead,
+    report_lines,
+    restore_service,
+    start_background_pass,
+    tell_link_update,
+)
 from app.services.settings import LinkCheckSettings, LinkCheckState, get_settings, update_settings
 
 router = Router(name="admin_links")
 router.callback_query.filter(RoleFilter("admin"))
 
-HIDDEN_REASONS = ("dead_link", "review")
+HIDDEN_REASONS = ("dead_link", "review", LINK_UPDATE)
+WHY_HIDDEN = {
+    "dead_link": "не открывается",
+    "review": "сменилось название",
+    LINK_UPDATE: "не открывается, ждёт новую ссылку от владельца",
+}
+NAMES_SHOWN = 25
 
 
 async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
@@ -50,6 +65,16 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         .select_from(Service)
         .where(Service.status == "active", Service.link_dead_streak > 0)
     )
+    dead = await session.scalar(
+        select(func.count())
+        .select_from(Service)
+        .where(Service.status == "hidden", Service.hidden_reason == "dead_link")
+    )
+    waiting = await session.scalar(
+        select(func.count())
+        .select_from(Service)
+        .where(Service.status == "hidden", Service.hidden_reason == LINK_UPDATE)
+    )
     lines = [
         "🔗 <b>Проверка ссылок</b>",
         "",
@@ -62,7 +87,8 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         *report_lines(state.last_report, ctx.config.timezone),
         "",
         f"Сейчас: скрыто {hidden or 0}, ждут замены ссылки {grace or 0}, "
-        f"с «мёртвыми» проверками {streak or 0}, смена названия {review or 0}.",
+        f"с «мёртвыми» проверками {streak or 0}, смена названия {review or 0}"
+        + (f", ждут новую ссылку от владельцев {waiting}." if waiting else "."),
     ]
     checker = ctx.get("linkcheck")
     if checker is not None and checker.running:
@@ -70,6 +96,8 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     builder = InlineKeyboardBuilder()
     builder.button(text="▶️ Проверить сейчас", callback_data="a:links:run")
     builder.button(text=f"🙈 Скрытые ({hidden or 0})", callback_data="a:links:hidden")
+    if dead:
+        builder.button(text=f"🗑 Удалить нерабочие ({dead})", callback_data="a:links:purge")
     builder.button(text=f"⚠️ Смена названия ({review or 0})", callback_data="a:links:fp")
     builder.button(
         text="⏸ Выключить автопроверку" if settings.enabled else "▶️ Включить автопроверку",
@@ -146,7 +174,7 @@ async def _hidden_screen(session: AsyncSession) -> tuple[str, Any]:
     builder = InlineKeyboardBuilder()
     lines = ["🙈 <b>Скрыты из-за ссылки</b>", ""]
     for service, category in rows:
-        why = "не открывается" if service.hidden_reason == "dead_link" else "сменилось название"
+        why = WHY_HIDDEN.get(service.hidden_reason or "", "скрыт")
         lines.append(f"• {h(service.name)} ({h(category.title)}) — {h(service.url)}, {why}")
         builder.button(text=f"♻️ {service.name[:40]}", callback_data=f"a:links:restore:{service.id}")
     if not rows:
@@ -266,3 +294,75 @@ async def on_fingerprint_decision(call: CallbackQuery, session: AsyncSession, **
     elif call.message is not None:
         with contextlib.suppress(TelegramAPIError):
             await call.message.edit_reply_markup(reply_markup=None)
+
+
+def _names(services: list[Service]) -> str:
+    shown = ", ".join(h(s.name[:40]) for s in services[:NAMES_SHOWN])
+    more = len(services) - NAMES_SHOWN
+    return shown + (f" и ещё {more}" if more > 0 else "")
+
+
+@router.callback_query(F.data == "a:links:purge")
+async def on_purge(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """What "🗑 Удалить нерабочие" will do, before it does."""
+    split = await dead_split(session)
+    total = len(split.owned) + len(split.lone)
+    if not total:
+        await call.answer("Сервисов с нерабочими ссылками нет", show_alert=True)
+        await _show(call, session, data["ctx"])
+        return
+    lines = [
+        "🗑 <b>Удалить нерабочие ссылки</b>",
+        "",
+        f"Скрыты из-за ссылки, которая не открывается: {total}.",
+    ]
+    if split.lone:
+        lines += [
+            "",
+            f"❌ Без владельца в боте — удалятся из базы ({len(split.lone)}): {_names(split.lone)}.",
+        ]
+    if split.owned:
+        lines += [
+            "",
+            f"👤 С владельцем — останутся снятыми, пока владелец не заменит ссылку ({len(split.owned)}): "
+            f"{_names(split.owned)}.",
+            "Владельцам придёт уведомление с кнопкой «🔗 Изменить ссылку». Новая ссылка проходит модерацию, "
+            "и после одобрения сервис возвращается в список. Сам по себе, даже если старая ссылка оживёт, "
+            "он не вернётся.",
+        ]
+    lines += ["", "Сервисы, которые не удалось проверить или которые ещё в списке, не затрагиваются."]
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗑 Да, удалить", callback_data="a:links:purgeyes")
+    builder.button(text="✖️ Отмена", callback_data="a:links")
+    builder.adjust(2)
+    await call.answer()
+    await _edit(call, ("\n".join(lines), builder.as_markup()))
+
+
+@router.callback_query(F.data == "a:links:purgeyes")
+async def on_purge_yes(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    ctx: AppContext = data["ctx"]
+    done = await remove_dead(session, data["user"].id)
+    await session.commit()
+    if not done.removed and not done.kept:
+        await call.answer("Удалять нечего", show_alert=True)
+        await _show(call, session, ctx)
+        return
+    request_sync(ctx)
+    await call.answer("Готово")
+    delivered, failed = await tell_link_update(ctx, done.tell)
+    lines = [
+        "✅ <b>Нерабочие ссылки убраны</b>",
+        "",
+        f"🗑 Удалено сервисов без владельца: {len(done.removed)}.",
+    ]
+    if done.kept:
+        line = f"🔗 Сняты до новой ссылки от владельца: {len(done.kept)}, уведомление получили {delivered}"
+        if failed:
+            line += f", не доставлено {failed} (бот заблокирован или недоступен)"
+        if len(done.tell) < len(done.kept):
+            line += f", уже прислали новую ссылку {len(done.kept) - len(done.tell)}"
+        lines.append(line + ".")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔗 К проверке ссылок", callback_data="a:links")
+    await _edit(call, ("\n".join(lines), builder.as_markup()))
