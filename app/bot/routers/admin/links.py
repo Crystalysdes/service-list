@@ -22,6 +22,7 @@ from app.db.models import Category, Service
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.linkcheck import (
+    DEAD_NOW,
     LINK_UPDATE,
     dead_split,
     remove_dead,
@@ -65,11 +66,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
         .select_from(Service)
         .where(Service.status == "active", Service.link_dead_streak > 0)
     )
-    dead = await session.scalar(
-        select(func.count())
-        .select_from(Service)
-        .where(Service.status == "hidden", Service.hidden_reason == "dead_link")
-    )
+    dead = await session.scalar(select(func.count()).select_from(Service).where(DEAD_NOW))
     waiting = await session.scalar(
         select(func.count())
         .select_from(Service)
@@ -314,7 +311,8 @@ async def on_purge(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
     lines = [
         "🗑 <b>Удалить нерабочие ссылки</b>",
         "",
-        f"Скрыты из-за ссылки, которая не открывается: {total}.",
+        f"Ссылка не открывается: {total} — скрыты {total - split.listed}, ещё в списке {split.listed} "
+        "(последняя проверка их ссылки была «мёртвой»).",
     ]
     if split.lone:
         lines += [
@@ -330,7 +328,7 @@ async def on_purge(call: CallbackQuery, session: AsyncSession, **data: Any) -> N
             "и после одобрения сервис возвращается в список. Сам по себе, даже если старая ссылка оживёт, "
             "он не вернётся.",
         ]
-    lines += ["", "Сервисы, которые не удалось проверить или которые ещё в списке, не затрагиваются."]
+    lines += ["", "Сервисы, которые не удалось проверить, не затрагиваются."]
     builder = InlineKeyboardBuilder()
     builder.button(text="🗑 Да, удалить", callback_data="a:links:purgeyes")
     builder.button(text="✖️ Отмена", callback_data="a:links")

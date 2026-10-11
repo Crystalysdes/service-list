@@ -9,8 +9,8 @@ from sqlalchemy import select
 from app.db.base import utcnow
 from app.db.models import Broadcast, Feature, ModerationRequest, Service, User
 from app.domain.linkcheck import Page, fingerprint
-from app.services.linkcheck import LinkChecker
-from app.services.settings import LinkCheckSettings, update_settings
+from app.services.linkcheck import LinkChecker, report_lines
+from app.services.settings import LinkCheckSettings, LinkCheckState, get_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.fakefetch import FakeFetcher
 from tests.helpers import MAIN, engine_for, imported_channel
@@ -25,7 +25,7 @@ async def _setup(tg, db, ctx):
     ids = await imported_channel(tg, db, ctx)
     engine = engine_for(ctx)
     await engine.run_once(ids["channel_id"])
-    fetcher = FakeFetcher()
+    fetcher = FakeFetcher(tg)
     checker = LinkChecker(ctx, fetcher, delay=0)
     ctx.services["linkcheck"] = checker
     async with db.session() as s:
@@ -70,7 +70,7 @@ async def test_dead_link_hidden_after_streak_and_restored(h, tg, db, ctx):
     fetcher.tme("hannibal_lecter", None)
     first = await checker.run_pass()
     assert (first.checked, first.dead, first.hidden, first.breaker) == (15, 1, [], False)
-    assert first.trust == {"tg": True, "ext": True}
+    assert first.trust == {"tg": True, "ext": True, "invite": True}
     await checker.run_pass()
     await checker.run_pass()
     hannibal = await _service(db, "Hannibal Lecter")
@@ -155,8 +155,8 @@ async def test_breaker_and_canaries_protect_from_mass_hiding(h, tg, db, ctx):
         fetcher.tme(username, username.title())
     fetcher.tme("dead_canary", "Squatted")
     report = await checker.run_pass()
-    assert report.trust == {"tg": False, "ext": True} and report.dead == 0
-    assert "эталонные ссылки не сошлись (t.me)" in h.last(OWNER_ID)["text"]
+    assert report.trust == {"tg": False, "ext": True, "invite": False} and report.dead == 0
+    assert "эталонные ссылки не сошлись (t.me, приглашения)" in h.last(OWNER_ID)["text"]
     assert (await _service(db, "LOUIS VUITTON TRAVEL")).link_dead_streak == 0
 
 
@@ -306,22 +306,29 @@ async def test_dead_links_are_removed_and_owners_keep_theirs_down_until_a_new_li
         await s.commit()
     for service in (hannibal, trip, lucky):
         await _patch(db, service.id, status="hidden", hidden_reason="dead_link", link_state="dead")
+    coco = await _service(
+        db, "Coco Jango Travel"
+    )  # still listed, but its link did not open at the last check
+    await _patch(db, coco.id, link_state="dead", link_dead_streak=1, link_first_dead_at=utcnow())
     await engine.run_once(ids["channel_id"])
 
     await h.say(OWNER_ID, "/admin")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Ссылки")
     screen = h.last(OWNER_ID)
-    await h.press(OWNER_ID, screen, "Удалить нерабочие (3)")
+    await h.press(OWNER_ID, screen, "Удалить нерабочие (4)")
     confirm = h.last(OWNER_ID)
-    assert "удалятся из базы (2): Hannibal Lecter, LuckyManTravel." in confirm["text"]
+    assert "Ссылка не открывается: 4 — скрыты 3, ещё в списке 1" in confirm["text"]
+    removing = confirm["text"].split("удалятся из базы (3): ", 1)[1].split(".", 1)[0]
+    assert sorted(removing.split(", ")) == ["Coco Jango Travel", "Hannibal Lecter", "LuckyManTravel"]
     assert "пока владелец не заменит ссылку (1): Tripmafia." in confirm["text"]
     assert (await _service(db, "Hannibal Lecter")).status == "hidden"  # nothing happens before "yes"
     await h.press(OWNER_ID, confirm, "Да, удалить")
     result = h.last(OWNER_ID)["text"]
-    assert "Удалено сервисов без владельца: 2" in result
+    assert "Удалено сервисов без владельца: 3" in result
     assert "Сняты до новой ссылки от владельца: 1, уведомление получили 1." in result
     assert (await _service(db, "Hannibal Lecter")).status == "removed"
     assert (await _service(db, "LuckyManTravel")).status == "removed"
+    assert (await _service(db, "Coco Jango Travel")).status == "removed"
     trip = await _service(db, "Tripmafia")
     assert (trip.status, trip.hidden_reason) == ("hidden", "link_update")
     notice = h.last(SELLER)
@@ -350,3 +357,83 @@ async def test_dead_links_are_removed_and_owners_keep_theirs_down_until_a_new_li
     await engine.run_once(ids["channel_id"])
     assert "Tripmafia" in _travel_lines(tg, ids)
     assert "Hannibal Lecter" not in _travel_lines(tg, ids)
+    assert "Coco Jango Travel" not in _travel_lines(tg, ids)  # the listed one is out of the channel too
+
+
+async def _invite_service(db, name: str, invite_hash: str) -> int:
+    async with db.session() as s:
+        service = Service(
+            category_id=1,
+            name=name,
+            url=f"https://t.me/+{invite_hash}",
+            url_kind="tg_invite",
+            status="active",
+        )
+        s.add(service)
+        await s.commit()
+        return service.id
+
+
+def _canaries(tg) -> list[dict]:
+    return [
+        link for link in tg.chats[MAIN].get("_links", {}).values() if link.get("name") == "проверка ссылок"
+    ]
+
+
+async def test_an_invite_that_no_longer_works_is_dead(h, tg, db, ctx):
+    """t.me shows an expired or revoked invite as a page with a generic title: learnt from the bot's own."""
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    dead_id = await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
+    live_id = await _invite_service(db, "Live Group", "LiveGroupHash")
+    fetcher.invite("75LkzDoblPtlOGRi", None)  # "Join group chat on Telegram"
+    fetcher.invite("LiveGroupHash", "Live Group")
+    report = await checker.run_pass()
+    assert report.trust["invite"] is True
+    assert report.verdicts[dead_id].state == "dead" and "приглашение" in report.verdicts[dead_id].detail
+    assert report.verdicts[live_id].state == "alive"
+    canaries = _canaries(tg)  # a fresh one and a revoked one, both revoked after the pass
+    assert len(canaries) == 2 and all(link["is_revoked"] for link in canaries)
+    async with db.session() as s:
+        state = await get_settings(s, LinkCheckState)
+    assert state.dead_invite_fp == fingerprint("Join group chat on Telegram")
+    assert "приглашения — ок" in "\n".join(report_lines(state.last_report, "UTC"))
+
+    await checker.run_pass()
+    await checker.run_pass()
+    await _patch(db, dead_id, link_first_dead_at=utcnow() - timedelta(hours=49))
+    report = await checker.run_pass()
+    assert report.hidden == [dead_id]  # like any dead link: three checks over two days
+    assert checker.dead_invite == fingerprint("Join group chat on Telegram")
+    assert (await _service(db, "Live Group")).status == "active"
+
+
+async def test_invites_are_not_trusted_until_their_references_work(h, tg, db, ctx):
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    dead_id = await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
+    fetcher.invite("75LkzDoblPtlOGRi", None)
+    assert (await checker.run_pass()).verdicts[dead_id].state == "dead"
+    fetcher.tg = None  # t.me does not show the bot's own fresh invite: nothing to compare with
+    report = await checker.run_pass()
+    assert report.trust["invite"] is False and report.trust["tg"] is True
+    assert report.verdicts[dead_id].state == "unknown"  # "dead" is not trusted then
+    assert (await _service(db, "Rolex Fullz")).link_dead_streak == 1
+    assert "эталонные ссылки не сошлись (приглашения)" in h.last(OWNER_ID)["text"]
+
+    fetcher.tg = tg  # a dead invite without any title: the plain t.me rule tells, nothing to learn
+    fetcher.dead_invite_title = None
+    fetcher.pages.pop("https://t.me/+75LkzDoblPtlOGRi")
+    fetcher.invite("75LkzDoblPtlOGRi", None)
+    report = await checker.run_pass()
+    assert report.trust["invite"] is True and report.verdicts[dead_id].state == "dead"
+    assert checker.dead_invite is None
+
+
+async def test_without_a_channel_for_references_invites_go_by_the_t_me_ones(h, tg, db, ctx):
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    dead_id = await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
+    fetcher.dead_invite_title = None
+    fetcher.invite("75LkzDoblPtlOGRi", None)
+    tg.inject("createChatInviteLink", 400, "Bad Request: CHAT_ADMIN_REQUIRED", chat_id=MAIN)
+    report = await checker.run_pass()
+    assert report.trust == {"tg": True, "ext": True, "invite": True}
+    assert report.verdicts[dead_id].state == "dead"

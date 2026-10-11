@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from app.domain.linkcheck import Page
 
 USERNAMES = [
@@ -30,8 +32,13 @@ def tme_page(title: str | None, description: str = "") -> Page:
     return Page(200, body)
 
 
+DEAD_INVITE_TITLE = "Join group chat on Telegram"  # like t.me: an invite that no longer works has a page too
+
+
 class FakeFetcher:
-    def __init__(self) -> None:
+    def __init__(self, tg: Any = None) -> None:
+        self.tg = tg  # the invite links the bot makes there get their t.me pages
+        self.dead_invite_title: str | None = DEAD_INVITE_TITLE
         self.pages: dict[str, Page] = {}
         self.calls: list[tuple[str, str]] = []
         self.tme("alive_canary", "Alive canary")
@@ -44,9 +51,25 @@ class FakeFetcher:
     def tme(self, username: str, title: str | None, description: str = "") -> None:
         self.pages[f"https://t.me/{username}"] = tme_page(title, description)
 
+    def invite(self, invite_hash: str, title: str | None) -> None:
+        """The t.me page of t.me/+<hash>: the chat's title, or (None) an invite that no longer works."""
+        self.pages[f"https://t.me/+{invite_hash}"] = tme_page(title if title else self.dead_invite_title)
+
+    def _bot_invite(self, url: str) -> Page | None:
+        for chat in self.tg.chats.values() if self.tg is not None else ():
+            link = chat.get("_links", {}).get(url)
+            if link is not None:
+                return tme_page(self.dead_invite_title if link.get("is_revoked") else chat.get("title"))
+        return None
+
     async def fetch(self, url: str, method: str = "GET") -> Page:
         self.calls.append((method, url))
-        return self.pages.get(f"{method} {url}") or self.pages.get(url) or Page(None, error="network")
+        return (
+            self.pages.get(f"{method} {url}")
+            or self.pages.get(url)
+            or self._bot_invite(url)
+            or Page(None, error="network")
+        )
 
     async def close(self) -> None:
         return None

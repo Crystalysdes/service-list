@@ -9,9 +9,15 @@ link whose known title comes back within ``auto_restore_days`` returns by itself
 shown to staff first (its domain may have a new owner). A changed page title (another owner took the
 username) is reported to the admins instead of being trusted.
 
-"🗑 Удалить нерабочие" (admin) clears the services hidden for a dead link: one without an owner in the bot is
-removed; one with an owner stays down (``LINK_UPDATE``, no longer checked or brought back by itself) until a
-new link of its owner is approved, and the owner is told.
+Invite links (t.me/+…) have references of their own, made fresh every pass: the bot creates an invite link of
+its channel and another one it revokes at once. t.me shows a dead invite as an ordinary page with a generic
+title, so the revoked one teaches what that title is (``LinkCheckState.dead_invite_fp``), and the fresh one
+must still come out alive; until both do, "dead" verdicts of invites are not trusted.
+
+"🗑 Удалить нерабочие" (admin) clears the services whose link does not open (hidden for it, or still listed
+after a "dead" check): one without an owner in the bot is removed; one with an owner goes down
+(``LINK_UPDATE``, no longer checked or brought back by itself) until a new link of its owner is approved, and
+the owner is told.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from yarl import URL
 from app.bot.i18n import Translator, h
 from app.context import AppContext
 from app.db.base import utcnow
-from app.db.models import Category, LinkCheck, Order, Service, User
+from app.db.models import Category, Channel, LinkCheck, Order, Service, User
 from app.domain.linkcheck import (
     ALIVE,
     DEAD,
@@ -52,7 +58,7 @@ from app.domain.links import LOCAL_SUFFIXES, Link, try_normalize
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.notify import claim_notification, notify_staff, notify_user
-from app.services.settings import LinkCheckSettings, LinkCheckState, Runtime, get_settings, save_settings
+from app.services.settings import LinkCheckSettings, LinkCheckState, Runtime, get_settings, update_settings
 from app.services.timefmt import fmt_date, fmt_dt
 
 log = logging.getLogger(__name__)
@@ -205,8 +211,19 @@ class PassReport:
 
 
 def _group(url: str) -> str:
+    """Whose references decide if a "dead" verdict counts: t.me pages, invites (their own), sites."""
     link = try_normalize(url)
+    if link is not None and link.kind == "tg_invite":
+        return "invite"
     return "tg" if link is not None and link.is_telegram else "ext"
+
+
+CANARY_NAME = "проверка ссылок"  # the invite links the checker makes itself (revoked right after)
+
+
+def _invite_page(invite_link: str) -> str:
+    link = try_normalize(invite_link)
+    return f"https://t.me/+{link.invite}" if link is not None and link.invite else invite_link
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -242,24 +259,28 @@ LINK_UPDATE = "link_update"  # hidden until its owner gives a new link (after "�
 DEAD_REASONS = ("dead_link", LINK_UPDATE)  # an approved new link of the owner brings the service back
 
 
+# a link that does not open: hidden for it, or still listed after a "dead" check
+DEAD_NOW = or_(
+    (Service.status == "hidden") & (Service.hidden_reason == "dead_link"),
+    (Service.status == "active") & (Service.link_state == DEAD) & (Service.link_dead_streak > 0),
+)
+
+
 @dataclass
 class DeadSplit:
-    """The services hidden for a dead link: with an owner in the bot, and without one."""
+    """The services whose link does not open: with an owner in the bot, and without one."""
 
     owned: list[Service]
     lone: list[Service]
 
+    @property
+    def listed(self) -> int:
+        """Of them, still in the list."""
+        return sum(1 for s in (*self.owned, *self.lone) if s.status == "active")
+
 
 async def dead_split(session: AsyncSession) -> DeadSplit:
-    rows = list(
-        (
-            await session.execute(
-                select(Service)
-                .where(Service.status == "hidden", Service.hidden_reason == "dead_link")
-                .order_by(Service.id)
-            )
-        ).scalars()
-    )
+    rows = list((await session.execute(select(Service).where(DEAD_NOW).order_by(Service.id))).scalars())
     owner_ids = {s.owner_id for s in rows if s.owner_id}
     owners = set()
     if owner_ids:
@@ -294,6 +315,7 @@ async def remove_dead(session: AsyncSession, actor_id: int | None) -> Removal:
         await audit(session, actor_id, "service.remove_dead", "service", service.id)
     tell = []
     for service in split.owned:
+        service.status = "hidden"
         service.hidden_reason = LINK_UPDATE
         await audit(session, actor_id, "service.link_update", "service", service.id)
         sending = await moderation.open_request(session, service.id, "edit")
@@ -353,6 +375,8 @@ class LinkChecker:
         self.delay = delay  # None: LinkCheckSettings.request_delay_sec
         self._lock = asyncio.Lock()
         self.last_report: PassReport | None = None
+        self.dead_invite: str | None = None  # LinkCheckState.dead_invite_fp, read once
+        self._dead_invite_loaded = False
 
     @property
     def running(self) -> bool:
@@ -372,7 +396,7 @@ class LinkChecker:
             if link.kind == "tg_username":
                 return await self._username(link)
             if link.kind == "tg_invite":
-                return tme_verdict(await self.fetcher.fetch(f"https://t.me/+{link.invite}"))
+                return await self._invite(link)
             if link.kind == "tg_post":
                 return post_verdict(
                     await self.fetcher.fetch(f"https://t.me/{link.username}/{link.post_id}?embed=1&mode=tme")
@@ -398,6 +422,75 @@ class LinkChecker:
                 title = chat.title or " ".join(filter(None, [chat.first_name, chat.last_name])) or None
                 return Verdict(ALIVE, "getChat", title=title, fingerprint=fingerprint(title))
         return tme_verdict(await self.fetcher.fetch(f"https://t.me/{link.username}"))
+
+    async def _invite(self, link: Link) -> Verdict:
+        """A t.me/+ page: an invite that no longer works still has a page, with the generic title learned from
+        the bot's own revoked invite (``invite_canaries``)."""
+        verdict = tme_verdict(await self.fetcher.fetch(f"https://t.me/+{link.invite}"))
+        if (
+            verdict.state == ALIVE
+            and verdict.fingerprint
+            and verdict.fingerprint == await self._dead_invite()
+        ):
+            return Verdict(DEAD, "t.me: приглашение недействительно или устарело", title=verdict.title)
+        return verdict
+
+    async def _dead_invite(self) -> str | None:
+        if not self._dead_invite_loaded:
+            async with self.ctx.db.session() as session:
+                self.dead_invite = (await get_settings(session, LinkCheckState)).dead_invite_fp
+            self._dead_invite_loaded = True
+        return self.dead_invite
+
+    async def invite_canaries(self) -> bool | None:
+        """A fresh invite link of the bot's channel must come out alive and one revoked at once dead; the page
+        of the revoked one shows what a dead invite looks like on t.me (its title is kept). None when the bot
+        cannot make invite links in any of its channels: invites are then judged like other t.me links."""
+        bot = self.ctx.bot
+        if bot is None:
+            return None
+        async with self.ctx.db.session() as session:
+            chats = list(
+                (
+                    await session.execute(
+                        select(Channel.chat_id)
+                        .where(Channel.status.not_in(("retired", "migrating", "broken")))
+                        .order_by(Channel.role != "main", Channel.id)
+                    )
+                ).scalars()
+            )
+        for chat_id in chats:
+            try:
+                alive = await bot.create_chat_invite_link(chat_id, name=CANARY_NAME, member_limit=1)
+                dead = await bot.create_chat_invite_link(chat_id, name=CANARY_NAME, member_limit=1)
+                await bot.revoke_chat_invite_link(chat_id, dead.invite_link)
+            except TelegramAPIError as exc:
+                log.info("no invite references in %s: %s", chat_id, exc.message)
+                continue
+            try:
+                alive_page = await self.fetcher.fetch(_invite_page(alive.invite_link))
+                dead_page = await self.fetcher.fetch(_invite_page(dead.invite_link))
+            finally:
+                with contextlib.suppress(TelegramAPIError):
+                    await bot.revoke_chat_invite_link(chat_id, alive.invite_link)
+            return await self._learn_dead_invite(tme_verdict(alive_page), tme_verdict(dead_page))
+        return None
+
+    async def _learn_dead_invite(self, alive: Verdict, dead: Verdict) -> bool:
+        if alive.state != ALIVE:
+            return False
+        if dead.state == DEAD:
+            learned = None  # a dead invite has no title: the plain t.me rule tells
+        elif dead.state == ALIVE and dead.fingerprint and dead.fingerprint != alive.fingerprint:
+            learned = dead.fingerprint
+        else:
+            return False
+        if learned != await self._dead_invite():
+            async with self.ctx.db.session() as session:
+                await update_settings(session, LinkCheckState, dead_invite_fp=learned)
+                await session.commit()
+            self.dead_invite = learned
+        return True
 
     async def _external(self, url: str) -> Verdict:
         head = await self.fetcher.fetch(url, "HEAD")
@@ -430,6 +523,8 @@ class LinkChecker:
         for group in trust:  # a group needs both an alive and a dead reference
             if (group, ALIVE) not in seen or (group, DEAD) not in seen:
                 trust[group] = False
+        invites = await self.invite_canaries()
+        trust["invite"] = trust["tg"] if invites is None else invites and trust["tg"]
         return trust
 
     async def canary_check(self) -> Any:
@@ -437,7 +532,10 @@ class LinkChecker:
 
         trust = await self.canaries()
         status = {True: "ок", False: "не сошлись"}
-        detail = f"t.me — {status[trust['tg']]}, сайты — {status[trust['ext']]}"
+        detail = (
+            f"t.me — {status[trust['tg']]}, сайты — {status[trust['ext']]}, "
+            f"приглашения — {status[trust['invite']]}"
+        )
         return Check("Эталонные ссылки (проверка мёртвых ссылок)", trust["tg"], detail)
 
     async def due(self) -> bool:
@@ -517,8 +615,8 @@ class LinkChecker:
             report.finished_at = utcnow()
             if mode != "import":
                 async with self.ctx.db.session() as session:
-                    await save_settings(
-                        session, LinkCheckState(last_pass_at=report.started_at, last_report=report.to_json())
+                    await update_settings(
+                        session, LinkCheckState, last_pass_at=report.started_at, last_report=report.to_json()
                     )
                     await session.commit()
             await self._alerts(report, len(new_dead))
@@ -722,7 +820,8 @@ class LinkChecker:
                 await notify_user(self.ctx, owner.id, t("lnk.restored", name=name))
 
     async def _alerts(self, report: PassReport, new_dead: int) -> None:
-        failed = [name for group, name in (("tg", "t.me"), ("ext", "сайты")) if not report.trust.get(group)]
+        groups = (("tg", "t.me"), ("ext", "сайты"), ("invite", "приглашения"))
+        failed = [name for group, name in groups if group in report.trust and not report.trust[group]]
         if failed:
             async with self.ctx.db.session() as session:
                 first = await claim_notification(
@@ -808,10 +907,13 @@ def report_lines(data: dict[str, Any], tz: str) -> list[str]:
     if changes:
         lines.append("Изменения: " + changes)
     trust = data.get("trust") or {}
-    lines.append(
+    references = (
         f"Эталоны: t.me — {'ок' if trust.get('tg') else 'не сошлись'}, "
         f"сайты — {'ок' if trust.get('ext') else 'не сошлись'}"
     )
+    if "invite" in trust:
+        references += f", приглашения — {'ок' if trust['invite'] else 'не сошлись'}"
+    lines.append(references)
     if data.get("breaker"):
         lines.append("🛑 Сработал предохранитель — результаты не применены.")
     return lines

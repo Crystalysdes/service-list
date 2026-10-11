@@ -345,6 +345,9 @@ class LinkCheckState(SettingsGroup):
 
     last_pass_at: datetime | None = None
     last_report: dict[str, Any] = Field(default_factory=dict)
+    # how t.me shows an invite link that no longer works: the title fingerprint of the page of an invite the
+    # bot made and revoked itself (None: such a page has no title)
+    dead_invite_fp: str | None = None
 
 
 class Runtime(SettingsGroup):
