@@ -31,6 +31,7 @@ from app.services.linkcheck import (
     remove_dead,
     report_lines,
     restore_service,
+    service_link,
     start_background_pass,
     tell_link_update,
 )
@@ -187,7 +188,8 @@ async def _hidden_screen(session: AsyncSession) -> tuple[str, Any]:
     lines = ["🙈 <b>Скрыты из-за ссылки</b>", ""]
     for service, category in rows:
         why = WHY_HIDDEN.get(service.hidden_reason or "", "скрыт")
-        lines.append(f"• {h(service.name)} ({h(category.title)}) — {h(service.url)}, {why}")
+        link = service_link(service) or "—"
+        lines.append(f"• {h(service.name)} ({h(category.title)}) — {h(link)}, {why}")
         builder.button(text=f"♻️ {service.name[:40]}", callback_data=f"a:links:restore:{service.id}")
     if not rows:
         lines.append("Скрытых сервисов нет.")
@@ -210,8 +212,9 @@ async def _fp_screen(session: AsyncSession) -> tuple[str, Any]:
     lines = ["⚠️ <b>Сменилось название по ссылке</b>", ""]
     for service in rows:
         extra = service.extra or {}
+        link = service_link(service) or "—"
         lines.append(
-            f"• {h(service.name)} — {h(service.url)}: «{h(extra.get('link_title') or '?')}» → "
+            f"• {h(service.name)} — {h(link)}: «{h(extra.get('link_title') or '?')}» → "
             f"«{h(extra.get('fp_title') or '?')}»"
         )
         builder.button(text=f"✅ {service.name[:25]}", callback_data=f"a:links:fpok:{service.id}")
@@ -384,6 +387,11 @@ async def on_purge_yes(call: CallbackQuery, session: AsyncSession, **data: Any) 
 VERDICT_NAMES = {ALIVE: "✅ открывается", DEAD: "❌ не открывается"}
 
 
+def _normal(url: str | None) -> str | None:
+    link = try_normalize(url) if url else None
+    return link.url if link is not None else None
+
+
 @router.callback_query(F.data == "a:links:probe")
 async def on_probe(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
     await ask(
@@ -426,13 +434,8 @@ async def input_probe(message: Message, data: dict[str, Any], fsm: dict[str, Any
             else ("страница без названия" if state.dead_invite_fp is None else "известен")
         )
         lines.append(f"Мёртвое приглашение t.me показывает так (по отозванному приглашению бота): {sample}.")
-    services = list(
-        (
-            await session.execute(
-                select(Service).where(Service.url == link.url, Service.status != "removed").limit(5)
-            )
-        ).scalars()
-    )
+    rows = (await session.execute(select(Service).where(Service.status != "removed"))).scalars()
+    services = [s for s in rows if _normal(service_link(s)) == link.url][:5]
     for service in services:
         reason = f", {service.hidden_reason}" if service.hidden_reason else ""
         lines.append(

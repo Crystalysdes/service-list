@@ -473,3 +473,49 @@ async def test_without_a_channel_for_references_invites_go_by_the_t_me_ones(h, t
     report = await checker.run_pass()
     assert report.trust == {"tg": True, "ext": True, "invite": True}
     assert report.verdicts[dead_id].state == "dead"
+
+
+async def _raw_service(db, name: str, raw: dict, url_kind: str = "external") -> int:
+    """A line imported as it was written: no link of its own, the line itself is shown."""
+    async with db.session() as s:
+        service = Service(
+            category_id=1,
+            name=name,
+            url="",
+            url_kind=url_kind,
+            raw_fragment=raw,
+            status="active",
+            source="import",
+        )
+        s.add(service)
+        await s.commit()
+        return service.id
+
+
+async def test_a_line_imported_as_written_is_checked_by_the_link_in_it(h, tg, db, ctx):
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    named = {"type": "text_link", "offset": 0, "length": 11, "url": "https://t.me/+Y3KsoupeeUk5ZmZi"}
+    rolex = await _raw_service(db, "ROLEX FULLZ", {"text": "ROLEX FULLZ — лучшие", "entities": [named]})
+    written = {"type": "url", "offset": 6, "length": 30}
+    rg = await _raw_service(
+        db, "RG AK", {"text": "RG AK https://t.me/+75LkzDoblPtlOGRi", "entities": [written]}
+    )
+    mention = {"type": "mention", "offset": 9, "length": 10}
+    trip = await _raw_service(db, "Trip Raw", {"text": "Trip Raw @tripmafia", "entities": [mention]})
+    note = await _raw_service(db, "—", {"text": "Ниже — проверенные", "entities": []}, url_kind="note")
+    fetcher.invite("Y3KsoupeeUk5ZmZi", None)
+    fetcher.invite("75LkzDoblPtlOGRi", None)
+    report = await checker.run_pass()
+    assert sorted(report.hidden) == sorted([rolex, rg])  # the dead invites in the lines themselves
+    assert report.verdicts[trip].state == "alive"
+    assert note not in report.verdicts  # a line without any link is not a check that failed
+
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Ссылки")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Скрытые")
+    hidden = h.last(OWNER_ID)["text"]
+    assert "• ROLEX FULLZ (" in hidden and ") — https://t.me/+Y3KsoupeeUk5ZmZi, не открывается" in hidden
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Назад")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Проверить одну ссылку")
+    await h.say(OWNER_ID, "https://t.me/+Y3KsoupeeUk5ZmZi")
+    assert "• Сервис «ROLEX FULLZ»: hidden, dead_link" in h.last(OWNER_ID)["text"]

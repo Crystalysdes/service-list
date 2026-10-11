@@ -23,6 +23,7 @@ from app.domain.richtext import Fragment
 from app.services import billing, catalog
 from app.services.audit import audit
 from app.services.claims import CLAIMABLE
+from app.services.linkcheck import service_link
 from app.services.purchases import listing_renewable
 from app.services.render_db import category_services
 from app.services.settings import Limits, Prices, get_settings
@@ -443,7 +444,7 @@ async def _service_card(session: AsyncSession, service: Service, tz: str) -> tup
             owner_text += " — сам привязывает через «🙋 Это мой сервис» или назначьте кнопкой «👤 Владелец»"
     lines = [
         f"🧩 <b>{h(service.name)}</b>",
-        f"Ссылка: {h(service.url or '—')}",
+        f"Ссылка: {h(service.url)}" if service.url else f"Ссылка в строке: {h(service_link(service) or '—')}",
         f"Ветка: {h(service.category.title)}",
         f"Статус: {service.status}" + (f" ({service.hidden_reason})" if service.hidden_reason else ""),
         f"Владелец: {h(owner_text)}",

@@ -19,6 +19,7 @@ from app.db.models import Category, ModerationRequest, Service
 from app.domain.links import LinkError, clean_text, normalize, without_emoji
 from app.services import billing, moderation
 from app.services.catalog import request_sync
+from app.services.linkcheck import service_link
 from app.services.purchases import listing_renewable, listing_state
 from app.services.render_db import active_feature, category_services
 from app.services.settings import Limits, Prices, get_settings
@@ -82,7 +83,7 @@ async def card_text(session: AsyncSession, service: Service, t: Translator, tz: 
             "my.card",
             name=h(service.name),
             category=h(category.title if category else ""),
-            url=h(service.url),
+            url=h(service_link(service) or service.url),
             status=t("status." + service.status),
         )
     ]

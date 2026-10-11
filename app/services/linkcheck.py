@@ -14,6 +14,10 @@ its channel and another one it revokes at once. t.me shows a dead invite as an o
 title, so the revoked one teaches what that title is (``LinkCheckState.dead_invite_fp``), and the fresh one
 must still come out alive; until both do, "dead" verdicts of invites are not trusted.
 
+A line imported as it was written (``raw_fragment``: it did not fit the usual form) has no link of its own:
+the link in it is checked, the first text link, else a plain URL, else an @username (``service_link``).
+Lines without any link (notes) are not checked at all.
+
 "🗑 Удалить нерабочие" (admin) clears the services whose link does not open (hidden for it, or still listed
 after a "dead" check): one without an owner in the bot is removed; one with an owner goes down
 (``LINK_UPDATE``, no longer checked or brought back by itself) until a new link of its owner is approved, and
@@ -55,6 +59,7 @@ from app.domain.linkcheck import (
     tme_verdict,
 )
 from app.domain.links import LOCAL_SUFFIXES, Link, try_normalize
+from app.domain.richtext import Fragment
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.notify import claim_notification, notify_staff, notify_user
@@ -256,6 +261,28 @@ def hide_for_dead_link(service: Service, settings: LinkCheckSettings, now: datet
     service.extra = {**(service.extra or {}), "dead_hidden_at": now.isoformat()}
 
 
+def service_link(service: Service) -> str | None:
+    """The link a service's line leads to: its own, or for a line imported as it was written, the first text
+    link in it, else a plain URL, else an @username. None for a line without any (a note)."""
+    if service.url:
+        return service.url
+    if service.url_kind == "note" or not service.raw_fragment:
+        return None
+    fragment = Fragment.from_json(service.raw_fragment)
+    found: dict[str, str] = {}
+    for entity in fragment.sorted_entities():
+        if entity.type == "text_link" and entity.url:
+            candidate = entity.url
+        elif entity.type in ("url", "mention"):
+            candidate = fragment.entity_text(entity)
+        else:
+            continue
+        link = try_normalize(candidate)
+        if link is not None:
+            found.setdefault(entity.type, link.url)
+    return found.get("text_link") or found.get("url") or found.get("mention")
+
+
 LINK_UPDATE = "link_update"  # hidden until its owner gives a new link (after "🗑 Удалить нерабочие")
 DEAD_REASONS = ("dead_link", LINK_UPDATE)  # an approved new link of the owner brings the service back
 
@@ -340,7 +367,7 @@ async def tell_link_update(ctx: AppContext, service_ids: list[int]) -> tuple[int
         builder.button(text=t("lnk.change"), callback_data=f"my:{service.id}:ef:url")
         builder.button(text=t("pay.manage"), callback_data=f"my:{service.id}")
         builder.adjust(1)
-        text = t("lnk.update", name=h(service.name), url=h(service.url))
+        text = t("lnk.update", name=h(service.name), url=h(service_link(service) or service.url))
         if await notify_user(ctx, owner.id, text, reply_markup=builder.as_markup()):
             delivered += 1
         else:
@@ -569,7 +596,10 @@ class LinkChecker:
                 hidden_at = _parse_dt((service.extra or {}).get("dead_hidden_at"))
                 if hidden_at is not None and now - hidden_at > timedelta(days=settings.auto_restore_days):
                     continue
-            targets.append((service.id, service.url, service.link_state or "unknown"))
+            link = service_link(service)
+            if link is None:  # a line without any link: nothing to check
+                continue
+            targets.append((service.id, link, service.link_state or "unknown"))
         return targets
 
     async def run_pass(
@@ -629,7 +659,7 @@ class LinkChecker:
         async with self.ctx.db.session() as session:
             for service_id, url, _previous, verdict in checked:
                 service = await session.get(Service, service_id)
-                if service is None or service.url != url:  # edited while the pass was running
+                if service is None or service_link(service) != url:  # edited while the pass was running
                     continue
                 session.add(
                     LinkCheck(
@@ -759,7 +789,8 @@ class LinkChecker:
                     continue
                 category = await session.get(Category, service.category_id)
                 owner = await session.get(User, service.owner_id) if service.owner_id else None
-            name, where, url = h(service.name), h(category.title if category else "?"), h(service.url)
+            where = h(category.title if category else "?")
+            name, url = h(service.name), h(service_link(service) or service.url)
             staff = InlineKeyboardBuilder()
             has_buttons = kind in ("hidden", "takeover", "back")
             text = ""
