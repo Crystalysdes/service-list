@@ -219,6 +219,7 @@ def _group(url: str) -> str:
 
 
 CANARY_NAME = "проверка ссылок"  # the invite links the checker makes itself (revoked right after)
+INVITE_DEAD = "t.me: приглашение недействительно или устарело"
 
 
 def _invite_page(invite_link: str) -> str:
@@ -427,12 +428,10 @@ class LinkChecker:
         """A t.me/+ page: an invite that no longer works still has a page, with the generic title learned from
         the bot's own revoked invite (``invite_canaries``)."""
         verdict = tme_verdict(await self.fetcher.fetch(f"https://t.me/+{link.invite}"))
-        if (
-            verdict.state == ALIVE
-            and verdict.fingerprint
-            and verdict.fingerprint == await self._dead_invite()
-        ):
-            return Verdict(DEAD, "t.me: приглашение недействительно или устарело", title=verdict.title)
+        dead = await self._dead_invite()
+        generic = verdict.state == ALIVE and verdict.fingerprint is not None and verdict.fingerprint == dead
+        if generic or verdict.state == DEAD:  # Telegram does not take such an invite back: dead for good
+            return Verdict(DEAD, INVITE_DEAD, title=verdict.title, final=True)
         return verdict
 
     async def _dead_invite(self) -> str | None:
@@ -480,14 +479,16 @@ class LinkChecker:
         if alive.state != ALIVE:
             return False
         if dead.state == DEAD:
-            learned = None  # a dead invite has no title: the plain t.me rule tells
+            learned, title = None, None  # a dead invite has no title: the plain t.me rule tells
         elif dead.state == ALIVE and dead.fingerprint and dead.fingerprint != alive.fingerprint:
-            learned = dead.fingerprint
+            learned, title = dead.fingerprint, dead.title
         else:
             return False
         if learned != await self._dead_invite():
             async with self.ctx.db.session() as session:
-                await update_settings(session, LinkCheckState, dead_invite_fp=learned)
+                await update_settings(
+                    session, LinkCheckState, dead_invite_fp=learned, dead_invite_title=title
+                )
                 await session.commit()
             self.dead_invite = learned
         return True
@@ -589,16 +590,13 @@ class LinkChecker:
                 if verdict.state == DEAD and not report.trust.get(_group(url), False):
                     verdict = Verdict(UNKNOWN, "эталоны не сошлись", verdict.title, verdict.fingerprint)
                 checked.append((service_id, url, previous, verdict))
-            new_dead = [c for c in checked if c[3].state == DEAD and c[2] != DEAD]
+            # dead invites checked against this pass's own references are no sign of trouble: not counted
+            new_dead = [c for c in checked if c[3].state == DEAD and c[2] != DEAD and not c[3].final]
             if mode != "import" and len(new_dead) > max(2, settings.breaker_ratio * len(checked)):
                 report.breaker = True
+                held = {c[0] for c in new_dead}
                 checked = [
-                    (
-                        sid,
-                        url,
-                        prev,
-                        Verdict(UNKNOWN, "предохранитель") if v.state == DEAD and prev != DEAD else v,
-                    )
+                    (sid, url, prev, Verdict(UNKNOWN, "предохранитель") if sid in held else v)
                     for sid, url, prev, v in checked
                 ]
             for service_id, _url, _previous, verdict in checked:
@@ -728,9 +726,11 @@ class LinkChecker:
             return
         # the owner learns at once, while the service is still listed, and can replace the link in time
         first_warning = service.link_dead_streak == 1 and service.owner_id is not None
-        if service.link_dead_streak < settings.dead_streak or now - service.link_first_dead_at < timedelta(
-            hours=settings.dead_min_hours
-        ):
+        waiting = (
+            service.link_dead_streak < settings.dead_streak
+            or now - service.link_first_dead_at < timedelta(hours=settings.dead_min_hours)
+        )
+        if waiting and not verdict.final:  # a dead invite does not wait: it does not come back
             if first_warning:
                 notices.append(("dead", service.id, {"detail": verdict.detail}))
             return

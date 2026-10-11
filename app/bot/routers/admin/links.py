@@ -9,16 +9,19 @@ from typing import Any
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, LinkPreviewOptions
+from aiogram.types import CallbackQuery, InlineKeyboardButton, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import RoleFilter
 from app.bot.i18n import h
+from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
 from app.db.models import Category, Service
+from app.domain.linkcheck import ALIVE, DEAD
+from app.domain.links import try_normalize
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.linkcheck import (
@@ -96,6 +99,7 @@ async def _screen(session: AsyncSession, ctx: AppContext) -> tuple[str, Any]:
     if dead:
         builder.button(text=f"🗑 Удалить нерабочие ({dead})", callback_data="a:links:purge")
     builder.button(text=f"⚠️ Смена названия ({review or 0})", callback_data="a:links:fp")
+    builder.button(text="🔎 Проверить одну ссылку", callback_data="a:links:probe")
     builder.button(
         text="⏸ Выключить автопроверку" if settings.enabled else "▶️ Включить автопроверку",
         callback_data="a:links:toggle",
@@ -135,14 +139,25 @@ async def on_run(call: CallbackQuery, **data: Any) -> None:
     chat_id = call.message.chat.id
 
     async def done(report: Any) -> None:
+        builder = InlineKeyboardBuilder()
         if report is None:
             text = "❌ Проверка ссылок завершилась с ошибкой, подробности в логе бота."
         else:
             text = "✅ <b>Проверка ссылок завершена</b>\n\n" + "\n".join(
                 report_lines(report.to_json(), ctx.config.timezone)
             )
-        builder = InlineKeyboardBuilder()
+            async with ctx.db.session() as session:
+                split = await dead_split(session)
+            dead = len(split.owned) + len(split.lone)
+            if dead:  # the ones still listed go by themselves only after several checks: here, at once
+                text += (
+                    f"\n\nСсылка не открывается у {dead} сервисов (ещё в списке — {split.listed}). "
+                    "Убрать их сейчас — кнопка ниже: без владельца удалятся, с владельцем снимутся до новой "
+                    "ссылки, а владельцы получат уведомление."
+                )
+                builder.button(text=f"🗑 Удалить нерабочие ({dead})", callback_data="a:links:purge")
         builder.button(text="🔗 К проверке ссылок", callback_data="a:links")
+        builder.adjust(1)
         await ctx.bot.send_message(chat_id, text, reply_markup=builder.as_markup())  # type: ignore[union-attr]
 
     if start_background_pass(ctx, "manual", done):
@@ -364,3 +379,69 @@ async def on_purge_yes(call: CallbackQuery, session: AsyncSession, **data: Any) 
     builder = InlineKeyboardBuilder()
     builder.button(text="🔗 К проверке ссылок", callback_data="a:links")
     await _edit(call, ("\n".join(lines), builder.as_markup()))
+
+
+VERDICT_NAMES = {ALIVE: "✅ открывается", DEAD: "❌ не открывается"}
+
+
+@router.callback_query(F.data == "a:links:probe")
+async def on_probe(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
+    await ask(
+        call,
+        state,
+        "link_probe",
+        "🔎 Пришлите ссылку — бот проверит её так же, как при проверке ссылок, и покажет, что видит.",
+        back="a:links",
+    )
+
+
+@input_handler("link_probe")
+async def input_probe(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
+    """What the checker sees for one link: its verdict, the page's title and, for an invite, how t.me shows a
+    dead one; and the services with this link."""
+    ctx: AppContext = data["ctx"]
+    session: AsyncSession = data["session"]
+    checker = ctx.get("linkcheck")
+    link = try_normalize(message.text or "")
+    if link is None:
+        await message.answer("Это не похоже на ссылку. Пришлите ссылку целиком, например https://t.me/+AbCd…")
+        return False
+    if checker is None:
+        await message.answer("Проверка ссылок сейчас недоступна.")
+        return True
+    verdict = await checker.check(link.url)
+    state = await get_settings(session, LinkCheckState)
+    lines = [
+        "🔎 <b>Проверка ссылки</b>",
+        "",
+        f"Ссылка: {h(link.url)}",
+        f"Итог: {VERDICT_NAMES.get(verdict.state, '❔ не удалось проверить')} — {h(verdict.detail)}",
+    ]
+    if verdict.title:
+        lines.append(f"Название на странице: «{h(verdict.title)}»")
+    if link.kind == "tg_invite":
+        sample = (
+            f"страница с заголовком «{h(state.dead_invite_title)}»"
+            if state.dead_invite_title
+            else ("страница без названия" if state.dead_invite_fp is None else "известен")
+        )
+        lines.append(f"Мёртвое приглашение t.me показывает так (по отозванному приглашению бота): {sample}.")
+    services = list(
+        (
+            await session.execute(
+                select(Service).where(Service.url == link.url, Service.status != "removed").limit(5)
+            )
+        ).scalars()
+    )
+    for service in services:
+        reason = f", {service.hidden_reason}" if service.hidden_reason else ""
+        lines.append(
+            f"• Сервис «{h(service.name)}»: {service.status}{reason}, «мёртвых» проверок подряд "
+            f"{service.link_dead_streak or 0}"
+        )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔎 Ещё ссылку", callback_data="a:links:probe")
+    builder.button(text="🔗 К проверке ссылок", callback_data="a:links")
+    builder.adjust(1)
+    await message.answer("\n".join(lines), reply_markup=builder.as_markup(), link_preview_options=NO_PREVIEW)
+    return True

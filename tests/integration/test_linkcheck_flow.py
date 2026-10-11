@@ -381,7 +381,8 @@ def _canaries(tg) -> list[dict]:
 
 
 async def test_an_invite_that_no_longer_works_is_dead(h, tg, db, ctx):
-    """t.me shows an expired or revoked invite as a page with a generic title: learnt from the bot's own."""
+    """t.me shows an expired or revoked invite as a page with a generic title: learnt from the bot's own. Such
+    an invite does not come back, so its service is hidden at the first check."""
     _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
     dead_id = await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
     live_id = await _invite_service(db, "Live Group", "LiveGroupHash")
@@ -391,20 +392,54 @@ async def test_an_invite_that_no_longer_works_is_dead(h, tg, db, ctx):
     assert report.trust["invite"] is True
     assert report.verdicts[dead_id].state == "dead" and "приглашение" in report.verdicts[dead_id].detail
     assert report.verdicts[live_id].state == "alive"
+    assert report.hidden == [dead_id]  # at once: no three checks over two days for an invite
     canaries = _canaries(tg)  # a fresh one and a revoked one, both revoked after the pass
     assert len(canaries) == 2 and all(link["is_revoked"] for link in canaries)
     async with db.session() as s:
         state = await get_settings(s, LinkCheckState)
     assert state.dead_invite_fp == fingerprint("Join group chat on Telegram")
+    assert state.dead_invite_title == "Join group chat on Telegram"
     assert "приглашения — ок" in "\n".join(report_lines(state.last_report, "UTC"))
-
-    await checker.run_pass()
-    await checker.run_pass()
-    await _patch(db, dead_id, link_first_dead_at=utcnow() - timedelta(hours=49))
-    report = await checker.run_pass()
-    assert report.hidden == [dead_id]  # like any dead link: three checks over two days
-    assert checker.dead_invite == fingerprint("Join group chat on Telegram")
     assert (await _service(db, "Live Group")).status == "active"
+
+
+async def test_dead_invites_go_even_when_the_breaker_holds_the_rest(h, tg, db, ctx):
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    invites = []
+    for n in range(4):
+        invites.append(await _invite_service(db, f"Dead Group {n}", f"DeadHash{n}"))
+        fetcher.invite(f"DeadHash{n}", None)
+    for username in ("lvtravel", "hoteltraffic", "tripmafia"):  # many usernames dying at once: suspicious
+        fetcher.tme(username, None)
+    report = await checker.run_pass()
+    assert report.breaker and sorted(report.hidden) == sorted(invites)
+    assert (await _service(db, "Tripmafia")).link_dead_streak == 0  # held back
+
+
+async def test_the_check_offers_to_remove_and_one_link_can_be_probed(h, tg, db, ctx):
+    _ids, _engine, _checker, fetcher = await _setup(tg, db, ctx)
+    await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
+    fetcher.invite("75LkzDoblPtlOGRi", None)
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Ссылки")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Проверить сейчас")
+    await asyncio.gather(*list(ctx.services.get("linkcheck_tasks", ())))
+    summary = h.last(OWNER_ID)
+    assert "Проверка ссылок завершена" in summary["text"] and "приглашения — ок" in summary["text"]
+    assert "Ссылка не открывается у 1 сервисов" in summary["text"]
+    assert h.button(summary, "Удалить нерабочие (1)")["callback_data"] == "a:links:purge"
+
+    await h.press(OWNER_ID, summary, "К проверке ссылок")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Проверить одну ссылку")
+    await h.say(OWNER_ID, "https://t.me/+75LkzDoblPtlOGRi")
+    probe = h.last(OWNER_ID)["text"]
+    assert "❌ не открывается — t.me: приглашение недействительно или устарело" in probe
+    assert "Название на странице: «Join group chat on Telegram»" in probe
+    assert "показывает так (по отозванному приглашению бота): страница с заголовком «Join group" in probe
+    assert "• Сервис «Rolex Fullz»: hidden, dead_link" in probe
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Ещё ссылку")
+    await h.say(OWNER_ID, "https://t.me/tripmafia")
+    assert "✅ открывается" in h.last(OWNER_ID)["text"]
 
 
 async def test_invites_are_not_trusted_until_their_references_work(h, tg, db, ctx):
@@ -412,11 +447,12 @@ async def test_invites_are_not_trusted_until_their_references_work(h, tg, db, ct
     dead_id = await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
     fetcher.invite("75LkzDoblPtlOGRi", None)
     assert (await checker.run_pass()).verdicts[dead_id].state == "dead"
+    streak = (await _service(db, "Rolex Fullz")).link_dead_streak
     fetcher.tg = None  # t.me does not show the bot's own fresh invite: nothing to compare with
     report = await checker.run_pass()
     assert report.trust["invite"] is False and report.trust["tg"] is True
     assert report.verdicts[dead_id].state == "unknown"  # "dead" is not trusted then
-    assert (await _service(db, "Rolex Fullz")).link_dead_streak == 1
+    assert (await _service(db, "Rolex Fullz")).link_dead_streak == streak
     assert "эталонные ссылки не сошлись (приглашения)" in h.last(OWNER_ID)["text"]
 
     fetcher.tg = tg  # a dead invite without any title: the plain t.me rule tells, nothing to learn

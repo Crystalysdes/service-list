@@ -38,6 +38,9 @@ class Verdict:
     detail: str = ""
     title: str | None = None  # human readable page / chat title
     fingerprint: str | None = None  # normalized title, to notice a username takeover
+    # dead for good: an invite link Telegram no longer accepts (checked against fresh references) does not
+    # come back, so it is hidden at once and is not held back by the breaker
+    final: bool = False
 
     @property
     def usable(self) -> str:

@@ -348,6 +348,7 @@ class LinkCheckState(SettingsGroup):
     # how t.me shows an invite link that no longer works: the title fingerprint of the page of an invite the
     # bot made and revoked itself (None: such a page has no title)
     dead_invite_fp: str | None = None
+    dead_invite_title: str | None = None  # that title as t.me shows it (for the admins)
 
 
 class Runtime(SettingsGroup):
