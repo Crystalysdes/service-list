@@ -1,5 +1,6 @@
 """Admin: dead-link checker — status, manual pass, hidden services, title changes (username takeover), removal
-of the dead links (owners keep their services down until they give a new link)."""
+of the dead links (owners keep their services down until they give a new link), one link checked on its own
+(with what the last pass made of the services that have it, and their removal at once)."""
 
 from __future__ import annotations
 
@@ -19,15 +20,19 @@ from app.bot.i18n import h
 from app.bot.routers.admin.inputs import ask, input_handler
 from app.bot.routers.admin.panel import back_home
 from app.context import AppContext
-from app.db.models import Category, Service
+from app.db.base import utcnow
+from app.db.models import Category, LinkCheck, Service
 from app.domain.linkcheck import ALIVE, DEAD
 from app.domain.links import try_normalize
 from app.services.audit import audit
 from app.services.catalog import request_sync
 from app.services.linkcheck import (
+    CHECKED,
     DEAD_NOW,
     LINK_UPDATE,
     dead_split,
+    last_checks,
+    record_dead,
     remove_dead,
     report_lines,
     restore_service,
@@ -36,6 +41,7 @@ from app.services.linkcheck import (
     tell_link_update,
 )
 from app.services.settings import LinkCheckSettings, LinkCheckState, get_settings, update_settings
+from app.services.timefmt import fmt_dt
 
 router = Router(name="admin_links")
 router.callback_query.filter(RoleFilter("admin"))
@@ -385,11 +391,63 @@ async def on_purge_yes(call: CallbackQuery, session: AsyncSession, **data: Any) 
 
 
 VERDICT_NAMES = {ALIVE: "✅ открывается", DEAD: "❌ не открывается"}
+UNCHECKED = "❔ не удалось проверить"
+STATUS_NAMES = {
+    "pending": "на модерации",
+    "approved": "одобрен, ещё не в списке",
+    "banned": "заблокирован",
+    "rejected": "отклонён",
+}
+WHY_DOWN = {
+    **WHY_HIDDEN,
+    "expired": "истёк срок размещения",
+    "unpaid": "не оплачен",
+    "scam": "скам по жалобе",
+    "admin": "вручную администратором",
+    "owner": "самим владельцем",
+}
+PROBE_SERVICES = 5  # services shown (and removable) under one checked link
 
 
 def _normal(url: str | None) -> str | None:
     link = try_normalize(url) if url else None
     return link.url if link is not None else None
+
+
+def _where(service: Service, tz: str) -> str:
+    """Where a service is now, for the one-link check."""
+    if service.status == "active":
+        text = "в списке"
+        if service.link_grace_until is not None:
+            text += f", владельцу дано время на замену ссылки до {fmt_dt(service.link_grace_until, tz)}"
+    elif service.status == "hidden":
+        reason = service.hidden_reason or ""
+        text = "скрыт: " + WHY_DOWN.get(reason, reason or "вручную")
+    else:
+        text = STATUS_NAMES.get(service.status, service.status)
+    if service.link_dead_streak:
+        text += f", «мёртвых» проверок подряд {service.link_dead_streak}"
+    return text
+
+
+def _last_check(check: LinkCheck | None, tz: str) -> str:
+    if check is None:
+        return "общая проверка эту строку ещё не проверяла"
+    detail = f" — {h(check.detail)}" if check.detail else ""
+    name = VERDICT_NAMES.get(check.verdict, UNCHECKED)
+    return f"общая проверка {fmt_dt(check.checked_at, tz)}: {name}{detail}"
+
+
+def _probe_keyboard(drop: list[int] | None = None) -> Any:
+    builder = InlineKeyboardBuilder()
+    if drop:
+        builder.button(
+            text=f"🗑 Убрать ({len(drop)})", callback_data="a:links:drop:" + ",".join(map(str, drop))
+        )
+    builder.button(text="🔎 Ещё ссылку", callback_data="a:links:probe")
+    builder.button(text="🔗 К проверке ссылок", callback_data="a:links")
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 @router.callback_query(F.data == "a:links:probe")
@@ -406,7 +464,7 @@ async def on_probe(call: CallbackQuery, state: FSMContext, **data: Any) -> None:
 @input_handler("link_probe")
 async def input_probe(message: Message, data: dict[str, Any], fsm: dict[str, Any]) -> bool:
     """What the checker sees for one link: its verdict, the page's title and, for an invite, how t.me shows a
-    dead one; and the services with this link."""
+    dead one; the services with this link, what the last pass made of each, and (dead) their removal now."""
     ctx: AppContext = data["ctx"]
     session: AsyncSession = data["session"]
     checker = ctx.get("linkcheck")
@@ -419,11 +477,12 @@ async def input_probe(message: Message, data: dict[str, Any], fsm: dict[str, Any
         return True
     verdict = await checker.check(link.url)
     state = await get_settings(session, LinkCheckState)
+    tz = ctx.config.timezone
     lines = [
         "🔎 <b>Проверка ссылки</b>",
         "",
         f"Ссылка: {h(link.url)}",
-        f"Итог: {VERDICT_NAMES.get(verdict.state, '❔ не удалось проверить')} — {h(verdict.detail)}",
+        f"Итог: {VERDICT_NAMES.get(verdict.state, UNCHECKED)} — {h(verdict.detail)}",
     ]
     if verdict.title:
         lines.append(f"Название на странице: «{h(verdict.title)}»")
@@ -435,16 +494,95 @@ async def input_probe(message: Message, data: dict[str, Any], fsm: dict[str, Any
         )
         lines.append(f"Мёртвое приглашение t.me показывает так (по отозванному приглашению бота): {sample}.")
     rows = (await session.execute(select(Service).where(Service.status != "removed"))).scalars()
-    services = [s for s in rows if _normal(service_link(s)) == link.url][:5]
+    services = [s for s in rows if _normal(service_link(s)) == link.url][:PROBE_SERVICES]
+    checks = await last_checks(session, [s.id for s in services])
+    lines.append("")
+    if not services:
+        lines.append("Сервисов с этой ссылкой в базе нет.")
     for service in services:
-        reason = f", {service.hidden_reason}" if service.hidden_reason else ""
         lines.append(
-            f"• Сервис «{h(service.name)}»: {service.status}{reason}, «мёртвых» проверок подряд "
-            f"{service.link_dead_streak or 0}"
+            f"• «{h(service.name)}» — {_where(service, tz)}; {_last_check(checks.get(service.id), tz)}"
         )
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔎 Ещё ссылку", callback_data="a:links:probe")
-    builder.button(text="🔗 К проверке ссылок", callback_data="a:links")
-    builder.adjust(1)
-    await message.answer("\n".join(lines), reply_markup=builder.as_markup(), link_preview_options=NO_PREVIEW)
+    lines.append("")
+    if state.last_pass_at is None:
+        lines.append("Общей проверки ещё не было.")
+    else:
+        lines.append(f"Последняя общая проверка: {fmt_dt(state.last_pass_at, tz)}.")
+        lines += [line for line in report_lines(state.last_report, tz) if line.startswith(("Эталоны", "🛑"))]
+    if checker.running:
+        lines.append("⏳ Общая проверка идёт сейчас — её итог придёт отдельным сообщением.")
+    # listed or hidden for a dead link: what "🗑 Убрать" takes
+    checked = [
+        s.id
+        for s in services
+        if s.status == "active" or (s.status, s.hidden_reason) == ("hidden", "dead_link")
+    ]
+    drop = checked if verdict.state == DEAD else []
+    if drop:
+        lines += [
+            "",
+            "🗑 «Убрать» — бот проверит ссылку ещё раз и, если она не открывается, уберёт сервис сейчас: без "
+            "владельца в боте он удалится, с владельцем — снимется до новой ссылки, а владелец получит "
+            "уведомление.",
+        ]
+    await message.answer(
+        "\n".join(lines), reply_markup=_probe_keyboard(drop), link_preview_options=NO_PREVIEW
+    )
     return True
+
+
+@router.callback_query(F.data.regexp(r"^a:links:drop:\d+(?:,\d+)*$"))
+async def on_drop(call: CallbackQuery, session: AsyncSession, **data: Any) -> None:
+    """Under a one-link check, "🗑 Убрать": the services whose link, checked once more, still does not open
+    go at once, the way "🗑 Удалить нерабочие" takes them."""
+    ctx: AppContext = data["ctx"]
+    checker = ctx.get("linkcheck")
+    if checker is None:
+        await call.answer("Проверка ссылок сейчас недоступна.", show_alert=True)
+        return
+    await call.answer("Проверяю ссылку ещё раз…")
+    ids = [int(part) for part in (call.data or "").rsplit(":", 1)[1].split(",")][:PROBE_SERVICES]
+    services = list(
+        (
+            await session.execute(select(Service).where(CHECKED, Service.id.in_(ids)).order_by(Service.id))
+        ).scalars()
+    )
+    now = utcnow()
+    dead: list[Service] = []
+    spared: list[Service] = []  # the link opens now, or could not be checked
+    for service in services:
+        link = service_link(service)
+        verdict = await checker.check(link) if link else None
+        if verdict is not None and verdict.state == DEAD:
+            record_dead(session, service, verdict, now)
+            dead.append(service)
+        else:
+            spared.append(service)
+    if not dead:
+        text = (
+            "Убирать нечего: ссылка сейчас открывается или проверить её не удалось — сервис не тронут."
+            if spared
+            else "Убирать нечего: сервис уже убран."
+        )
+        await _edit(call, (text, _probe_keyboard()))
+        return
+    done = await remove_dead(session, data["user"].id, [s.id for s in dead])
+    await session.commit()
+    request_sync(ctx)
+    delivered, failed = await tell_link_update(ctx, done.tell)
+    lines = ["✅ <b>Убрано</b>", ""]
+    if done.removed:
+        lines.append(
+            f"🗑 Удалены — без владельца в боте: {_names([s for s in dead if s.id in done.removed])}."
+        )
+    if done.kept:
+        kept = _names([s for s in dead if s.id in done.kept])
+        line = f"🔗 Сняты до новой ссылки от владельца: {kept}. Уведомление получили {delivered}"
+        if failed:
+            line += f", не доставлено {failed} (бот заблокирован или недоступен)"
+        if len(done.tell) < len(done.kept):
+            line += f", уже прислали новую ссылку {len(done.kept) - len(done.tell)}"
+        lines.append(line + ".")
+    if spared:
+        lines.append(f"Не тронуты (ссылка открывается или проверить не удалось): {_names(spared)}.")
+    await _edit(call, ("\n".join(lines), _probe_keyboard()))

@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.db.base import utcnow
 from app.db.models import Broadcast, Feature, ModerationRequest, Service, User
 from app.domain.linkcheck import Page, fingerprint
-from app.services.linkcheck import LinkChecker, report_lines
+from app.services.linkcheck import LinkChecker, last_checks, report_lines
 from app.services.settings import LinkCheckSettings, LinkCheckState, get_settings, update_settings
 from tests.conftest import OWNER_ID
 from tests.fakefetch import FakeFetcher
@@ -150,13 +150,16 @@ async def test_breaker_and_canaries_protect_from_mass_hiding(h, tg, db, ctx):
     assert "предохранитель" in h.last(OWNER_ID)["text"]
     assert (await _service(db, "Tripmafia")).link_dead_streak == 0
 
-    # the dead reference link suddenly looks alive: t.me verdicts are not trusted
+    # the dead reference link suddenly looks alive: t.me verdicts are not trusted; invites go by their own
     for username in ("hoteltraffic", "tripmafia"):
         fetcher.tme(username, username.title())
     fetcher.tme("dead_canary", "Squatted")
+    rolex = await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
+    fetcher.invite("75LkzDoblPtlOGRi", None)
     report = await checker.run_pass()
-    assert report.trust == {"tg": False, "ext": True, "invite": False} and report.dead == 0
-    assert "эталонные ссылки не сошлись (t.me, приглашения)" in h.last(OWNER_ID)["text"]
+    assert report.trust == {"tg": False, "ext": True, "invite": True}
+    assert report.dead == 1 and report.hidden == [rolex]
+    assert "эталонные ссылки не сошлись (t.me)." in h.last(OWNER_ID)["text"]
     assert (await _service(db, "LOUIS VUITTON TRAVEL")).link_dead_streak == 0
 
 
@@ -436,7 +439,9 @@ async def test_the_check_offers_to_remove_and_one_link_can_be_probed(h, tg, db, 
     assert "❌ не открывается — t.me: приглашение недействительно или устарело" in probe
     assert "Название на странице: «Join group chat on Telegram»" in probe
     assert "показывает так (по отозванному приглашению бота): страница с заголовком «Join group" in probe
-    assert "• Сервис «Rolex Fullz»: hidden, dead_link" in probe
+    assert "• «Rolex Fullz» — скрыт: не открывается, «мёртвых» проверок подряд 3; общая проверка " in probe
+    assert "Эталоны: t.me — ок, сайты — ок, приглашения — ок" in probe
+    assert h.button(h.last(OWNER_ID), "Убрать (1)")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Ещё ссылку")
     await h.say(OWNER_ID, "https://t.me/tripmafia")
     assert "✅ открывается" in h.last(OWNER_ID)["text"]
@@ -518,4 +523,91 @@ async def test_a_line_imported_as_written_is_checked_by_the_link_in_it(h, tg, db
     await h.press(OWNER_ID, h.last(OWNER_ID), "Назад")
     await h.press(OWNER_ID, h.last(OWNER_ID), "Проверить одну ссылку")
     await h.say(OWNER_ID, "https://t.me/+Y3KsoupeeUk5ZmZi")
-    assert "• Сервис «ROLEX FULLZ»: hidden, dead_link" in h.last(OWNER_ID)["text"]
+    assert "• «ROLEX FULLZ» — скрыт: не открывается" in h.last(OWNER_ID)["text"]
+
+
+async def _probe(h, url: str) -> dict:
+    await h.say(OWNER_ID, "/admin")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Ссылки")
+    await h.press(OWNER_ID, h.last(OWNER_ID), "Проверить одну ссылку")
+    await h.say(OWNER_ID, url)
+    return h.last(OWNER_ID)
+
+
+async def test_a_probe_tells_what_the_last_check_made_of_a_line_and_removes_it_now(h, tg, db, ctx):
+    """One link checked by the admins: the services with it, what the last pass made of each and why; a dead
+    one goes at once with "🗑 Убрать" (its link checked once more)."""
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    fetcher.dead_invite_title = None  # as on t.me now: a dead invite's page has no title
+    named = {"type": "text_link", "offset": 0, "length": 11, "url": "https://t.me/+Y3KsoupeeUk5ZmZi"}
+    rolex = await _raw_service(db, "ROLEX FULLZ", {"text": "ROLEX FULLZ — лучшие", "entities": [named]})
+    fetcher.invite("Y3KsoupeeUk5ZmZi", None)
+    screen = await _probe(h, "https://t.me/+Y3KsoupeeUk5ZmZi")
+    assert "Итог: ❌ не открывается" in screen["text"]
+    assert "• «ROLEX FULLZ» — в списке; общая проверка эту строку ещё не проверяла" in screen["text"]
+    assert "Общей проверки ещё не было." in screen["text"]
+    assert h.button(screen, "Убрать (1)")["callback_data"] == f"a:links:drop:{rolex}"
+
+    fetcher.tg = None  # the pass cannot get its invite references right: its "dead" is not trusted
+    assert (await checker.run_pass()).verdicts[rolex].state == "unknown"
+    fetcher.tg = tg
+    screen = await _probe(h, "https://t.me/+Y3KsoupeeUk5ZmZi")
+    last = r"общая проверка [\d.]+ [\d:]+: ❔ не удалось проверить — эталоны не сошлись"
+    assert re.search("• «ROLEX FULLZ» — в списке; " + last, screen["text"])
+    assert "Последняя общая проверка: " in screen["text"]
+    assert "Эталоны: t.me — ок, сайты — ок, приглашения — не сошлись" in screen["text"]
+
+    await h.press(OWNER_ID, screen, "Убрать (1)")
+    done = h.last(OWNER_ID)["text"]
+    assert "✅ Убрано" in done and "🗑 Удалены — без владельца в боте: ROLEX FULLZ." in done
+    service = await _service(db, "ROLEX FULLZ")
+    assert (service.status, service.hidden_reason, service.link_state) == ("removed", "dead_link", "dead")
+    async with db.session() as s:
+        check = (await last_checks(s, [rolex]))[rolex]
+    assert (check.verdict, check.detail) == ("dead", "t.me: приглашение недействительно или устарело")
+
+    await h.click(OWNER_ID, h.last(OWNER_ID), f"a:links:drop:{rolex}")  # an old button pressed again
+    assert "Убирать нечего: сервис уже убран." in h.last(OWNER_ID)["text"]
+
+
+async def test_a_probed_dead_link_takes_an_owners_service_down_until_a_new_one(h, tg, db, ctx):
+    _ids, _engine, _checker, fetcher = await _setup(tg, db, ctx)
+    fetcher.dead_invite_title = None
+    owned = await _invite_service(db, "Rolex Owned", "OwnedHash")
+    lone = await _invite_service(db, "Rolex Copy", "OwnedHash")  # the same link, nobody's in the bot
+    await _patch(db, owned, owner_id=SELLER)
+    fetcher.invite("OwnedHash", None)
+    screen = await _probe(h, "https://t.me/+OwnedHash")
+    assert "• «Rolex Owned» — в списке" in screen["text"] and "• «Rolex Copy» — в списке" in screen["text"]
+    fetcher.pages.pop("https://t.me/+OwnedHash")
+    fetcher.invite("OwnedHash", "Rolex Group")  # it opens again before the button is pressed
+    await h.press(OWNER_ID, screen, "Убрать (2)")
+    assert "Убирать нечего: ссылка сейчас открывается" in h.last(OWNER_ID)["text"]
+    assert (await _service(db, "Rolex Owned")).status == "active"
+
+    fetcher.pages.pop("https://t.me/+OwnedHash")
+    fetcher.invite("OwnedHash", None)
+    await h.press(OWNER_ID, await _probe(h, "https://t.me/+OwnedHash"), "Убрать (2)")
+    done = h.last(OWNER_ID)["text"]
+    assert "🗑 Удалены — без владельца в боте: Rolex Copy." in done
+    assert "🔗 Сняты до новой ссылки от владельца: Rolex Owned. Уведомление получили 1." in done
+    service = await _service(db, "Rolex Owned")
+    assert (service.status, service.hidden_reason) == ("hidden", "link_update")
+    assert (await _service(db, "Rolex Copy")).status == "removed" and lone != owned
+    notice = h.last(SELLER)
+    assert "снят из списка, пока ссылка не будет заменена" in notice["text"]
+    assert h.button(notice, "Изменить ссылку")["callback_data"] == f"my:{owned}:ef:url"
+
+
+async def test_the_invite_references_get_a_second_look(h, tg, db, ctx):
+    """t.me lagging a moment on the bot's own fresh invite does not make every invite verdict untrusted."""
+    _ids, _engine, checker, fetcher = await _setup(tg, db, ctx)
+    fetcher.dead_invite_title = None
+    dead_id = await _invite_service(db, "Rolex Fullz", "75LkzDoblPtlOGRi")
+    fetcher.invite("75LkzDoblPtlOGRi", None)
+    pages = fetcher._bot_invite
+    hiccups = [Page(502)]
+    fetcher._bot_invite = lambda url: hiccups.pop() if hiccups else pages(url)
+    report = await checker.run_pass()
+    assert not hiccups and report.trust["invite"] is True
+    assert report.hidden == [dead_id]

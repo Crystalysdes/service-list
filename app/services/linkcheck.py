@@ -12,7 +12,8 @@ username) is reported to the admins instead of being trusted.
 Invite links (t.me/+…) have references of their own, made fresh every pass: the bot creates an invite link of
 its channel and another one it revokes at once. t.me shows a dead invite as an ordinary page with a generic
 title, so the revoked one teaches what that title is (``LinkCheckState.dead_invite_fp``), and the fresh one
-must still come out alive; until both do, "dead" verdicts of invites are not trusted.
+must still come out alive; until both do, "dead" verdicts of invites are not trusted (they go by these
+references alone; by the t.me ones only when the bot cannot make invite links anywhere).
 
 A line imported as it was written (``raw_fragment``: it did not fit the usual form) has no link of its own:
 the link in it is checked, the first text link, else a plain URL, else an @username (``service_link``).
@@ -21,7 +22,8 @@ Lines without any link (notes) are not checked at all.
 "🗑 Удалить нерабочие" (admin) clears the services whose link does not open (hidden for it, or still listed
 after a "dead" check): one without an owner in the bot is removed; one with an owner goes down
 (``LINK_UPDATE``, no longer checked or brought back by itself) until a new link of its owner is approved, and
-the owner is told.
+the owner is told. "🔎 Проверить одну ссылку" shows what the last pass made of the services with that link and
+can clear them the same way at once (``record_dead`` + ``remove_dead`` for just them).
 """
 
 from __future__ import annotations
@@ -224,6 +226,7 @@ def _group(url: str) -> str:
 
 
 CANARY_NAME = "проверка ссылок"  # the invite links the checker makes itself (revoked right after)
+RETRY_PAUSE = 3.0  # seconds before the invite references are looked at once more
 INVITE_DEAD = "t.me: приглашение недействительно или устарело"
 
 
@@ -286,6 +289,10 @@ def service_link(service: Service) -> str | None:
 LINK_UPDATE = "link_update"  # hidden until its owner gives a new link (after "🗑 Удалить нерабочие")
 DEAD_REASONS = ("dead_link", LINK_UPDATE)  # an approved new link of the owner brings the service back
 
+# the services a pass checks: listed, or hidden for a dead link (to bring them back)
+CHECKED = or_(
+    Service.status == "active", (Service.status == "hidden") & (Service.hidden_reason == "dead_link")
+)
 
 # a link that does not open: hidden for it, or still listed after a "dead" check
 DEAD_NOW = or_(
@@ -307,8 +314,10 @@ class DeadSplit:
         return sum(1 for s in (*self.owned, *self.lone) if s.status == "active")
 
 
-async def dead_split(session: AsyncSession) -> DeadSplit:
-    rows = list((await session.execute(select(Service).where(DEAD_NOW).order_by(Service.id))).scalars())
+async def dead_split(session: AsyncSession, service_ids: list[int] | None = None) -> DeadSplit:
+    """``service_ids``: just these services (their link was found dead a moment ago), if still checked."""
+    query = select(Service).where(DEAD_NOW if service_ids is None else CHECKED & Service.id.in_(service_ids))
+    rows = list((await session.execute(query.order_by(Service.id))).scalars())
     owner_ids = {s.owner_id for s in rows if s.owner_id}
     owners = set()
     if owner_ids:
@@ -328,14 +337,18 @@ class Removal:
     tell: list[int]  # of those, the ones whose owners are told (not those already sending a new link)
 
 
-async def remove_dead(session: AsyncSession, actor_id: int | None) -> Removal:
+async def remove_dead(
+    session: AsyncSession, actor_id: int | None, service_ids: list[int] | None = None
+) -> Removal:
     """The dead links out: a service without an owner in the bot is removed (its options end, open orders
-    close); one with an owner stays down until a new link of the owner is approved."""
+    close); one with an owner stays down until a new link of the owner is approved. ``service_ids``: only
+    these (see :func:`dead_split`)."""
     from app.services import billing, moderation
 
-    split = await dead_split(session)
+    split = await dead_split(session, service_ids)
     for service in split.lone:
-        service.status = "removed"  # hidden_reason stays "dead_link": why it went
+        service.status = "removed"
+        service.hidden_reason = "dead_link"  # why it went
         for feature in service.features:
             if feature.status == "active":
                 feature.status = "revoked"
@@ -351,6 +364,37 @@ async def remove_dead(session: AsyncSession, actor_id: int | None) -> Removal:
             tell.append(service.id)
     await session.flush()
     return Removal(removed=[s.id for s in split.lone], kept=[s.id for s in split.owned], tell=tell)
+
+
+def record_dead(session: AsyncSession, service: Service, verdict: Verdict, now: datetime) -> None:
+    """A "dead" verdict seen outside a pass (the admins' one-link check) goes into the history like one."""
+    session.add(
+        LinkCheck(
+            service_id=service.id,
+            verdict=DEAD,
+            detail=verdict.detail[:500],
+            fingerprint=verdict.fingerprint,
+        )
+    )
+    service.link_checked_at = now
+    service.link_state = DEAD
+    service.link_dead_streak = (service.link_dead_streak or 0) + 1
+    service.link_first_dead_at = service.link_first_dead_at or now
+
+
+async def last_checks(session: AsyncSession, service_ids: list[int]) -> dict[int, LinkCheck]:
+    """The latest check of each of these services (what the last pass made of its link)."""
+    if not service_ids:
+        return {}
+    rows = await session.execute(
+        select(LinkCheck)
+        .where(LinkCheck.service_id.in_(service_ids))
+        .order_by(LinkCheck.checked_at.desc(), LinkCheck.id.desc())
+    )
+    latest: dict[int, LinkCheck] = {}
+    for row in rows.scalars():
+        latest.setdefault(row.service_id, row)
+    return latest
 
 
 async def tell_link_update(ctx: AppContext, service_ids: list[int]) -> tuple[int, int]:
@@ -494,12 +538,17 @@ class LinkChecker:
                 log.info("no invite references in %s: %s", chat_id, exc.message)
                 continue
             try:
-                alive_page = await self.fetcher.fetch(_invite_page(alive.invite_link))
-                dead_page = await self.fetcher.fetch(_invite_page(dead.invite_link))
+                for attempt in range(2):  # once more after a pause: t.me may lag a moment or hiccup
+                    if attempt:
+                        await asyncio.sleep(RETRY_PAUSE if self.delay is None else self.delay)
+                    alive_page = await self.fetcher.fetch(_invite_page(alive.invite_link))
+                    dead_page = await self.fetcher.fetch(_invite_page(dead.invite_link))
+                    if await self._learn_dead_invite(tme_verdict(alive_page), tme_verdict(dead_page)):
+                        return True
+                return False
             finally:
                 with contextlib.suppress(TelegramAPIError):
                     await bot.revoke_chat_invite_link(chat_id, alive.invite_link)
-            return await self._learn_dead_invite(tme_verdict(alive_page), tme_verdict(dead_page))
         return None
 
     async def _learn_dead_invite(self, alive: Verdict, dead: Verdict) -> bool:
@@ -551,8 +600,10 @@ class LinkChecker:
         for group in trust:  # a group needs both an alive and a dead reference
             if (group, ALIVE) not in seen or (group, DEAD) not in seen:
                 trust[group] = False
+        # invites go by their own references (they test exactly the invite pages), by the t.me ones only
+        # when the bot cannot make invite links anywhere
         invites = await self.invite_canaries()
-        trust["invite"] = trust["tg"] if invites is None else invites and trust["tg"]
+        trust["invite"] = trust["tg"] if invites is None else invites
         return trust
 
     async def canary_check(self) -> Any:
@@ -581,12 +632,7 @@ class LinkChecker:
     async def _targets(
         self, session: AsyncSession, settings: LinkCheckSettings, service_ids: list[int] | None
     ) -> list[tuple[int, str, str]]:
-        query = select(Service).where(
-            or_(
-                Service.status == "active",
-                (Service.status == "hidden") & (Service.hidden_reason == "dead_link"),
-            )
-        )
+        query = select(Service).where(CHECKED)
         if service_ids is not None:
             query = query.where(Service.id.in_(service_ids))
         now = utcnow()

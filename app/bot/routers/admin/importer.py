@@ -298,6 +298,7 @@ async def _links_message(ctx: AppContext, report: Any) -> tuple[str, Any]:
     """Store the verdicts in the run report and describe them."""
     from app.db.models import Service
     from app.domain.linkcheck import DEAD, UNKNOWN
+    from app.services.linkcheck import service_link
 
     async with ctx.db.session() as session:
         run = await latest_run(session)
@@ -322,7 +323,8 @@ async def _links_message(ctx: AppContext, report: Any) -> tuple[str, Any]:
             f"Проверено: {report.checked} — живых {report.alive}, не открываются {len(dead)}, "
             f"не удалось проверить {len(unknown)}.",
         ]
-        failed = [name for group, name in (("tg", "t.me"), ("ext", "сайты")) if not report.trust.get(group)]
+        groups = (("tg", "t.me"), ("ext", "сайты"), ("invite", "приглашения"))
+        failed = [name for group, name in groups if group in report.trust and not report.trust[group]]
         if failed:
             lines.append(
                 "⚠️ Эталонные ссылки не сошлись (" + ", ".join(failed) + "): такие ссылки попали в "
@@ -334,7 +336,8 @@ async def _links_message(ctx: AppContext, report: Any) -> tuple[str, Any]:
                 service = await session.get(Service, service_id)
                 if service is not None:
                     detail = report.verdicts[service_id].detail
-                    lines.append(f"• {h(service.name)} — {h(service.url)} ({h(detail)})")
+                    link = service_link(service) or service.url
+                    lines.append(f"• {h(service.name)} — {h(link)} ({h(detail)})")
             if len(dead) > 40:
                 lines.append(f"…и ещё {len(dead) - 40}")
             lines += [
