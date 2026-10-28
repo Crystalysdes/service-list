@@ -65,6 +65,7 @@ def home_keyboard(
         builder.button(text="💵 Цены и сроки", callback_data="a:prices")
         builder.button(text="😀 Эмодзи", callback_data="a:emoji")
         builder.button(text="🧾 Шаблоны", callback_data="a:tpl")
+        builder.button(text="📨 Рассылка", callback_data="a:mail")
         builder.button(text="📡 Каналы", callback_data="a:ch")
         builder.button(text="📦 Импорт", callback_data="a:imp")
         builder.button(text="🔗 Ссылки", callback_data="a:links")

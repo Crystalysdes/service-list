@@ -138,6 +138,12 @@ async def job_announce(ctx: AppContext) -> None:
     await job(ctx)
 
 
+async def job_mailing(ctx: AppContext) -> None:
+    from app.services.mailing import job
+
+    await job(ctx)
+
+
 async def job_moderation_cards(ctx: AppContext) -> None:
     from app.services.moderation import repost_missing
 
@@ -178,6 +184,7 @@ def schedule(ctx: AppContext) -> list[tuple[Job, Any]]:
         (job_health, IntervalTrigger(minutes=15, jitter=60)),
         (job_backup, CronTrigger(hour=4, minute=0, timezone=ctx.config.timezone)),
         (job_announce, IntervalTrigger(seconds=10)),
+        (job_mailing, IntervalTrigger(seconds=10)),
         (job_publish_watch, IntervalTrigger(minutes=2)),
         (job_glow, IntervalTrigger(seconds=15)),
         (job_emoji_tasks, IntervalTrigger(seconds=30)),

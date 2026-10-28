@@ -31,15 +31,7 @@ from aiogram.exceptions import (
     TelegramNotFound,
     TelegramRetryAfter,
 )
-from aiogram.types import (
-    InlineKeyboardMarkup,
-    InputMediaAnimation,
-    InputMediaAudio,
-    InputMediaDocument,
-    InputMediaPhoto,
-    InputMediaVideo,
-    Message,
-)
+from aiogram.types import InlineKeyboardMarkup, Message
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,10 +43,11 @@ from app.domain.links import is_emoji
 from app.domain.render import RenderTemplates, render_item
 from app.domain.richtext import Fragment, RichText
 from app.domain.symbols import LinkContext
-from app.services import premium_account, render_db
+from app.services import premium_account, render_db, resend
 from app.services.announce import short
 from app.services.channels import INACTIVE_STATUSES
 from app.services.published import SHOWN_STATES, shows
+from app.services.resend import input_media, link_markup, send_again
 from app.services.settings import Chats, Escrow, InfoFeed, Runtime, Templates, get_settings, update_settings
 from app.services.sync.manual import PLAIN as PLAIN_SENT
 
@@ -383,44 +376,8 @@ def _chat_trouble(exc: TelegramAPIError) -> bool:
     )
 
 
-def _link_markup(message: Message) -> InlineKeyboardMarkup | None:
-    """The link buttons of a post (the others would not work under a copy)."""
-    if message.reply_markup is None:
-        return None
-    rows = [[b for b in row if b.url] for row in message.reply_markup.inline_keyboard]
-    rows = [row for row in rows if row]
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-
-
 def _messages(post: InfoPost) -> list[Message]:
-    result = []
-    for dump in post.messages or []:
-        try:
-            result.append(Message.model_validate(dump))
-        except ValueError:
-            log.warning("info post %s keeps a message Telegram's types do not read", post.id)
-    return result
-
-
-def _input_media(message: Message) -> Any:
-    """The message's file as an album item or an edit of the copy (None: not a kind that can be)."""
-    fragment = Fragment.from_message(message)
-    extra: dict[str, Any] = {
-        "caption": fragment.text or None,
-        "caption_entities": fragment.to_entities() or None,
-        "parse_mode": None,
-    }
-    if message.photo:
-        return InputMediaPhoto(media=message.photo[-1].file_id, **extra)
-    if message.video is not None:
-        return InputMediaVideo(media=message.video.file_id, **extra)
-    if message.animation is not None:
-        return InputMediaAnimation(media=message.animation.file_id, **extra)
-    if message.audio is not None:
-        return InputMediaAudio(media=message.audio.file_id, **extra)
-    if message.document is not None:
-        return InputMediaDocument(media=message.document.file_id, **extra)
-    return None
+    return resend.messages(post.messages or [], f"info post {post.id}")
 
 
 async def copy_between(
@@ -456,55 +413,14 @@ async def copy_between(
 async def _resend(engine: Any, channel_id: int, chat_id: int, post: InfoPost) -> list[int]:
     """The post put together again from the messages the database keeps (file ids of this bot): its new
     message ids, or none when it cannot be."""
-    bot = engine.ctx.bot
-    messages = _messages(post)
-    if not messages:
-        return []
-    if len(messages) > 1:
-        items = [item for item in (_input_media(m) for m in messages) if item is not None]
-        if len(items) > 1:
-            sent = await _tg(
-                engine,
-                channel_id,
-                lambda: bot.send_media_group(chat_id, media=items, disable_notification=True),
-            )
-            return [m.message_id for m in sent]
-    message = messages[0]
-    fragment = Fragment.from_message(message)
-    common: dict[str, Any] = {"disable_notification": True, "reply_markup": _link_markup(message)}
-    caption: dict[str, Any] = {
-        "caption": fragment.text or None,
-        "caption_entities": fragment.to_entities() or None,
-        "parse_mode": None,
-    }
-    call: Callable[[], Awaitable[Any]] | None = None
-    if message.text is not None:
-        call = lambda: bot.send_message(  # noqa: E731
-            chat_id,
-            fragment.text,
-            entities=fragment.to_entities() or None,
-            parse_mode=None,
-            link_preview_options=message.link_preview_options,
-            **common,
-        )
-    elif message.photo:
-        call = lambda: bot.send_photo(chat_id, message.photo[-1].file_id, **caption, **common)  # noqa: E731
-    elif message.video is not None:
-        call = lambda: bot.send_video(chat_id, message.video.file_id, **caption, **common)  # noqa: E731
-    elif message.animation is not None:
-        call = lambda: bot.send_animation(chat_id, message.animation.file_id, **caption, **common)  # noqa: E731
-    elif message.audio is not None:
-        call = lambda: bot.send_audio(chat_id, message.audio.file_id, **caption, **common)  # noqa: E731
-    elif message.voice is not None:
-        call = lambda: bot.send_voice(chat_id, message.voice.file_id, **caption, **common)  # noqa: E731
-    elif message.document is not None:
-        call = lambda: bot.send_document(chat_id, message.document.file_id, **caption, **common)  # noqa: E731
-    elif message.sticker is not None:
-        call = lambda: bot.send_sticker(chat_id, message.sticker.file_id, **common)  # noqa: E731
-    if call is None:
-        return []
-    sent = await _tg(engine, channel_id, call)
-    return [sent.message_id]
+    sent = await send_again(
+        engine.ctx.bot,
+        chat_id,
+        _messages(post),
+        run=lambda call: _tg(engine, channel_id, call),
+        disable_notification=True,
+    )
+    return [m.message_id for m in sent]
 
 
 # ------------------------------------------------------------------------------------------ the planner
@@ -869,7 +785,7 @@ async def _to_storage(engine: Any, channel_id: int, chat_id: int, limiter: Any) 
             version, forward = post.version, post.forward
             old = list(post.storage_ids or []) if post.storage_chat_id == storage else []
             messages = _messages(post)
-            markup = _link_markup(messages[0]) if len(messages) == 1 else None
+            markup = link_markup(messages[0]) if len(messages) == 1 else None
         await limiter.acquire()
         new_ids: list[int] | None = None
         problem: str | None = None
@@ -924,8 +840,8 @@ async def _edit_copy(bot: Any, storage: int, copies: list[int], messages: list[M
     if not messages or len(messages) != len(copies):
         return False
     for message, copy_id in zip(messages, copies, strict=True):
-        markup = _link_markup(message) if len(messages) == 1 else None
-        media = _input_media(message)
+        markup = link_markup(message) if len(messages) == 1 else None
+        media = input_media(message)
         fragment = Fragment.from_message(message)
         try:
             if media is not None:
@@ -1194,7 +1110,7 @@ async def _rewrite(
             message_id,
             fragment,
             preview=preview,
-            markup=_link_markup(message) if len(messages) == 1 else None,
+            markup=link_markup(message) if len(messages) == 1 else None,
             gave_up=(row_id, message_id, fragment.content_hash()),
             key=f"info:{post_id}",
             limiter=limiter,
@@ -1272,7 +1188,7 @@ async def _fill_one(
             session.add(row)
         news, forward, pinned = is_news(post), post.forward, post.pinned
         messages = _messages(post)
-        markup = _link_markup(messages[0]) if len(messages) == 1 else None
+        markup = link_markup(messages[0]) if len(messages) == 1 else None
         copies = list(post.storage_ids or []) if storage and post.storage_chat_id == storage else []
         origin = await _placement(session, source.id, post_id) if source is not None else None
         origin_ids = (
@@ -1495,7 +1411,7 @@ async def on_edit(session: AsyncSession, channel: Channel, message: Message) -> 
     post.version += 1
     if post.kind == EVENT:  # the admins' words from now on: not written anew, a move copies them
         fragment = Fragment.from_message(message)
-        markup = _link_markup(message)
+        markup = link_markup(message)
         buttons = [[b.text, b.url] for line in (markup.inline_keyboard if markup else []) for b in line]
         post.content = {"edited": True, "fragment": fragment.to_json(), "buttons": buttons}
     else:

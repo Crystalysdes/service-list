@@ -36,7 +36,9 @@ USER_COUNTED = {
     "text_mention",
     "date_time",
 }
-MEDIA_KEYS = ("photo", "video", "animation", "document")
+MEDIA_KEYS = ("photo", "video", "animation", "document", "audio", "voice", "video_note", "sticker")
+# what a person who blocked the bot does not get (Telegram answers 403)
+SENDS = ("send", "copyMessage", "forwardMessage")
 DEFAULT_ADMIN_RIGHTS = {
     "can_post_messages": True,
     "can_edit_messages": True,
@@ -334,7 +336,17 @@ class FakeTelegram:
         handler = getattr(self, f"m_{method}", None)
         if handler is None:
             raise FakeError(400, f"Bad Request: method {method} is not implemented in FakeTelegram")
+        if method.startswith(SENDS) and self._blocked(params.get("chat_id")):
+            raise FakeError(403, "Forbidden: bot was blocked by the user")
         return handler(params, files)
+
+    def _blocked(self, chat_id: Any) -> bool:
+        """A person's chat with the bot, which they blocked (``tg.chats[uid]["_blocked"] = True``)."""
+        try:
+            chat = self.chats.get(int(chat_id))
+        except (TypeError, ValueError):
+            return False
+        return chat is not None and chat["type"] == "private" and bool(chat.get("_blocked"))
 
     # ------------------------------------------------------------------ helpers
     def _chat(self, chat_id: Any) -> dict[str, Any]:
@@ -475,8 +487,6 @@ class FakeTelegram:
     def m_sendMessage(self, params: dict, files: dict) -> dict:
         chat = self._chat(params["chat_id"])
         self._require(chat, "can_post_messages")
-        if chat["type"] == "private" and chat.get("_blocked"):
-            raise FakeError(403, "Forbidden: bot was blocked by the user")
         text, entities = self._process_entities(
             chat, params["text"], params.get("entities"), params.get("parse_mode")
         )
@@ -1049,13 +1059,27 @@ class FakeTelegram:
                     "duration": 5,
                 }
             }
+        if kind in ("voice", "audio"):
+            return {kind: {"file_id": file_id, "file_unique_id": unique, "duration": 7}}
+        if kind == "video_note":
+            return {kind: {"file_id": file_id, "file_unique_id": unique, "length": 240, "duration": 5}}
+        if kind == "sticker":
+            return {
+                kind: {
+                    "file_id": file_id,
+                    "file_unique_id": unique,
+                    "type": "regular",
+                    "width": 512,
+                    "height": 512,
+                    "is_animated": False,
+                    "is_video": False,
+                }
+            }
         return {"document": {"file_id": file_id, "file_unique_id": unique, "file_name": "file.bin"}}
 
     def _send_media(self, params: dict, files: dict, kind: str) -> dict:
         chat = self._chat(params["chat_id"])
         self._require(chat, "can_post_messages")
-        if chat["type"] == "private" and chat.get("_blocked"):
-            raise FakeError(403, "Forbidden: bot was blocked by the user")
         file_id = self._upload(files, params[kind], kind)
         msg = self._base_message(chat)
         msg.update(self._media_object(kind, file_id))
@@ -1076,6 +1100,18 @@ class FakeTelegram:
 
     def m_sendAnimation(self, params: dict, files: dict) -> dict:
         return self._send_media(params, files, "animation")
+
+    def m_sendAudio(self, params: dict, files: dict) -> dict:
+        return self._send_media(params, files, "audio")
+
+    def m_sendVoice(self, params: dict, files: dict) -> dict:
+        return self._send_media(params, files, "voice")
+
+    def m_sendVideoNote(self, params: dict, files: dict) -> dict:
+        return self._send_media(params, files, "video_note")
+
+    def m_sendSticker(self, params: dict, files: dict) -> dict:
+        return self._send_media(params, files, "sticker")
 
     def m_sendPhoto(self, params: dict, files: dict) -> dict:
         chat = self._chat(params["chat_id"])
@@ -1102,16 +1138,7 @@ class FakeTelegram:
             msg["_reply_to"] = params["reply_parameters"].get("message_id")
 
     def m_sendDocument(self, params: dict, files: dict) -> dict:
-        chat = self._chat(params["chat_id"])
-        self._require(chat, "can_post_messages")
-        file_id = self._upload(files, params["document"], "doc")
-        msg = self._base_message(chat)
-        msg["document"] = {"file_id": file_id, "file_unique_id": f"u{file_id}", "file_name": "file.bin"}
-        if params.get("caption"):
-            msg["caption"] = _strip_html(params["caption"])
-        self._common(msg, params)
-        self._store(chat, msg)
-        return self._export(msg)
+        return self._send_media(params, files, "document")
 
     def m_sendMediaGroup(self, params: dict, files: dict) -> list[dict]:
         chat = self._chat(params["chat_id"])

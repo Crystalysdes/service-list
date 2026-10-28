@@ -510,6 +510,38 @@ class Broadcast(CreatedMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class Mailing(CreatedMixin, Base):
+    """An admin's message to every user of the bot (📨 Рассылка, app/services/mailing.py): sent as it was
+    written, at once or at ``send_at``, in the background; ``cursor`` works as in :class:`Broadcast`."""
+
+    __tablename__ = "mailings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    author_id: Mapped[int] = mapped_column(BigInteger)
+    # the admin's message as Telegram gave it (an album: one per item, in order)
+    messages: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    # scheduled / sending / done / cancelled (stopped: cancelled once it had started)
+    status: Mapped[str] = mapped_column(String(16), default="scheduled", index=True)
+    # why it was cancelled: admin / restore / refused / unreadable
+    reason: Mapped[str | None] = mapped_column(String(16))
+    last_error: Mapped[str | None] = mapped_column(Text)  # what Telegram said when it kept refusing it
+    send_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    cursor: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))
+    total: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))  # people when it started
+    sent: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    blocked: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))  # blocked the bot
+    failed: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # Telegram showed its premium emoji as plain ones (the bot's owner has no Premium)
+    emoji_lost: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # the author's card of it, kept up to date while it goes out
+    card_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    card_message_id: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class InfoPost(TimestampMixin, Base):
     """A post of the Service List Info channel (app/services/infofeed.py): news the bot publishes by itself
     (an event: a new service or category, an owner who confirmed a service, a garant deal that went well, a

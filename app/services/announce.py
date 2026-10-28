@@ -26,6 +26,7 @@ from app.bot.i18n import LANGS, Translator, h
 from app.context import AppContext
 from app.db.base import utcnow
 from app.db.models import Broadcast, Category, Service, User
+from app.services.notify import outbound
 from app.services.settings import Announce, get_settings
 
 log = logging.getLogger(__name__)
@@ -177,18 +178,20 @@ async def job(ctx: AppContext) -> None:
     if report is not None:
         await _report(ctx, report)
         return
-    for user_id, lang in people:
-        outcome = None if user_id == owner_id else await _send(ctx, user_id, *texts[Translator(lang).lang])
-        values: dict[str, Any] = {"cursor": user_id}
-        if outcome is not None:
-            values[outcome] = getattr(Broadcast, outcome) + 1
-        async with ctx.db.session() as session:
-            await session.execute(update(Broadcast).where(Broadcast.id == broadcast_id).values(**values))
-            if outcome == "blocked":
-                await session.execute(update(User).where(User.id == user_id).values(blocked_bot=True))
-            await session.commit()
-        if outcome is not None:
-            await asyncio.sleep(PAUSE_SEC)
+    async with outbound(ctx):  # a mailing of the admins goes out between the batches, not at the same time
+        for user_id, lang in people:
+            content = texts[Translator(lang).lang]
+            outcome = None if user_id == owner_id else await _send(ctx, user_id, *content)
+            values: dict[str, Any] = {"cursor": user_id}
+            if outcome is not None:
+                values[outcome] = getattr(Broadcast, outcome) + 1
+            async with ctx.db.session() as session:
+                await session.execute(update(Broadcast).where(Broadcast.id == broadcast_id).values(**values))
+                if outcome == "blocked":
+                    await session.execute(update(User).where(User.id == user_id).values(blocked_bot=True))
+                await session.commit()
+            if outcome is not None:
+                await asyncio.sleep(PAUSE_SEC)
 
 
 async def _report(ctx: AppContext, report: dict[str, Any]) -> None:

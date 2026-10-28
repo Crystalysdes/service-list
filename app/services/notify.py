@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from html import escape
@@ -224,6 +225,12 @@ async def close_alert(ctx: AppContext, ref_type: str, ref_id: int, text: str) ->
         except TelegramAPIError:
             continue
     return len(cards)
+
+
+def outbound(ctx: AppContext) -> asyncio.Lock:
+    """Held while a batch of messages to many people goes out (the news about services, 📨 Рассылка): one
+    batch at a time, so together they keep the pace Telegram accepts."""
+    return ctx.services.setdefault("outbound", asyncio.Lock())
 
 
 async def notify_user(

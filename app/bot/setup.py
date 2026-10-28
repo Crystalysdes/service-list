@@ -46,6 +46,7 @@ def build_dispatcher(ctx: AppContext) -> Dispatcher:
     from app.bot.routers.admin import escrow as admin_escrow
     from app.bot.routers.admin import info as admin_info
     from app.bot.routers.admin import intro as admin_intro
+    from app.bot.routers.admin import mailing as admin_mailing
     from app.bot.routers.admin import menu as admin_menu
     from app.bot.routers.admin import panel as admin_panel
     from app.bot.routers.admin import staff as admin_staff
@@ -73,6 +74,7 @@ def build_dispatcher(ctx: AppContext) -> Dispatcher:
         templates.router,
         admin_menu.router,
         admin_intro.router,
+        admin_mailing.router,
         admin_info.router,
         admin_escrow.router,
         orders.router,
