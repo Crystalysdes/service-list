@@ -252,6 +252,30 @@ async def test_a_reply_that_does_not_read_may_have_been_carried_out(api, status,
     assert outcome_unknown(err.value), body
 
 
+CLOUDFLARE = """<!DOCTYPE html>
+<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js" lang="en-US"> <!--<![endif]-->
+<head><title>apirone.com | 502: Bad gateway</title><meta charset="UTF-8" /></head>
+<body><div id="cf-error-details">Bad gateway</div></body></html>"""
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "message", "unknown"),
+    [
+        (502, CLOUDFLARE, "server error: apirone.com | 502: Bad gateway", True),  # Apirone's server is down
+        (503, "", "server error", True),
+        (403, CLOUDFLARE.replace("502: Bad gateway", "Access denied"), "apirone.com | Access denied", False),
+    ],
+)
+async def test_an_error_page_is_told_by_its_title_not_its_markup(api, status, body, message, unknown):
+    client, _, replies = api
+    replies[("GET", f"v2/accounts/{ACCOUNT}/balance")] = (status, body)
+    with pytest.raises(ApironeError) as err:
+        await client.balance()
+    assert (err.value.message, err.value.status, err.value.unknown) == (message, status, unknown)
+    assert "<" not in err.value.message
+
+
 async def test_no_answer_in_time_is_an_unknown_outcome(api):
     client, _, replies = api
 

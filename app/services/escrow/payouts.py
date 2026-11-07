@@ -804,9 +804,11 @@ async def _reconcile(ctx: AppContext, now: datetime) -> list[str]:
     pay = provider(ctx)
     problems: list[str] = []
     passing: set[str] = set()  # told to the owner only when the next check finds them again
+    unread: set[str] = set()  # Apirone did not give the data: no mismatch of money
 
     def failed(what: str, exc: BaseException) -> None:
         problems.append(f"Apirone не отдаёт {what}: {why(exc)}")
+        unread.add(problems[-1])
         if ledger.transient(exc):
             passing.add(problems[-1])
 
@@ -918,5 +920,15 @@ async def _reconcile(ctx: AppContext, now: datetime) -> list[str]:
     if fresh:
         from app.services.escrow.notify import alert_owner
 
-        await alert_owner(ctx, "⚠️ Сверка нашла расхождения:\n" + "\n".join(f"• {h(p)}" for p in fresh))
+        lines = "\n".join(f"• {h(p)}" for p in fresh)
+        if not all(p in unread for p in fresh):
+            text = "⚠️ Сверка нашла расхождения:\n" + lines
+        else:  # nothing is wrong with the money that the bot knows of: Apirone did not answer as it should
+            text = "⚠️ Сверка не прошла: Apirone не отдал данные.\n" + lines
+            if all(p in passing for p in fresh):
+                text += (
+                    "\n\nЭто сбой на стороне Apirone, а не нехватка денег: выплаты подождут, бот повторит "
+                    "проверку сам."
+                )
+        await alert_owner(ctx, text)
     return problems

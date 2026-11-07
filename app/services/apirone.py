@@ -14,8 +14,10 @@ an error text. The raw replies are logged at DEBUG (key-free) for checking the s
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -59,6 +61,21 @@ def outcome_unknown(exc: BaseException) -> bool:
     if isinstance(exc, ApironeError):
         return exc.unknown
     return isinstance(exc, UNKNOWN_OUTCOME)
+
+
+_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _gist(text: str, limit: int = 200) -> str:
+    """What an error reply says, in short: an HTML page (Cloudflare's or a proxy's, when Apirone's server is
+    down) by its title, never its markup; anything else by its beginning."""
+    text = text.strip()
+    if text.startswith("<") or "<html" in text[:500].lower():
+        match = _TITLE.search(text)
+        title = " ".join(html.unescape(_TAG.sub(" ", match.group(1))).split()) if match else ""
+        return title[:120] or "HTML page"
+    return text[:limit]
 
 
 # ------------------------------------------------------------------------------------------ parsed shapes
@@ -293,7 +310,8 @@ class ApironeClient:
             raise ApironeError(f"network: {type(exc).__name__}", unknown=True) from exc
         log.debug("apirone %s %s → %s %s", method, path, status, self._clean(text[:4000]))
         if status >= 500:
-            raise ApironeError(f"server error: {self._clean(text[:200])}", status, unknown=True)
+            gist = self._clean(_gist(text))
+            raise ApironeError(f"server error: {gist}" if gist else "server error", status, unknown=True)
         data: Any = None
         try:
             data = json.loads(text) if text.strip() else None
@@ -303,7 +321,7 @@ class ApironeClient:
             message = ""
             if isinstance(data, dict):
                 message = _text(data.get("message") or data.get("error") or data.get("description"))
-            raise ApironeError(self._clean(message or text[:200] or f"HTTP {status}"), status)
+            raise ApironeError(self._clean(message or _gist(text) or f"HTTP {status}"), status)
         if data is None:
             raise ApironeError(f"not an API reply (HTTP {status})", status, unknown=True)
         try:

@@ -314,11 +314,13 @@ async def test_reconcile_now_and_network_hiccups_are_told_only_when_they_last(h,
     assert "расхождений: 3" in _text(screen) and "нет ответа" in _text(screen)
 
     def told() -> list[str]:
-        return [t for t in map(_text, tg.bot_messages(OWNER_ID)) if "Сверка нашла расхождения" in t]
+        return [t for t in map(_text, tg.bot_messages(OWNER_ID)) if "⚠️ Сверка " in t]
 
     assert told() == []  # once may be a hiccup
     await h.press(ADMIN, screen, "Сверить сейчас")
     assert len(told()) == 1 and "баланс аккаунта: нет ответа" in told()[0]  # it lasts: told
+    assert "⚠️ Сверка не прошла: Apirone не отдал данные." in told()[0]  # not a mismatch of money
+    assert "Это сбой на стороне Apirone, а не нехватка денег: выплаты подождут" in told()[0]
     await h.press(ADMIN, screen, "Сверить сейчас")
     assert len(told()) == 1  # and only once
     pay.fail = False
@@ -331,6 +333,7 @@ async def test_reconcile_now_and_network_hiccups_are_told_only_when_they_last(h,
     pay.history = refused  # a refusal is not a hiccup: told at once
     await h.press(ADMIN, tg.messages[ADMIN][home["message_id"]], "Сверить сейчас")
     assert len(told()) == 2 and "Apirone отказал (HTTP 403)" in told()[-1]
+    assert "Сверка не прошла" in told()[-1] and "сбой на стороне Apirone" not in told()[-1]
 
 
 async def test_the_owner_takes_the_income(h, tg, db, ctx, pay):

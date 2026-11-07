@@ -63,6 +63,9 @@ def why(exc: BaseException) -> str:
         if exc.later:
             return "Apirone просит подождать: слишком много запросов"
         return f"Apirone: {exc.message}"
+    if isinstance(exc, ApironeError) and exc.status is not None and exc.status >= 500:
+        page = exc.message.partition(": ")[2]  # «server error: apirone.com | 502: Bad gateway»
+        return f"у Apirone сбой (HTTP {exc.status}{': ' + page if page else ''}), бот повторит сам"
     if isinstance(exc, ApironeError) and exc.status is not None:
         return f"Apirone ответил не так, как ожидалось ({exc.message})"
     return "нет ответа (сеть или Apirone недоступен)"
